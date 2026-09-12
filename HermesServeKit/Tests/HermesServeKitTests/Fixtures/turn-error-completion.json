@@ -1,0 +1,34 @@
+{
+  "comment": "Failure path (jsonrpc-methods-and-events.md 2.2 / 8): 'message.complete with status: \"error\" is the terminal frame for a failed turn — clients should not additionally wait for an error event.' `partial: true` means `text` is streamed output worth keeping, NOT the error string (reference-clients.md 3.6 step 5).",
+  "frames": [
+    {
+      "jsonrpc": "2.0",
+      "method": "event",
+      "params": { "type": "message.start", "session_id": "a1b2c3d4" }
+    },
+    {
+      "jsonrpc": "2.0",
+      "method": "event",
+      "params": {
+        "type": "message.delta",
+        "session_id": "a1b2c3d4",
+        "payload": { "text": "Let me check the log" }
+      }
+    },
+    {
+      "jsonrpc": "2.0",
+      "method": "event",
+      "params": {
+        "type": "message.complete",
+        "session_id": "a1b2c3d4",
+        "payload": {
+          "text": "Let me check the log",
+          "status": "error",
+          "error": "provider returned 529 overloaded",
+          "recoverable": true,
+          "partial": true
+        }
+      }
+    }
+  ]
+}

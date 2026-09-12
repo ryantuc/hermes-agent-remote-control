@@ -1,0 +1,354 @@
+# XcodeGen project definition for the Hermes iOS client.
+#
+# On a Mac:
+#   brew install xcodegen
+#   cd HermesMobile
+#   xcodegen generate
+#   open HermesMobile.xcodeproj
+#
+# Set DEVELOPMENT_TEAM below (or in Xcode's Signing pane) before device builds.
+name: HermesMobile
+options:
+  bundleIdPrefix: com.hermes.mobile
+  deploymentTarget:
+    iOS: "17.0"
+  createIntermediateGroups: true
+
+packages:
+  HermesServeKit:
+    path: HermesServeKit
+
+targets:
+  HermesMobile:
+    type: application
+    platform: iOS
+    sources:
+      - path: HermesApp
+      # Privacy manifest (ITMS-91053): the app uses UserDefaults — a
+      # required-reason API — so the app bundle declares reason CA92.1.
+      - path: HermesApp/PrivacyInfo.xcprivacy
+      # Shared with the widget extension, compiled into both. The ActivityKit
+      # attributes and the two approval intents: the widget declares the
+      # buttons, the app performs them, and the types have to exist on both
+      # sides of that.
+      - path: HermesActivity
+    dependencies:
+      - package: HermesServeKit
+      - target: HermesLiveActivity
+        embed: true
+    info:
+      path: HermesApp/Info.plist
+      properties:
+        UILaunchScreen: {}
+        # FEAT-007 introduced this key so SpringBoard would not fall back to
+        # the product name "HermesMobile". FEAT-025 changes the label to HARC.
+        # Leave CFBundleName / PRODUCT_NAME as HermesMobile — that is the
+        # .app filename, not what the home screen draws.
+        CFBundleDisplayName: HARC
+        # FEAT-002. xcodegen's default plist hardcodes 1.0 / 1, so
+        # MARKETING_VERSION and CURRENT_PROJECT_VERSION below never reached the
+        # shipped bundle: every build reported "1.0 (1)" no matter what the
+        # build settings said. These two lines make the build settings the
+        # single source of truth they were always meant to be.
+        CFBundleShortVersionString: "$(MARKETING_VERSION)"
+        CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
+        # Live Activities (spec §5.3). Without this key `Activity.request`
+        # throws `.unentitled` and nothing ever appears — it is the switch, not
+        # a hint.
+        NSSupportsLiveActivities: true
+        # Frequent updates are deliberately NOT requested. A turn's card is
+        # updated from the socket the app already holds, coalesced to at most
+        # once a second, and asking for the unbudgeted rate would be asking for
+        # something this app does not need.
+        NSSupportsLiveActivitiesFrequentUpdates: false
+        # `hermes://chat/<runtime session id>` — the one link this app opens,
+        # tapped from a Lock Screen card or the island's "Open Hermes".
+        CFBundleURLTypes:
+          - CFBundleURLName: com.hermes.mobile.app.activity
+            CFBundleTypeRole: Editor
+            CFBundleURLSchemes:
+              - hermes
+        # Landscape ships (spec §1/§2/§3): the hub becomes a persistent 300 pt
+        # rail at regular width — landscape on a Max — and the transcript /
+        # composer take their column caps. Upside-down is deliberately absent;
+        # it is not a phone posture. TARGETED_DEVICE_FAMILY stays "1": landscape
+        # is an iPhone target and iPad support is a separate product decision.
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+        NSCameraUsageDescription: "Attach photos of documents or scenes to your Hermes conversation."
+        NSPhotoLibraryUsageDescription: "Attach photos from your library to your Hermes conversation."
+        # Add-only (spec §4.5 / §3 media viewer): saving a generated image to
+        # the camera roll needs *Add*, not full library access. The read key
+        # above is the picker's and stays a separate grant — asking for read
+        # access in order to write one file is the kind of over-ask that gets
+        # a prompt denied once and then forever.
+        NSPhotoLibraryAddUsageDescription: "Save an image from a Hermes conversation to your photo library."
+        # Voice (spec §4.5). Both are required before the first use of either
+        # dictation engine: the recogniser needs the speech grant even when it
+        # runs entirely on device, and the microphone grant is what actually
+        # starts the audio engine. A missing string here is a launch-time
+        # crash on first use, not a build error.
+        NSMicrophoneUsageDescription: "Dictate a message, or talk to Hermes hands-free."
+        NSSpeechRecognitionUsageDescription: "Turn your dictation into text. On-device recognition keeps the audio on your iPhone; the Hermes engine sends the recording to your own backend."
+        NSFaceIDUsageDescription: "Confirm dangerous agent actions with Face ID."
+        NSLocalNetworkUsageDescription: "Connect to your own hermes serve backend on your local network or tailnet."
+        # Allow plain-http backends over private networks (Tailscale) during
+        # development. Production guidance is HTTPS/WSS — see docs/DEPLOYMENT.md.
+        NSAppTransportSecurity:
+          NSAllowsLocalNetworking: true
+        ITSAppUsesNonExemptEncryption: false
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.hermes.mobile.app
+        MARKETING_VERSION: "1.0.0"
+        CURRENT_PROJECT_VERSION: "0"
+        SWIFT_VERSION: "5.9"
+        TARGETED_DEVICE_FAMILY: "1"
+        # FEAT-021 flipped this from YES. The build-number script phase below
+        # reads the repository's git metadata and writes CFBundleVersion into the
+        # built bundle, and the script sandbox denies both — the first attempt
+        # died at `Sandbox: bash deny(1) file-read-data
+        # .../scripts/stamp-build-number.sh` before it ever reached the plist.
+        # Declaring inputs and outputs does not rescue it: in a git worktree the
+        # gitdir lives outside SRCROOT entirely, and the built Info.plist is
+        # already another task's declared output. What this opens up is exactly
+        # the two script phases written in this file, both of which are in the
+        # repository under scripts/ and readable there.
+        ENABLE_USER_SCRIPT_SANDBOXING: NO
+        # Device builds: automatic signing. Substitute your own team id here;
+        # see CONTRIBUTING.md.
+        DEVELOPMENT_TEAM: KVJFB6B6NJ
+        CODE_SIGN_STYLE: Automatic
+    postBuildScripts:
+      # FEAT-021. The two things that have to happen on every build that can
+      # reach the phone, and that cannot live in the generated project because
+      # `xcodegen generate` rewrites it from this file: the build number is
+      # stamped from git, so it rises whenever the code does and nobody has to
+      # remember to bump it, and the changelog is checked against the ids
+      # committed since the last tag. The check only ever warns — a Cmd-R that
+      # dies on paperwork is a worse problem than a changelog that is briefly
+      # behind.
+      #
+      # BUG-064: this phase runs **after** Embed Foundation Extensions (verified
+      # in the generated project — Sources, Resources, Frameworks, Embed, then
+      # this), so the `.appex` inside the app bundle already exists when the
+      # stamp runs and the script stamps that copy too. That is what makes an
+      # app/extension version mismatch impossible rather than merely unlikely:
+      # whatever the extension's own phase managed under parallel target
+      # builds, the bundle that ships is the embedded one and this stamps it.
+      #
+      # `set -e` is load-bearing. The stamp now exits non-zero when it cannot
+      # write a plist it is responsible for, and without `-e` the phase's exit
+      # status would be the changelog check's — which always succeeds — so the
+      # failure would be a warning in the log and an .ipa rejected at App Store
+      # Connect. CURRENT_PROJECT_VERSION above stays deliberately at "0": it is the
+      # never-ship sentinel a bundle is left carrying when this phase does not
+      # run, and it is the value `BuildNumberTests` looks for to prove exactly
+      # that. It is not the accepted-build floor — that is a separate constant,
+      # ACCEPTED_BUILD_FLOOR in scripts/stamp-build-number.sh, which rises after
+      # each accepted upload while this stays 0 forever. They coincide at 0 today
+      # only because nothing has been accepted. Raising this one as "insurance"
+      # would blind the guard.
+      #
+      # `HermesMobile.xcodeproj` is generated and gitignored. After any merge or
+      # checkout that changes this file, `xcodegen generate` is mandatory before
+      # building or archiving; otherwise this `set -e` is not in the project the
+      # build is actually using and a stamp failure can be hidden by the
+      # warn-only changelog command that follows it.
+      #
+      # BUG-064, second half, found on 2026-08-30. Stamping the app's own
+      # Info.plist is only durable if nothing writes that plist afterwards, and
+      # something does: ProcessInfoPlistFile re-expands CFBundleVersion from
+      # CURRENT_PROJECT_VERSION every time it runs. A script phase with no
+      # declared inputs has no dependency edge to that task, so the order was
+      # whatever the scheduler picked - and on an incremental build it picked
+      # the script first, putting the shipped app back on the "0" that means
+      # unstamped while the embedded .appex kept the derived number. Measured
+      # at 0c45197: a clean build came out 415/415; the next three incremental
+      # builds came out app 2 / appex 415, each with Xcode's own `warning: The
+      # CFBundleVersion of an app extension ('415') must match that of its
+      # containing parent app ('2')`.
+      #
+      # `inputFiles` below is the missing edge, and it is the only shape
+      # available: the built Info.plist cannot be declared as an *output*
+      # because ProcessInfoPlistFile already produces that node, and two
+      # producers of one node is a build error. Declaring it as an input costs
+      # nothing else - `basedOnDependencyAnalysis: false` still makes the phase
+      # run on every build; the input only says *when*.
+      - name: FEAT-021 build number + changelog
+        basedOnDependencyAnalysis: false
+        inputFiles:
+          - $(TARGET_BUILD_DIR)/$(INFOPLIST_PATH)
+        script: |
+          set -e
+          sh "$SRCROOT/scripts/stamp-build-number.sh"
+          sh "$SRCROOT/scripts/check-changelog.sh" --warn-only
+
+  # The Live Activity widget extension (band 7e). The campaign's last
+  # structural change and its only second target.
+  #
+  # It gets its **own** bundle id under `com.hermes.mobile`, which means Xcode
+  # mints a second provisioning profile against the same free personal team.
+  # `DEVELOPMENT_TEAM` and automatic signing match the app's exactly; nothing
+  # here is renamed to work around an App-ID limit, because that limit would be
+  # an account fact and not a code problem.
+  HermesLiveActivity:
+    type: app-extension
+    platform: iOS
+    sources:
+      - path: HermesLiveActivity
+      - path: HermesActivity
+      # The design system, compiled in rather than duplicated. A widget process
+      # cannot read the app's `Theme` (different process, different defaults
+      # container, no App Group), so the skin seeds travel in the activity's
+      # attributes and these three files turn them back into the same tokens
+      # the app draws with. No new tokens exist because of this target.
+      - path: HermesApp/Design/HermesTokens.swift
+      - path: HermesApp/Design/HermesType.swift
+      - path: HermesApp/Design/SkinPresets.swift
+      # The generated Desktop palette table. Compiled in because the seeds the
+      # widget draws with are now read from it rather than restated — which is
+      # the whole point of generating it. It is data: static colour constants,
+      # no behaviour.
+      - path: HermesApp/Design/DesktopThemePalette.swift
+      # The extension's own privacy manifest: HermesTokens.swift (compiled in
+      # above) reads and writes UserDefaults for skin polarity, so the .appex
+      # binary declares the same CA92.1 reason.
+      - path: HermesLiveActivity/PrivacyInfo.xcprivacy
+    dependencies:
+      - package: HermesServeKit
+    info:
+      path: HermesLiveActivity/Info.plist
+      properties:
+        CFBundleDisplayName: HARC
+        # FEAT-002. Same wiring as the app's: an extension whose version does
+        # not match its host app is rejected at embed/submit time, so both
+        # read the same two build settings.
+        CFBundleShortVersionString: "$(MARKETING_VERSION)"
+        CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.widgetkit-extension
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.hermes.mobile.app.liveactivity
+        MARKETING_VERSION: "1.0.0"
+        CURRENT_PROJECT_VERSION: "0"
+        SWIFT_VERSION: "5.9"
+        TARGETED_DEVICE_FAMILY: "1"
+        # NO for the same reason as the app target above: this target runs the
+        # same build-number script, and the sandbox denies it reading git.
+        ENABLE_USER_SCRIPT_SANDBOXING: NO
+        DEVELOPMENT_TEAM: KVJFB6B6NJ
+        CODE_SIGN_STYLE: Automatic
+        SKIP_INSTALL: YES
+    postBuildScripts:
+      # FEAT-021. The extension is stamped by the same script reading the same
+      # git count, because an extension whose version disagrees with its host
+      # app does not embed (FEAT-002's first rule). The changelog check is the
+      # app's alone; running it here would print the same warnings twice.
+      #
+      # BUG-064 kept this phase rather than replacing it with the app-side one.
+      # It is what leaves the DerivedData product correct, so the copy the embed
+      # phase lands is already right and the app's pass over the embedded plist
+      # writes nothing — and writing nothing is what keeps the .appex's own
+      # signature intact on a device build. The app-side stamp is the backstop
+      # for when this loses its race, not a replacement for winning it.
+      #
+      # The same `inputFiles` edge as the app's phase, for the same reason:
+      # without it ProcessInfoPlistFile put this target's own product back on
+      # "2" on every incremental build, which is what made the app's backstop
+      # pass over the embedded copy fire on every build instead of never.
+      - name: FEAT-021 build number
+        basedOnDependencyAnalysis: false
+        inputFiles:
+          - $(TARGET_BUILD_DIR)/$(INFOPLIST_PATH)
+        script: sh "$SRCROOT/scripts/stamp-build-number.sh"
+
+  HermesServeKitTests:
+    type: bundle.unit-test
+    platform: iOS
+    sources:
+      - path: HermesServeKit/Tests/HermesServeKitTests
+    dependencies:
+      - package: HermesServeKit
+    settings:
+      base:
+        # Xcode 26.3 refuses to code-sign a test bundle with no Info.plist.
+        # Unset here since the project was written, so every test target
+        # failed to build after the toolchain upgrade (BUG-038).
+        GENERATE_INFOPLIST_FILE: YES
+
+  # The app layer's tests. Hosted by the app, because `@testable import
+  # HermesMobile` needs the app binary to link against — `swift test` cannot
+  # run these, they need a simulator (see HermesAppTests/README.md).
+  HermesAppTests:
+    type: bundle.unit-test
+    platform: iOS
+    sources:
+      - path: HermesAppTests
+        excludes:
+          - "README.md"
+    dependencies:
+      - target: HermesMobile
+      - package: HermesServeKit
+    settings:
+      base:
+        # Xcode 26.3 refuses to code-sign a test bundle with no Info.plist.
+        # Unset here since the project was written, so every test target
+        # failed to build after the toolchain upgrade (BUG-038).
+        GENERATE_INFOPLIST_FILE: YES
+        SWIFT_VERSION: "5.9"
+        TEST_HOST: "$(BUILT_PRODUCTS_DIR)/HermesMobile.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/HermesMobile"
+        BUNDLE_LOADER: "$(TEST_HOST)"
+        # The host app is signed; the test bundle rides inside it.
+        PRODUCT_BUNDLE_IDENTIFIER: com.hermes.mobile.app.tests
+        DEVELOPMENT_TEAM: KVJFB6B6NJ
+        CODE_SIGN_STYLE: Automatic
+
+  # BUG-016's repro harness. The only thing in this project that can tap,
+  # long-press or type — `simctl` cannot inject input at all, and both of the
+  # blank-transcript repros are gestures. It needs no macOS Accessibility
+  # permission on a simulator and no signing, so `xcodebuild test` runs it over
+  # SSH the same way every other target runs.
+  #
+  # It drives the app through `-hermesScreenshotRoute transcript-long`, which
+  # bypasses the network bootstrap entirely: no backend, no profile, no sign-in.
+  HermesUITests:
+    type: bundle.ui-testing
+    platform: iOS
+    sources:
+      - path: HermesUITests
+    dependencies:
+      - target: HermesMobile
+    settings:
+      base:
+        # Xcode 26.3 refuses to code-sign a test bundle with no Info.plist.
+        # Unset here since the project was written, so every test target
+        # failed to build after the toolchain upgrade (BUG-038).
+        GENERATE_INFOPLIST_FILE: YES
+        SWIFT_VERSION: "5.9"
+        TEST_TARGET_NAME: HermesMobile
+        PRODUCT_BUNDLE_IDENTIFIER: com.hermes.mobile.app.uitests
+        DEVELOPMENT_TEAM: KVJFB6B6NJ
+        CODE_SIGN_STYLE: Automatic
+
+schemes:
+  HermesMobile:
+    build:
+      targets:
+        HermesMobile: all
+    run:
+      config: Debug
+    test:
+      config: Debug
+      targets:
+        - HermesServeKitTests
+        - HermesAppTests
+        # Deliberately last: it launches the app per test and is an order of
+        # magnitude slower than the other two. `-only-testing:HermesUITests`
+        # runs it alone.
+        - HermesUITests
+    archive:
+      config: Release

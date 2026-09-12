@@ -1,0 +1,192 @@
+{
+  "comment": "One parent turn that fans out to two subagents, in the shape tui_gateway/server.py relays them: all six types on the PARENT session id, always stamped with session_id, and never `subagent.text` (the relay skips the child's reply body by name). The two agents are deliberately different: `sa-1` carries a real `subagent_id`, while the second carries none at all and must be identified by the synthetic composite `{parent_id or 'root'}:{task_index}:{goal}` — a fan-out where only some agents have ids is the case that collapses four agents into one row if identity is wrong. `tool_count` arrives as a float on one frame and an int on another because the gateway emits them interchangeably. `sa-ghost` sends a progress frame for an id nobody ever announced: it must be DISCARDED, not promoted into a headless row with no goal and no way to finish. The second agent ends with `status: 'timeout'`, which is the trap — desktop's status mapper falls through anything unrecognised to `running`, so its timed-out agents never become terminal, never prune and spin forever; here `subagent.complete` is terminal by event type and `timeout` maps to `failed`. message.complete then ends the parent turn with one running agent left over, which is the case turn end must NOT clear.",
+  "frames": [
+    {
+      "jsonrpc": "2.0",
+      "method": "event",
+      "params": {
+        "type": "message.start",
+        "session_id": "a1b2c3d4"
+      }
+    },
+    {
+      "jsonrpc": "2.0",
+      "method": "event",
+      "params": {
+        "type": "subagent.spawn_requested",
+        "session_id": "a1b2c3d4",
+        "payload": {
+          "subagent_id": "sa-1",
+          "parent_id": "root-agent",
+          "goal": "Audit the migration for dropped indexes",
+          "task_index": 0,
+          "task_count": 2,
+          "depth": 1
+        }
+      }
+    },
+    {
+      "jsonrpc": "2.0",
+      "method": "event",
+      "params": {
+        "type": "subagent.spawn_requested",
+        "session_id": "a1b2c3d4",
+        "payload": {
+          "parent_id": "root-agent",
+          "goal": "Draft the release notes",
+          "task_index": 1,
+          "task_count": 2,
+          "depth": 1
+        }
+      }
+    },
+    {
+      "jsonrpc": "2.0",
+      "method": "event",
+      "params": {
+        "type": "subagent.start",
+        "session_id": "a1b2c3d4",
+        "payload": {
+          "subagent_id": "sa-1",
+          "parent_id": "root-agent",
+          "child_session_id": "20260814_090000_child1",
+          "goal": "Audit the migration for dropped indexes",
+          "task_index": 0,
+          "task_count": 2,
+          "depth": 1,
+          "model": "deepseek-v4-flash",
+          "toolsets": ["fs", "search"]
+        }
+      }
+    },
+    {
+      "jsonrpc": "2.0",
+      "method": "event",
+      "params": {
+        "type": "subagent.start",
+        "session_id": "a1b2c3d4",
+        "payload": {
+          "parent_id": "root-agent",
+          "goal": "Draft the release notes",
+          "task_index": 1,
+          "task_count": 2,
+          "depth": 1,
+          "model": "deepseek-v4-flash"
+        }
+      }
+    },
+    {
+      "jsonrpc": "2.0",
+      "method": "event",
+      "params": {
+        "type": "subagent.thinking",
+        "session_id": "a1b2c3d4",
+        "payload": {
+          "subagent_id": "sa-1",
+          "goal": "Audit the migration for dropped indexes",
+          "task_index": 0,
+          "task_count": 2,
+          "text": "The   schema  dump\n\n  is the place to start"
+        }
+      }
+    },
+    {
+      "jsonrpc": "2.0",
+      "method": "event",
+      "params": {
+        "type": "subagent.tool",
+        "session_id": "a1b2c3d4",
+        "payload": {
+          "subagent_id": "sa-1",
+          "goal": "Audit the migration for dropped indexes",
+          "task_index": 0,
+          "task_count": 2,
+          "tool_name": "read_file",
+          "tool_preview": "db/schema.sql",
+          "tool_count": 1.0
+        }
+      }
+    },
+    {
+      "jsonrpc": "2.0",
+      "method": "event",
+      "params": {
+        "type": "subagent.progress",
+        "session_id": "a1b2c3d4",
+        "payload": {
+          "subagent_id": "sa-1",
+          "goal": "Audit the migration for dropped indexes",
+          "task_index": 0,
+          "task_count": 2,
+          "text": "Two indexes are missing from the down migration",
+          "tool_count": 2
+        }
+      }
+    },
+    {
+      "jsonrpc": "2.0",
+      "method": "event",
+      "params": {
+        "type": "subagent.progress",
+        "session_id": "a1b2c3d4",
+        "payload": {
+          "subagent_id": "sa-ghost",
+          "goal": "An agent nobody announced",
+          "task_index": 7,
+          "task_count": 2,
+          "text": "this frame has no row to land on"
+        }
+      }
+    },
+    {
+      "jsonrpc": "2.0",
+      "method": "event",
+      "params": {
+        "type": "subagent.complete",
+        "session_id": "a1b2c3d4",
+        "payload": {
+          "subagent_id": "sa-1",
+          "parent_id": "root-agent",
+          "goal": "Audit the migration for dropped indexes",
+          "task_index": 0,
+          "task_count": 2,
+          "status": "completed",
+          "summary": "Found two indexes missing from the down migration.",
+          "duration_seconds": 12.5,
+          "tool_count": 3,
+          "input_tokens": 8120,
+          "output_tokens": 640,
+          "files_read": ["db/schema.sql", "db/migrate/003_add_indexes.sql"]
+        }
+      }
+    },
+    {
+      "jsonrpc": "2.0",
+      "method": "event",
+      "params": {
+        "type": "subagent.tool",
+        "session_id": "a1b2c3d4",
+        "payload": {
+          "parent_id": "root-agent",
+          "goal": "Draft the release notes",
+          "task_index": 1,
+          "task_count": 2,
+          "tool_name": "write_file",
+          "tool_preview": "NOTES.md"
+        }
+      }
+    },
+    {
+      "jsonrpc": "2.0",
+      "method": "event",
+      "params": {
+        "type": "message.complete",
+        "session_id": "a1b2c3d4",
+        "payload": {
+          "text": "The audit is done; the notes agent is still running.",
+          "status": "complete"
+        }
+      }
+    }
+  ]
+}

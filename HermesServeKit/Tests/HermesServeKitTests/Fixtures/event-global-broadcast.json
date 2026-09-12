@@ -1,0 +1,18 @@
+{
+  "comment": "Gotcha 3 (jsonrpc-methods-and-events.md 0.3 / 2.8): session-less broadcasts carry session_id: \"\" and an empty payload. sessions.changed is a 'something changed, refetch' tick driven by the newest mtime of state.db / state.db-wal, coalesced to a 2.0 s floor. gateway.ready is stranger still: it is hand-built and has NO session_id key at all (ws.py:306-318).",
+  "frames": [
+    {
+      "jsonrpc": "2.0",
+      "method": "event",
+      "params": { "type": "sessions.changed", "session_id": "", "payload": {} }
+    },
+    {
+      "jsonrpc": "2.0",
+      "method": "event",
+      "params": {
+        "type": "gateway.ready",
+        "payload": { "skin": { "name": "nous" }, "change_events": true }
+      }
+    }
+  ]
+}

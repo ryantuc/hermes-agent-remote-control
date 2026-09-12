@@ -1,0 +1,2 @@
+# Shell scripts run on the Mac; a CRLF checkout makes them unrunnable there.
+*.sh text eol=lf

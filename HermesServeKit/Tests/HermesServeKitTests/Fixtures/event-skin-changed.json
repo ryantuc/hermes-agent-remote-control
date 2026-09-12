@@ -1,0 +1,19 @@
+{
+  "comment": "skin.changed carries the raw resolve_skin() dict with the name at TOP level, not under a `skin` key the way gateway.ready nests it (jsonrpc-methods-and-events.md 6.3 table; a config.set of `skin` broadcasts this to every connected client, 700). The client keeps the whole dict and maps its own seeds out of it, so the projection must not flatten or drop the colour tables.",
+  "frames": [
+    {
+      "jsonrpc": "2.0",
+      "method": "event",
+      "params": {
+        "type": "skin.changed",
+        "session_id": "",
+        "payload": {
+          "name": "moss",
+          "colors": { "accent": "#6f8f5a", "bg": "#0e120c" },
+          "light_colors": { "accent": "#3f5a30", "bg": "#f4f6f0" },
+          "dark_colors": { "accent": "#8fb576", "bg": "#0b0e09" }
+        }
+      }
+    }
+  ]
+}

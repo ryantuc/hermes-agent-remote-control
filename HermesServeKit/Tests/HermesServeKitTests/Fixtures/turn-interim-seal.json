@@ -1,0 +1,33 @@
+{
+  "comment": "message.interim is assistant commentary alongside tool calls (jsonrpc-methods-and-events.md 2.2). The client must SEAL the streaming bubble as a standalone interim message so a following message.complete cannot wipe it (reference-clients.md 3.2). When the final text merely continues the interim, it settles onto that bubble instead of appending a duplicate (finalContinuesInterim, 3.6).",
+  "frames": [
+    {
+      "jsonrpc": "2.0",
+      "method": "event",
+      "params": { "type": "message.start", "session_id": "a1b2c3d4" }
+    },
+    {
+      "jsonrpc": "2.0",
+      "method": "event",
+      "params": { "type": "message.delta", "session_id": "a1b2c3d4", "payload": { "text": "Checking" } }
+    },
+    {
+      "jsonrpc": "2.0",
+      "method": "event",
+      "params": {
+        "type": "message.interim",
+        "session_id": "a1b2c3d4",
+        "payload": { "text": "Checking the repository first.", "already_streamed": true }
+      }
+    },
+    {
+      "jsonrpc": "2.0",
+      "method": "event",
+      "params": {
+        "type": "message.complete",
+        "session_id": "a1b2c3d4",
+        "payload": { "text": "Checking the repository first. Done.", "status": "complete" }
+      }
+    }
+  ]
+}

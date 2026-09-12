@@ -1,0 +1,30 @@
+{
+  "comment": "model.options (jsonrpc-methods-and-events.md 5.1) is build_model_options_payload output — 'shape defined outside this layer', so every field is optional and entries are polymorphic. This fixture carries the three shapes seen in the wild: a model object keyed `slug`, one keyed `id`, and a bare string. An unauthenticated provider still lists models; it just cannot be selected.",
+  "frames": [
+    {
+      "jsonrpc": "2.0",
+      "id": "i5",
+      "result": {
+        "providers": [
+          {
+            "slug": "nous",
+            "name": "Nous Research",
+            "is_current": true,
+            "authenticated": true,
+            "featured_models": ["hermes-4-405b"],
+            "models": [
+              { "slug": "hermes-4-405b", "name": "Hermes 4 405B", "is_current": true },
+              { "id": "hermes-4-70b", "name": "Hermes 4 70B" }
+            ]
+          },
+          {
+            "slug": "openrouter",
+            "authenticated": false,
+            "warning": "No API key saved for this provider.",
+            "models": ["some-vendor/some-model"]
+          }
+        ]
+      }
+    }
+  ]
+}

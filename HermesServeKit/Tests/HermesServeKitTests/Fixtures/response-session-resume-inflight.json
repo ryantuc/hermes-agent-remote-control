@@ -1,0 +1,36 @@
+{
+  "comment": "session.resume against a session that is live mid-turn (_live_session_payload, server.py:7588-7602). `inflight` is the ONLY carrier of a terminal frame lost while disconnected — there is no server-side event replay (reference-clients.md 7.1). The projected user row is normally ALSO present in `messages`, so it must be de-duplicated against the contiguous run of trailing user rows. `corrections` are mid-turn redirects, oldest first.",
+  "frames": [
+    {
+      "jsonrpc": "2.0",
+      "id": "i3",
+      "result": {
+        "session_id": "99887766",
+        "resumed": "20260731_170500_ab12ef",
+        "session_key": "20260731_170500_ab12ef",
+        "message_count": 2,
+        "running": true,
+        "status": "streaming",
+        "messages": [
+          { "role": "user", "text": "fix the failing test", "row_id": 11 },
+          { "role": "assistant", "text": "On it.", "row_id": 12 }
+        ],
+        "info": {
+          "model": "hermes-4-405b",
+          "cwd": "/repo",
+          "lazy": true,
+          "desktop_contract": 5,
+          "profile_name": "default"
+        },
+        "inflight": {
+          "user": "fix the failing test",
+          "assistant": "Reading the traceback",
+          "streaming": true,
+          "corrections": ["actually check tests/test_api.py first"]
+        },
+        "queued": { "user": "then open a PR" },
+        "auto_continue": { "attempt": 1, "interrupted_at": 1753900000.0 }
+      }
+    }
+  ]
+}

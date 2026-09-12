@@ -1,0 +1,11 @@
+{
+  "comment": "A server-to-client REQUEST frame: carries both an id and a non-'event' method. The tui_gateway dialect does not use these today — every blocking prompt arrives as an event (reference-clients.md 5) — but the codec must classify one rather than mistaking it for a response, so an unanswered frame can never park an agent thread.",
+  "frames": [
+    {
+      "jsonrpc": "2.0",
+      "id": 42,
+      "method": "client.ping",
+      "params": { "nonce": "abc123" }
+    }
+  ]
+}

@@ -1,0 +1,103 @@
+{
+  "comment": "One turn's worth of `todo` traffic in the shape tui_gateway/server.py `_on_tool_complete` actually emits it: tool.start ships an args preview that MAY be a partial merge update (the backend's own comment warns so, which is why it is not decoded), and tool.complete carries BOTH the parsed `result` object and the gateway-attached `payload.todos` — the full current list, attached only when name == 'todo'. Two completes, because every call returns the whole list and the second one is what proves it is a replacement rather than a merge: the plan goes from three items (one in progress) to the same three all settled, and the last item is CANCELLED rather than completed so the finished-list rule has to accept both terminal statuses. message.complete then ends the turn with a finished list, which is the one case turn end must NOT drop.",
+  "frames": [
+    {
+      "jsonrpc": "2.0",
+      "method": "event",
+      "params": {
+        "type": "message.start",
+        "session_id": "a1b2c3d4"
+      }
+    },
+    {
+      "jsonrpc": "2.0",
+      "method": "event",
+      "params": {
+        "type": "tool.start",
+        "session_id": "a1b2c3d4",
+        "payload": {
+          "tool_id": "call_todo_1",
+          "name": "todo",
+          "context": "{\"todos\": [{\"id\": \"1\", …"
+        }
+      }
+    },
+    {
+      "jsonrpc": "2.0",
+      "method": "event",
+      "params": {
+        "type": "tool.complete",
+        "session_id": "a1b2c3d4",
+        "payload": {
+          "tool_id": "call_todo_1",
+          "name": "todo",
+          "result": {
+            "todos": [
+              { "id": "1", "content": "Read the failing test", "status": "in_progress" },
+              { "id": "2", "content": "Fix the assertion", "status": "pending" },
+              { "id": "3", "content": "Re-run the suite", "status": "pending" }
+            ],
+            "summary": { "total": 3, "pending": 2, "in_progress": 1, "completed": 0, "cancelled": 0 }
+          },
+          "todos": [
+            { "id": "1", "content": "Read the failing test", "status": "in_progress" },
+            { "id": "2", "content": "Fix the assertion", "status": "pending" },
+            { "id": "3", "content": "Re-run the suite", "status": "pending" }
+          ],
+          "duration_s": 0.02
+        }
+      }
+    },
+    {
+      "jsonrpc": "2.0",
+      "method": "event",
+      "params": {
+        "type": "tool.start",
+        "session_id": "a1b2c3d4",
+        "payload": {
+          "tool_id": "call_todo_2",
+          "name": "todo",
+          "context": "{\"todos\": [{\"id\": \"1\", …"
+        }
+      }
+    },
+    {
+      "jsonrpc": "2.0",
+      "method": "event",
+      "params": {
+        "type": "tool.complete",
+        "session_id": "a1b2c3d4",
+        "payload": {
+          "tool_id": "call_todo_2",
+          "name": "todo",
+          "result": {
+            "todos": [
+              { "id": "1", "content": "Read the failing test", "status": "completed" },
+              { "id": "2", "content": "Fix the assertion", "status": "completed" },
+              { "id": "3", "content": "Re-run the suite", "status": "cancelled" }
+            ],
+            "summary": { "total": 3, "pending": 0, "in_progress": 0, "completed": 2, "cancelled": 1 }
+          },
+          "todos": [
+            { "id": "1", "content": "Read the failing test", "status": "completed" },
+            { "id": "2", "content": "Fix the assertion", "status": "completed" },
+            { "id": "3", "content": "Re-run the suite", "status": "cancelled" }
+          ],
+          "duration_s": 0.01
+        }
+      }
+    },
+    {
+      "jsonrpc": "2.0",
+      "method": "event",
+      "params": {
+        "type": "message.complete",
+        "session_id": "a1b2c3d4",
+        "payload": {
+          "text": "Done — the suite is green.",
+          "status": "complete"
+        }
+      }
+    }
+  ]
+}

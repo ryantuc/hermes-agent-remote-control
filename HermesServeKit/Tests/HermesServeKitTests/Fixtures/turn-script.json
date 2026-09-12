@@ -1,0 +1,103 @@
+{
+  "comment": "The reference turn timeline from jsonrpc-methods-and-events.md 8: a cold session, first message, one tool call, one approval. Note message.start carries no payload key, reasoning arrives before any message text, the approval.request has NO request_id (session-keyed FIFO), and the turn ends at message.complete.",
+  "frames": [
+    {
+      "jsonrpc": "2.0",
+      "method": "event",
+      "params": { "type": "message.start", "session_id": "a1b2c3d4" }
+    },
+    {
+      "jsonrpc": "2.0",
+      "method": "event",
+      "params": {
+        "type": "status.update",
+        "session_id": "a1b2c3d4",
+        "payload": { "kind": "lifecycle", "text": "Thinking about the failing test" }
+      }
+    },
+    {
+      "jsonrpc": "2.0",
+      "method": "event",
+      "params": {
+        "type": "reasoning.delta",
+        "session_id": "a1b2c3d4",
+        "payload": { "text": "The assertion " }
+      }
+    },
+    {
+      "jsonrpc": "2.0",
+      "method": "event",
+      "params": {
+        "type": "reasoning.delta",
+        "session_id": "a1b2c3d4",
+        "payload": { "text": "compares the wrong field." }
+      }
+    },
+    {
+      "jsonrpc": "2.0",
+      "method": "event",
+      "params": {
+        "type": "tool.start",
+        "session_id": "a1b2c3d4",
+        "payload": { "tool_id": "call_1", "name": "terminal", "context": "pytest -q" }
+      }
+    },
+    {
+      "jsonrpc": "2.0",
+      "method": "event",
+      "params": {
+        "type": "approval.request",
+        "session_id": "a1b2c3d4",
+        "payload": {
+          "command": "pytest -q",
+          "description": "run the test suite",
+          "allow_permanent": true,
+          "choices": ["once", "session", "always", "deny"]
+        }
+      }
+    },
+    {
+      "jsonrpc": "2.0",
+      "method": "event",
+      "params": {
+        "type": "tool.complete",
+        "session_id": "a1b2c3d4",
+        "payload": {
+          "tool_id": "call_1",
+          "name": "terminal",
+          "result": "1 passed in 0.42s",
+          "duration_s": 4.1
+        }
+      }
+    },
+    {
+      "jsonrpc": "2.0",
+      "method": "event",
+      "params": { "type": "message.delta", "session_id": "a1b2c3d4", "payload": { "text": "I " } }
+    },
+    {
+      "jsonrpc": "2.0",
+      "method": "event",
+      "params": { "type": "message.delta", "session_id": "a1b2c3d4", "payload": { "text": "fixed " } }
+    },
+    {
+      "jsonrpc": "2.0",
+      "method": "event",
+      "params": { "type": "message.delta", "session_id": "a1b2c3d4", "payload": { "text": "the test." } }
+    },
+    {
+      "jsonrpc": "2.0",
+      "method": "event",
+      "params": {
+        "type": "message.complete",
+        "session_id": "a1b2c3d4",
+        "payload": {
+          "text": "I fixed the test.",
+          "status": "complete",
+          "rendered": "I fixed the test.",
+          "usage": { "input": 1200, "output": 64, "total": 1264 }
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,47 @@
+{
+  "comment": "Event-to-session routing (reference-clients.md 3.1, gateway-events.ts:79-128). 1) An explicit session_id always wins. 2) subagent.* with no session_id is DROPPED — background work must never attach to whatever chat is focused. 3) Everything else unscoped is the active turn's output and must pin to the session that received message.start, not the session on screen, so a mid-turn chat switch cannot steal live deltas. The pin clears at message.complete.",
+  "frames": [
+    {
+      "jsonrpc": "2.0",
+      "method": "event",
+      "params": { "type": "message.start", "session_id": "a1b2c3d4" }
+    },
+    {
+      "jsonrpc": "2.0",
+      "method": "event",
+      "params": { "type": "message.delta", "session_id": "", "payload": { "text": "pinned text" } }
+    },
+    {
+      "jsonrpc": "2.0",
+      "method": "event",
+      "params": {
+        "type": "subagent.progress",
+        "session_id": "",
+        "payload": { "goal": "background research", "task_index": 1, "task_count": 3 }
+      }
+    },
+    {
+      "jsonrpc": "2.0",
+      "method": "event",
+      "params": {
+        "type": "tool.start",
+        "session_id": "",
+        "payload": { "tool_id": "call_9", "name": "read_file", "context": "src/main.py" }
+      }
+    },
+    {
+      "jsonrpc": "2.0",
+      "method": "event",
+      "params": {
+        "type": "message.complete",
+        "session_id": "a1b2c3d4",
+        "payload": { "text": "pinned text", "status": "complete" }
+      }
+    },
+    {
+      "jsonrpc": "2.0",
+      "method": "event",
+      "params": { "type": "message.delta", "session_id": "", "payload": { "text": "orphan" } }
+    }
+  ]
+}

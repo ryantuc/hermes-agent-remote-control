@@ -1,0 +1,20 @@
+{
+  "comment": "One WS text message may contain MULTIPLE newline-delimited frames: the server coalesces message.delta / reasoning.delta / thinking.delta on a ~33 ms timer (_TOKEN_COALESCE_S = 0.033). PROTOCOL.md 'Transport'; jsonrpc-methods-and-events.md 0.7. The test joins `frames` with \\n to reconstruct the wire payload.",
+  "frames": [
+    {
+      "jsonrpc": "2.0",
+      "method": "event",
+      "params": { "type": "message.delta", "session_id": "a1b2c3d4", "payload": { "text": "I " } }
+    },
+    {
+      "jsonrpc": "2.0",
+      "method": "event",
+      "params": { "type": "message.delta", "session_id": "a1b2c3d4", "payload": { "text": "fixed " } }
+    },
+    {
+      "jsonrpc": "2.0",
+      "method": "event",
+      "params": { "type": "message.delta", "session_id": "a1b2c3d4", "payload": { "text": "the test." } }
+    }
+  ]
+}

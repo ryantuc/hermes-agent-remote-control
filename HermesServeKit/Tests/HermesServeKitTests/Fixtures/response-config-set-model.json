@@ -1,0 +1,18 @@
+{
+  "comment": "config.set key=model (jsonrpc-methods-and-events.md 4.2, server.py:10001). Result base is {key, value} plus, for `model`, warning / confirm_required / confirm_message / scope and `deferred: true` when the switch was queued because a turn is running. `deferred` is the ONLY producer of ValueState.pending in this client, so it has to survive decoding.",
+  "frames": [
+    {
+      "jsonrpc": "2.0",
+      "id": "i4",
+      "result": {
+        "key": "model",
+        "value": "hermes-4-405b",
+        "warning": "This model bills at 4x the current one.",
+        "confirm_required": true,
+        "confirm_message": "Switch to an expensive model?",
+        "scope": "session",
+        "deferred": true
+      }
+    }
+  ]
+}

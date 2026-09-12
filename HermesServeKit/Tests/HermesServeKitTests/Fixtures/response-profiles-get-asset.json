@@ -1,0 +1,22 @@
+{
+  "comment": "profiles.get_asset results, methods_profiles.py:1029-1067. Frame 1 is the hit: {found, mime, size, data} where data is a FULL data: URL (`data:{mime};base64,{...}`, :1055-1062), not bare base64 — the payload here is a real 70-byte 1x1 RGBA PNG. Frame 2 is the miss: {found: false} and nothing else, returned as a SUCCESS rather than an error (:1064) so a roster can probe every row cheaply. Errors, when they do happen, are 4063 (name required) / 4064 (profile not found) / 5066. `asset` defaults to \"avatar\" and avatar is the only supported value.",
+  "frames": [
+    {
+      "jsonrpc": "2.0",
+      "id": "i1",
+      "result": {
+        "found": true,
+        "mime": "image/png",
+        "size": 70,
+        "data": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
+      }
+    },
+    {
+      "jsonrpc": "2.0",
+      "id": "i2",
+      "result": {
+        "found": false
+      }
+    }
+  ]
+}

@@ -1,0 +1,46 @@
+{
+  "comment": "session.list with `title` — the exact-title registry branch, methods_session.py:180-221. Frame 1 is what a gateway that HAS the branch answers: a literal one-element list (:205-217) with seven keys, where id is the row carrying the title and resolved_id is the live compression tip, so the two differ once the conversation has rotated. started_at comes from the root row and message_count from the tip; preview is empty because the tip is a get_session() row and preview is a field only list_sessions_rich derives. Hidden rows resolve here — the branch returns before include_hidden is read at :228 — and archived / kanban / tool rows come back as {\"sessions\": []}, an empty success rather than an error. Frame 2 is what an OLDER gateway answers to the same request: it does not know the param, ignores it, and returns its ordinary windowed listing (:223-259) — six keys, no resolved_id, none of them titled \"Bot Chat\". That frame is why the client-side exact-title filter exists (plugin.js:4316-4320): trusting sessions[0] here would adopt an unrelated conversation as the bot's forever chat.",
+  "frames": [
+    {
+      "jsonrpc": "2.0",
+      "id": "i1",
+      "result": {
+        "sessions": [
+          {
+            "id": "20260820_101010_abc123",
+            "resolved_id": "20260822_143000_tip999",
+            "title": "Bot Chat",
+            "preview": "",
+            "started_at": 1755684610.0,
+            "message_count": 214,
+            "source": "desktop"
+          }
+        ]
+      }
+    },
+    {
+      "jsonrpc": "2.0",
+      "id": "i2",
+      "result": {
+        "sessions": [
+          {
+            "id": "20260821_090000_visible",
+            "title": "Fix the roster poll",
+            "preview": "Let's start with the recency ordering.",
+            "started_at": 1755763200.0,
+            "message_count": 18,
+            "source": "ios"
+          },
+          {
+            "id": "20260819_120000_older11",
+            "title": "Bot Chat notes",
+            "preview": "A near miss on purpose.",
+            "started_at": 1755604800.0,
+            "message_count": 4,
+            "source": "desktop"
+          }
+        ]
+      }
+    }
+  ]
+}

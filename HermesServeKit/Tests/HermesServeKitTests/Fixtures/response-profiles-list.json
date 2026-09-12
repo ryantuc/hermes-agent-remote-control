@@ -1,0 +1,85 @@
+{
+  "comment": "profiles.list result. Row shape methods_profiles.py:216-276; top-level keys are exactly {profiles, bot_mode_protocol} (:277-284, the flag is hardcoded True and never sent as false). The three rows carry the three preferred_session states the tri-state exists for, and they are NOT interchangeable: `default` has the key with an object (the caller pinned it and it resolved), `work` has the key with null (the caller pinned it and the row is gone / archived / kanban-or-tool sourced, :93-98), `research` has NO key at all (the caller supplied no pin for it, or the gateway is too old to answer — :234-236 writes the key only for a non-empty caller pin). default's preferred_session is the post-compression shape: root_title has gone empty and the title has moved to the tip, so id != resolved_id (hermes_state.py:8829-8859). last_session (:174-181) has six keys — no resolved_id, no root_title — and can never be the Bot Chat, because its lookup omits include_hidden (:159-161) and canonical chats are born hidden (filter at hermes_state.py:9486). ui_meta is present only when profile.yaml carries a non-empty dict (:238-263); ui_meta_revisions is always present and is the feature-detect for gateway-owned CAS.",
+  "frames": [
+    {
+      "jsonrpc": "2.0",
+      "id": "i1",
+      "result": {
+        "profiles": [
+          {
+            "name": "default",
+            "path": "/Users/you/.hermes",
+            "is_default": true,
+            "model": "hermes-4-405b",
+            "provider": "nous",
+            "description": "The default profile",
+            "display_name": "",
+            "skill_count": 12,
+            "last_session": {
+              "id": "20260821_090000_visible",
+              "title": "Fix the roster poll",
+              "preview": "Let's start with the recency ordering.",
+              "started_at": 1755763200.0,
+              "last_active": 1755766800.0,
+              "message_count": 18
+            },
+            "worker_session": {
+              "id": "20260821_091500_worker1",
+              "source": "kanban",
+              "title": "board sweep",
+              "last_active": 1755767100.0
+            },
+            "preferred_session": {
+              "id": "20260820_101010_abc123",
+              "resolved_id": "20260822_143000_tip999",
+              "root_title": "",
+              "title": "Bot Chat",
+              "preview": "Sure — I pulled the numbers you asked for.",
+              "started_at": 1755684610.0,
+              "last_active": 1755870600.0,
+              "message_count": 214
+            },
+            "ui_meta": {
+              "hermes-bots": {
+                "chat": "20260820_101010_abc123",
+                "title": "Ops"
+              }
+            },
+            "ui_meta_revisions": { "hermes-bots": 7 },
+            "has_avatar": true
+          },
+          {
+            "name": "work",
+            "path": "/Users/you/.hermes/profiles/work",
+            "is_default": false,
+            "model": null,
+            "provider": null,
+            "description": "",
+            "display_name": "Work",
+            "skill_count": 3,
+            "last_session": null,
+            "worker_session": null,
+            "preferred_session": null,
+            "ui_meta_revisions": {},
+            "has_avatar": false
+          },
+          {
+            "name": "research",
+            "path": "/Users/you/.hermes/profiles/research",
+            "is_default": false,
+            "model": "hermes-4-70b",
+            "provider": "nous",
+            "description": "Reading and note-taking",
+            "display_name": "",
+            "skill_count": 0,
+            "last_session": null,
+            "worker_session": null,
+            "ui_meta_revisions": {},
+            "has_avatar": false
+          }
+        ],
+        "bot_mode_protocol": true
+      }
+    }
+  ]
+}

@@ -1,0 +1,21 @@
+{
+  "comment": "session.usage is the _get_usage dict (jsonrpc-methods-and-events.md 3.4, server.py:4560-4617). The context_* fields exist ONLY when a context compressor does, which is why the client treats them as optional and hides the ring rather than drawing a zero. estimated_total lives on session.context_breakdown, not here.",
+  "frames": [
+    {
+      "jsonrpc": "2.0",
+      "id": "i6",
+      "result": {
+        "model": "hermes-4-405b",
+        "input": 41200,
+        "output": 3180,
+        "total": 44380,
+        "calls": 12,
+        "context_used": 41200,
+        "context_max": 128000,
+        "context_percent": 32.2,
+        "compressions": 1,
+        "active_subagents": 0
+      }
+    }
+  ]
+}

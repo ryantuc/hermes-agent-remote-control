@@ -1,0 +1,10 @@
+{
+  "comment": "Error envelope (jsonrpc-methods-and-events.md 0.2, server.py:1660). 4001 is the universal 'session not found' for a live sid; 4007 is its durable-id twin. The shared TypeScript client discards the code and string-matches the message (reference-clients.md 1.5) — the Swift port keeps both.",
+  "frames": [
+    {
+      "jsonrpc": "2.0",
+      "id": "i7",
+      "error": { "code": 4001, "message": "session not found" }
+    }
+  ]
+}

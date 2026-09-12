@@ -1,0 +1,24 @@
+{
+  "comment": "session.create {title: \"Bot Chat\", hidden: true} result, methods_session.py:128-160. The response shape is identical to an ordinary create — `hidden` is deferred intent stored as pending_hidden (:101), not something the result echoes — so the only proof the flag travelled is the REQUEST, which is what the encoding test asserts. Nothing is on disk yet either: the create deliberately persists no DB row (:114-119); the row materialises on the first prompt.submit and set_session_hidden applies the pending flag then (server.py:3206-3226). stored_session_id is the durable key to pin; session_id is the ephemeral runtime id prompt.submit takes.",
+  "frames": [
+    {
+      "jsonrpc": "2.0",
+      "id": "i1",
+      "result": {
+        "session_id": "9f8e7d6c",
+        "stored_session_id": "20260823_101500_bot001",
+        "message_count": 0,
+        "messages": [],
+        "info": {
+          "model": "hermes-4-405b",
+          "provider": "nous",
+          "cwd": "/Users/you",
+          "branch": "",
+          "lazy": true,
+          "desktop_contract": 5,
+          "profile_name": "work"
+        }
+      }
+    }
+  ]
+}

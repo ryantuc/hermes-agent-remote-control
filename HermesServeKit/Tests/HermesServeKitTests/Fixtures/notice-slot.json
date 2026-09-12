@@ -1,0 +1,50 @@
+{
+  "comment": "notification.show / notification.clear (jsonrpc-methods-and-events.md 2.6). These occupy ONE keyed slot above the composer, not a stack in the transcript: show with the same key swaps content in place, a different key replaces the slot, an empty text clears it, and clear removes it (a clear for a key that is not showing must be ignored, or a stale frame would wipe a live warning).",
+  "frames": [
+    {
+      "jsonrpc": "2.0",
+      "method": "event",
+      "params": {
+        "type": "notification.show",
+        "session_id": "a1b2c3d4",
+        "payload": { "key": "rate_limit", "text": "Rate limited; retrying in 20s", "level": "warn" }
+      }
+    },
+    {
+      "jsonrpc": "2.0",
+      "method": "event",
+      "params": {
+        "type": "notification.show",
+        "session_id": "a1b2c3d4",
+        "payload": { "key": "rate_limit", "text": "Rate limited; retrying in 5s", "level": "warn" }
+      }
+    },
+    {
+      "jsonrpc": "2.0",
+      "method": "event",
+      "params": {
+        "type": "notification.show",
+        "session_id": "a1b2c3d4",
+        "payload": { "key": "mcp", "text": "filesystem MCP server reconnected", "level": "info" }
+      }
+    },
+    {
+      "jsonrpc": "2.0",
+      "method": "event",
+      "params": {
+        "type": "notification.clear",
+        "session_id": "a1b2c3d4",
+        "payload": { "key": "rate_limit" }
+      }
+    },
+    {
+      "jsonrpc": "2.0",
+      "method": "event",
+      "params": {
+        "type": "notification.clear",
+        "session_id": "a1b2c3d4",
+        "payload": { "key": "mcp" }
+      }
+    }
+  ]
+}

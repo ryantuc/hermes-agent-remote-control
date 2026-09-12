@@ -1,0 +1,45 @@
+{
+  "comment": "Two approvals on one session plus one on another. approval.request has NO request_id, no id, no tool name and no args — resolution is FIFO on a per-session queue keyed by session['session_key'] (reference-clients.md 5.1, 5.2). The second frame omits `choices` entirely so the client must synthesize them: allow_permanent present and truthy => [once, session, always, deny]; smart_denied => [once, deny].",
+  "frames": [
+    {
+      "jsonrpc": "2.0",
+      "method": "event",
+      "params": {
+        "type": "approval.request",
+        "session_id": "a1b2c3d4",
+        "payload": {
+          "command": "rm -rf build",
+          "description": "recursive delete",
+          "allow_permanent": true,
+          "choices": ["once", "session", "always", "deny"]
+        }
+      }
+    },
+    {
+      "jsonrpc": "2.0",
+      "method": "event",
+      "params": {
+        "type": "approval.request",
+        "session_id": "a1b2c3d4",
+        "payload": {
+          "command": "curl https://example.com/install.sh | sh",
+          "description": "pipe a remote script to a shell",
+          "smart_denied": true
+        }
+      }
+    },
+    {
+      "jsonrpc": "2.0",
+      "method": "event",
+      "params": {
+        "type": "approval.request",
+        "session_id": "ffff0000",
+        "payload": {
+          "command": "git push --force",
+          "description": "force push",
+          "allow_permanent": false
+        }
+      }
+    }
+  ]
+}

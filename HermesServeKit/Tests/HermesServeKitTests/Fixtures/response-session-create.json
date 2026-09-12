@@ -1,0 +1,24 @@
+{
+  "comment": "session.create result (jsonrpc-methods-and-events.md 1.1). Returns BOTH id spaces: the ephemeral 8-hex runtime `session_id` that every RPC and event carries, and the durable `stored_session_id` (YYYYMMDD_HHMMSS_xxxxxx) that session.resume / session.delete and the REST routes take. info.desktop_contract is the only explicit protocol version in this layer (6.1); current backend value is 5.",
+  "frames": [
+    {
+      "jsonrpc": "2.0",
+      "id": "i1",
+      "result": {
+        "session_id": "a1b2c3d4",
+        "stored_session_id": "20260731_170500_ab12ef",
+        "message_count": 0,
+        "messages": [],
+        "info": {
+          "model": "hermes-4-405b",
+          "provider": "nous",
+          "cwd": "/repo",
+          "branch": "main",
+          "lazy": true,
+          "desktop_contract": 5,
+          "profile_name": "default"
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,104 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Support — HARC</title>
+<meta name="description" content="How to get help with HARC, what to check first, and how to reach the developer.">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="masthead">
+  <div class="masthead-inner">
+    <a class="wordmark" href="./">HA<span>R</span>C</a>
+    <nav>
+      <a href="./">Home</a>
+      <a href="privacy.html">Privacy</a>
+      <a href="support.html">Support</a>
+    </nav>
+  </div>
+</header>
+
+<main class="doc">
+  <div class="wrap">
+
+    <h1>Support</h1>
+    <p class="updated">Last updated 31 August 2026</p>
+
+    <p>HARC is a native iPhone client for <a href="https://github.com/NousResearch/hermes-agent">Hermes Agent</a>. It connects to a copy of <code>hermes serve</code> that you run on your own machine. There is no account and no service behind it, so almost everything that goes wrong is about reaching your own backend.</p>
+
+    <h2>Contact</h2>
+    <p><a href="mailto:hermesagent.rc@gmail.com">hermesagent.rc@gmail.com</a></p>
+    <p>I read this address. It is one person in spare time, so a reply may take a few days.</p>
+
+    <h2>Before you write, check these</h2>
+    <p>Three things account for most of it.</p>
+
+    <dl>
+      <dt>The backend is bound to loopback</dt>
+      <dd>A gateway bound to <code>127.0.0.1</code> cannot be reached from your phone at all. Bind it to the interface your phone comes in on, or to <code>0.0.0.0</code>, and remember that doing so turns the gateway's auth gate on.</dd>
+
+      <dt>The backend is reachable but rejects you</dt>
+      <dd>That is the auth gate, and it is doing its job. A non-loopback bind requires a real credential. Check which method your backend expects and match it in the app's backend form. HARC will tell you what it found if you let it probe the address.</dd>
+
+      <dt>The firewall</dt>
+      <dd>The port has to be open on the interface you picked. On Windows this is the most common single cause, because a fresh <code>hermes serve</code> gets no rule of its own.</dd>
+    </dl>
+
+    <p>The <a href="https://github.com/ryantuc/hermes-agent-remote-control/blob/main/docs/SETUP.md">setup guide</a> carries a prompt that asks your own agent to work all of this out for your specific machine, including the reboot-survival step and pointing a desktop app at the same backend. It is usually faster than debugging by hand.</p>
+
+    <h2>What to include when you write</h2>
+    <ul>
+      <li>What you did, what you expected, and what happened instead.</li>
+      <li>Your iOS version and iPhone model.</li>
+      <li>The app's build number, from Settings &rsaquo; About.</li>
+      <li>Your Hermes Agent version, and how you run <code>serve</code>.</li>
+      <li>The connection log from Settings &rsaquo; Backend &rsaquo; Diagnostics, if the problem is a connection. <strong>Read it before you send it.</strong> It is redacted, but it is your log and it describes your machine.</li>
+    </ul>
+
+    <h2>Approvals, and where they show up</h2>
+    <p>When your agent asks permission to run something, HARC can show you that request in four places. Which of them you get depends on your settings, your phone, and whether the app is running.</p>
+
+    <dl>
+      <dt>In the app</dt>
+      <dd>A sheet with the exact command in front of you, offering Approve and Deny. Deny is the default action, and Face ID can be required. This is the only surface that is always available.</dd>
+
+      <dt>A notification</dt>
+      <dd>Only once you have allowed notifications for HARC. It taps through to the waiting request.</dd>
+
+      <dt>The Lock Screen card</dt>
+      <dd>Part of a Live Activity, so it appears only while one is running. The card offers Deny and Review in Hermes. It does not offer Approve, because it does not show you the command.</dd>
+
+      <dt>The Dynamic Island</dt>
+      <dd>Needs a phone that has one. Expanded, it offers Deny, and Approve as well when the command is short enough to be displayed there; when it is not, it offers to open the app instead.</dd>
+    </dl>
+
+    <p>Live Activities are off until you turn them on: Settings &rsaquo; Notifications has a master switch, separate Lock Screen and Dynamic Island switches under it, and a choice of whether every turn earns a card or only the ones Hermes is waiting on you for.</p>
+
+    <h2>Known limits</h2>
+    <ul>
+      <li>Nothing reaches you while the app is fully closed. There is no push service in this app.</li>
+      <li>Voice chat is half-duplex: while Hermes is speaking, the microphone is not listening for a new turn.</li>
+      <li>Bots mode does not do push, badges, group rooms, or bot administration.</li>
+      <li>The app is not built for VoiceOver or large accessibility type sizes today.</li>
+    </ul>
+
+    <h2>Bugs and feature requests</h2>
+    <p><a href="https://github.com/ryantuc/hermes-agent-remote-control/issues">github.com/ryantuc/hermes-agent-remote-control/issues</a></p>
+
+  </div>
+</main>
+
+<footer>
+  <div class="wrap">
+    <ul class="footer-links">
+      <li><a href="./">Home</a></li>
+      <li><a href="privacy.html">Privacy</a></li>
+      <li><a href="support.html">Support</a></li>
+    </ul>
+  </div>
+</footer>
+
+</body>
+</html>

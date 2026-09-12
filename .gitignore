@@ -1,0 +1,49 @@
+# XcodeGen output — regenerate with `xcodegen generate` from project.yml
+*.xcodeproj/
+*.xcworkspace/
+HermesApp/Info.plist
+
+# Swift Package Manager
+.build/
+.swiftpm/
+
+# Xcode
+DerivedData/
+build/
+xcuserdata/
+*.xcuserstate
+*.xcscmblueprint
+*.xccheckout
+*.moved-aside
+*.hmap
+*.ipa
+*.dSYM
+*.dSYM.zip
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Screenshot evidence — large, local, and not part of the product.
+screenshots/
+
+# Hermes Agent scratch directories. A session creates these inside the repo and
+# they collect tool crash logs and sentinel files. One was committed by accident
+# once; anything running `git add -A` would do it again.
+.hermes-tmp*/
+
+# Signing and secrets. None of this is tracked, and the first device archive is
+# where it arrives.
+*.mobileprovision
+*.p12
+*.cer
+*.certSigningRequest
+*.xcconfig
+ExportOptions.plist
+.env
+
+# Agent session worktrees and scratch, created at the repo root.
+# Never part of the product.
+.claude/

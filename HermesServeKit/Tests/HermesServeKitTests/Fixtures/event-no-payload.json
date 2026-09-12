@@ -1,0 +1,10 @@
+{
+  "comment": "Gotcha 2 (jsonrpc-methods-and-events.md 0.3): `payload` is OMITTED ENTIRELY when it would be None. This is how message.start is emitted (server.py:8982). Clients must treat a missing payload as {}.",
+  "frames": [
+    {
+      "jsonrpc": "2.0",
+      "method": "event",
+      "params": { "type": "message.start", "session_id": "a1b2c3d4" }
+    }
+  ]
+}

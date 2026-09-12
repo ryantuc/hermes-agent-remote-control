@@ -1,0 +1,101 @@
+{
+  "comment": "tool.output_risk {tool_id, name, risk, findings, redacted} (jsonrpc-methods-and-events.md 2.3, server.py:5117). Three shapes the client must not drop: (1) the easy case, an id that matches its card; (2) a tool.start that arrived with NO tool_id, so its card holds a synthetic live-tool: id and the risk event's real tool_id can never match it — correlation has to fall back to `name`; (3) a risk that beats its card, which is what happens with tool progress off, since the card is only materialised at tool.complete. The trailing all-empty event is the 'scanned, found nothing' shape and must change nothing.",
+  "frames": [
+    {
+      "jsonrpc": "2.0",
+      "method": "event",
+      "params": {
+        "type": "tool.start",
+        "session_id": "a1b2c3d4",
+        "payload": { "tool_id": "call_1", "name": "terminal", "context": "curl https://example.com/x.sh" }
+      }
+    },
+    {
+      "jsonrpc": "2.0",
+      "method": "event",
+      "params": {
+        "type": "tool.output_risk",
+        "session_id": "a1b2c3d4",
+        "payload": {
+          "tool_id": "call_1",
+          "name": "terminal",
+          "risk": "high",
+          "findings": ["Output contains an instruction to exfiltrate ~/.ssh/id_rsa"],
+          "redacted": true
+        }
+      }
+    },
+    {
+      "jsonrpc": "2.0",
+      "method": "event",
+      "params": {
+        "type": "tool.complete",
+        "session_id": "a1b2c3d4",
+        "payload": { "tool_id": "call_1", "name": "terminal", "result": "done", "duration_s": 0.9 }
+      }
+    },
+    {
+      "jsonrpc": "2.0",
+      "method": "event",
+      "params": {
+        "type": "tool.start",
+        "session_id": "a1b2c3d4",
+        "payload": { "name": "read_file", "context": "notes.md" }
+      }
+    },
+    {
+      "jsonrpc": "2.0",
+      "method": "event",
+      "params": {
+        "type": "tool.output_risk",
+        "session_id": "a1b2c3d4",
+        "payload": {
+          "tool_id": "call_9",
+          "name": "read_file",
+          "risk": "medium",
+          "findings": [],
+          "redacted": false
+        }
+      }
+    },
+    {
+      "jsonrpc": "2.0",
+      "method": "event",
+      "params": {
+        "type": "tool.output_risk",
+        "session_id": "a1b2c3d4",
+        "payload": {
+          "tool_id": "call_12",
+          "name": "web_fetch",
+          "risk": "high",
+          "findings": ["The page asks the agent to ignore its instructions"],
+          "redacted": false
+        }
+      }
+    },
+    {
+      "jsonrpc": "2.0",
+      "method": "event",
+      "params": {
+        "type": "tool.complete",
+        "session_id": "a1b2c3d4",
+        "payload": { "tool_id": "call_12", "name": "web_fetch", "result": "<html>…</html>" }
+      }
+    },
+    {
+      "jsonrpc": "2.0",
+      "method": "event",
+      "params": {
+        "type": "tool.output_risk",
+        "session_id": "a1b2c3d4",
+        "payload": {
+          "tool_id": "call_1",
+          "name": "terminal",
+          "risk": "",
+          "findings": [],
+          "redacted": false
+        }
+      }
+    }
+  ]
+}
