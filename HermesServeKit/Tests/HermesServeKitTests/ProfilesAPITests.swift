@@ -131,37 +131,20 @@ final class ProfilesAPITests: XCTestCase {
 
     // MARK: - profiles.list request
 
-    func testListSendsIncludeSessionsAndOnlyANonEmptyPinMap() async throws {
+    /// The declared params are `include_sessions` + `profile` (`contracts/profiles_vault_complete_foreign_subagents.py:170-171`, `:165-166` on an older backend)
+    /// and any other key answers 4000, so the request is exactly `include_sessions`.
+    func testListSendsOnlyIncludeSessions() async throws {
         let (client, socket) = try await ScriptedGateway.connected(replies: [
-            "profiles.list": [
-                try Fixtures.result("response-profiles-list"),
-                try Fixtures.result("response-profiles-list"),
-            ]
+            "profiles.list": [try Fixtures.result("response-profiles-list")]
         ])
         let profiles = ProfilesAPI(client: client)
 
         _ = try await profiles.list()
-        let sentBare = await socket.sentParams("profiles.list")
-        let bare = try XCTUnwrap(sentBare)
-        XCTAssertEqual(bare["include_sessions"]?.coercedBool, true)
-        XCTAssertNil(
-            bare["preferred_session_ids"],
-            "an empty pin map costs a per-profile database open and buys nothing"
-        )
-
-        _ = try await profiles.list(preferredSessionIDs: [
-            "default": "20260820_101010_abc123",
-            "work": "20260821_120000_work22",
-        ])
-        let sentPinned = await socket.sentParams("profiles.list")
-        let pinned = try XCTUnwrap(sentPinned)
+        let sent = await socket.sentParams("profiles.list")
         XCTAssertEqual(
-            pinned["preferred_session_ids"],
-            .object([
-                "default": .string("20260820_101010_abc123"),
-                "work": .string("20260821_120000_work22"),
-            ]),
-            "the pin map is an object keyed by profile name; anything else is discarded"
+            sent,
+            .object(["include_sessions": .bool(true)]),
+            "preferred_session_ids is rejected with 4000 by every supported backend and the roster never loads"
         )
 
         await client.disconnect()

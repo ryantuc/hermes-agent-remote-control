@@ -85,6 +85,7 @@ struct NavigationHubView: View {
     }
 
     private var backendSubtitle: String {
+        if app.isDemoActive { return HubBackendCopy.demoSubtitle }
         switch app.connectionState {
         case .open:
             var parts = ["Connected"]
@@ -178,7 +179,7 @@ struct NavigationHubView: View {
                     }
                     .padding(.bottom, Space.s6)
                 } else {
-                    if !app.threads.isEmpty {
+                    if HubGroupingSegment.isShown(hasThreads: !app.threads.isEmpty, groupingMode: groupingMode) {
                         SegmentedRow(
                             options: ["Sessions", "Projects"],
                             selection: $groupingMode,
@@ -373,5 +374,20 @@ struct HubBackendRow: View {
         .hairline()
         .accessibilityLabel("Backend: \(title), \(subtitle)")
         .accessibilityHint("Opens backend settings")
+    }
+}
+
+enum HubBackendCopy {
+    /// The demo answers on a scripted socket, so "Connected" and a version string would describe a backend that does not exist.
+    static let demoSubtitle = "Sample conversations · no backend"
+}
+
+/// When the hub draws its Sessions / Projects segment.
+enum HubGroupingSegment {
+    /// The segment is the only control that changes `hermes.hub.mode`, so whether it is drawn is decided here, where a test can reach it.
+    ///
+    /// BUG-146: hidden whenever the account had no threads, but the grouping is persisted, so an empty account left on Projects showed an empty Projects list with no way back. It stays while Projects is selected.
+    static func isShown(hasThreads: Bool, groupingMode: String) -> Bool {
+        hasThreads || groupingMode == "Projects"
     }
 }

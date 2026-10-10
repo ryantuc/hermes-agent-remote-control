@@ -64,9 +64,12 @@ struct ApprovalSheetView: View {
     /// Latches once the end of the command has been reached; never re-gates on scroll-up.
     @State private var reachedCommandEnd = false
 
-    /// A command overflows when its natural height exceeds the 190 pt window.
+    /// A command overflows when its natural height exceeds the 190 pt window, by the same rule the read latch uses.
     private var commandOverflows: Bool {
-        commandContainerHeight > 0 && commandContentHeight > commandContainerHeight + 1
+        ApprovalReadGate.overflows(
+            containerHeight: Double(commandContainerHeight),
+            contentHeight: Double(commandContentHeight)
+        ) ?? false
     }
 
     /// Satisfied unless the command overflows and has not yet been read to end.
@@ -314,13 +317,19 @@ struct ApprovalSheetView: View {
             .frame(maxWidth: .infinity)
             .background(
                 LinearGradient(
-                    colors: [t.enclosure.opacity(0), t.enclosure],
+                    stops: Self.gateVeilStops(t),
                     startPoint: .top,
                     endPoint: .bottom
                 )
             )
             .allowsHitTesting(false)
         }
+    }
+
+    /// The veil's gradient, top to bottom, apart from the view so a test can read it.
+    /// Painted in the command block's own ground (`EnclosureModifier` draws `toolCard`, not `enclosure`), and solid from just above the cue down, so no command text shows through "Scroll to the end ▾".
+    static func gateVeilStops(_ t: HermesTokens) -> [Gradient.Stop] {
+        [.init(color: t.toolCard.opacity(0), location: 0), .init(color: t.toolCard, location: 0.55)]
     }
 
     private func riskLine(_ text: String) -> some View {
@@ -368,7 +377,7 @@ struct ApprovalSheetView: View {
                 }
                 .disabled(allowsGated)
 
-                Text("Always allow writes the pattern to your backend's allowlist in config.yaml, for every conversation.")
+                Text("Always allow tells your backend to stop asking about commands like this one, in every conversation.")
                     .font(HermesFont.footnote)
                     .foregroundStyle(t.text3)
                     .frame(maxWidth: .infinity, alignment: .leading)
@@ -488,24 +497,31 @@ struct ApprovalSheetView: View {
                     .font(HermesFont.code)
                     .foregroundStyle(t.text3)
             }
-            Text("Skipping is safe: the tool reports the value as skipped rather than failing.")
+            Text(request.serverRequest != nil
+                 ? "Skipping ends this request for every client viewing the session."
+                 : "Skipping is safe: the tool reports the value as skipped rather than failing.")
                 .font(HermesFont.footnote)
                 .foregroundStyle(t.text3)
 
-            SecureField("Value", text: $secretValue)
-                .font(HermesFont.body)
-                .textContentType(.password)
-                .autocorrectionDisabled()
-                .textInputAutocapitalization(.never)
-                .padding(Space.s5)
-                .enclosure()
+            if !request.requiresDesktop {
+                SecureField("Value", text: $secretValue)
+                    .font(HermesFont.body)
+                    .textContentType(.password)
+                    .autocorrectionDisabled()
+                    .textInputAutocapitalization(.never)
+                    .padding(Space.s5)
+                    .enclosure()
 
-            HStack(spacing: Space.s4) {
-                Button("Skip") { submitSecret("") }
+                HStack(spacing: Space.s4) {
+                    Button("Skip") { submitSecret("") }
+                        .buttonStyle(SecondaryButtonStyle())
+                    Button(request.serverRequest?.method == "secret" || request.serverRequest == nil ? "Save to backend" : "Send") { submitSecret(secretValue) }
+                        .buttonStyle(PrimaryButtonStyle())
+                        .disabled(secretValue.isEmpty)
+                }
+            } else {
+                Button("Skip for all clients") { submitSecret("") }
                     .buttonStyle(SecondaryButtonStyle())
-                Button("Save to backend") { submitSecret(secretValue) }
-                    .buttonStyle(PrimaryButtonStyle())
-                    .disabled(secretValue.isEmpty)
             }
         }
         .disabled(isSubmitting)
@@ -519,7 +535,7 @@ struct ApprovalSheetView: View {
             onMinimise()
             dismiss()
         } label: {
-            Text("Minimise")
+            Text("Minimize")
                 .font(HermesFont.callout)
                 .foregroundStyle(t.text2)
                 .frame(maxWidth: .infinity, minHeight: Hit.min)
@@ -590,7 +606,7 @@ struct ApprovalSheetView: View {
         case .approval: return "Hermes wants to run a command"
         case .clarify(let request): return request.isBatch ? "Hermes has some questions" : "Hermes has a question"
         case .sudo: return "Administrator password needed"
-        case .secret: return "Credential needed"
+        case .secret(let request): return request.requiresDesktop ? "Continue in Desktop" : "Credential needed"
         }
     }
 
@@ -610,13 +626,14 @@ struct ApprovalSheetView: View {
         case .approval(let request):
             return model.approvalBudget(for: request)
         case .clarify(let request):
+            guard request.serverRequest == nil else { return nil }
             // Wire payload first, else the configured `agent.clarify_timeout`, else the kit default.
             let seconds = clarifyTimeoutSeconds(for: request)
             // `<= 0` is the backend's "wait forever", and rendering it as a drained red bar would invent an expiry.
             guard seconds > 0 else { return nil }
             return (request.receivedAt, seconds)
-        case .sudo(let request): return (request.receivedAt, request.timeoutSeconds)
-        case .secret(let request): return (request.receivedAt, request.timeoutSeconds)
+        case .sudo(let request): return request.serverRequest == nil ? (request.receivedAt, request.timeoutSeconds) : nil
+        case .secret(let request): return request.serverRequest == nil ? (request.receivedAt, request.timeoutSeconds) : nil
         }
     }
 

@@ -34,7 +34,7 @@ final class BackendEditorDecisionTests: XCTestCase {
         }
         XCTAssertEqual(
             BackendAuthMethod.allCases.map(\.title),
-            ["Password", "Bearer token", "Session token", "None"],
+            ["Password", "Access token", "Session token", "None"],
             "the menu's order and words are the screen; pin them"
         )
     }

@@ -15,6 +15,8 @@ enum ChatOverflowAction: String, CaseIterable, Equatable, Identifiable {
     case rename
     /// The existing `ProjectPickerSheet`, applied through `ChatModel.applyCwd`; a session is in a project because its cwd sits inside that project's path, and there is no `session.project` field to write.
     case project
+    /// `PromptTimelineSheet`: the conversation's prompts, each a jump.
+    case timeline
 
     var id: String { rawValue }
 
@@ -23,6 +25,7 @@ enum ChatOverflowAction: String, CaseIterable, Equatable, Identifiable {
         case .details: return "info.circle"
         case .rename: return "pencil"
         case .project: return "folder"
+        case .timeline: return "list.bullet.below.rectangle"
         }
     }
 
@@ -31,16 +34,22 @@ enum ChatOverflowAction: String, CaseIterable, Equatable, Identifiable {
         case .details: return "Session details"
         case .rename: return "Rename conversation"
         case .project: return "Move to project"
+        case .timeline: return "Jump to a prompt"
         }
     }
 }
 
 enum ChatChrome {
+    /// Off until a jump survives leaving and reopening the chat: a windowed page reopened after a successful replay reads as the end of the conversation.
+    static let promptTimelineEnabled = false
+
     /// The overflow's action set, in order: info, pencil, folder. A bot thread is never offered Rename, because a bot conversation's title is the registry key its resolver looks it up by; a draft is not offered it because there is no session id to rename yet.
-    static func overflowActions(isBotThread: Bool, isDraft: Bool) -> [ChatOverflowAction] {
+    static func overflowActions(isBotThread: Bool, isDraft: Bool, offersTimeline: Bool = false) -> [ChatOverflowAction] {
         var actions: [ChatOverflowAction] = [.details]
         if !isBotThread && !isDraft { actions.append(.rename) }
         actions.append(.project)
+        // Only a conversation with prompts in it has anywhere to jump; the demo and a backend without the routes offer nothing.
+        if offersTimeline && promptTimelineEnabled { actions.append(.timeline) }
         return actions
     }
 
@@ -50,12 +59,14 @@ enum ChatChrome {
     /// BUG-120: the region the chrome may paint into below the layout bounds. `.container` is the home indicator, and it is neither `.all` nor `.keyboard`, which would re-enter the keyboard's inset negotiation.
     static let homeIndicatorEscape: SafeAreaRegions = .container
 
-    /// BUG-120: height of the layout-neutral fade hanging off the top bar into the transcript. Not a mask on the composer plate, where a fade sits on the well itself and reads as a dirty halo.
-    static let frostEdgeFade: CGFloat = Space.s6
+    /// Whether the app frosts the region under the top bar itself. Only where the OS does not: on iOS 26 the transcript's scroll view draws its own soft scroll-edge effect there, and a plane over it would hide it.
+    static func drawsOwnTopPlane(_ rendering: GlassRendering) -> Bool {
+        rendering == .material
+    }
 
     /// What the popover draws: the enabled set, plus the one control that is shown and disabled rather than omitted. A draft's Rename is unavailable only until its first send, so it is greyed; a bot thread's is wrong forever, so it is omitted, and the bot rule wins where both apply.
-    static func overflowEntries(isBotThread: Bool, isDraft: Bool) -> [ChatOverflowEntry] {
-        let enabled = overflowActions(isBotThread: isBotThread, isDraft: isDraft)
+    static func overflowEntries(isBotThread: Bool, isDraft: Bool, offersTimeline: Bool = false) -> [ChatOverflowEntry] {
+        let enabled = overflowActions(isBotThread: isBotThread, isDraft: isDraft, offersTimeline: offersTimeline)
         guard isDraft, !isBotThread else {
             return enabled.map { ChatOverflowEntry(action: $0, isEnabled: true) }
         }
@@ -100,7 +111,7 @@ enum ChatChromeMaterial: Equatable {
         osMajorVersion >= liquidGlassMinimumMajorVersion ? .liquidGlass : .ultraThinMaterial
     }
 
-    /// The frost the chat's own chrome is painted in. Both cases resolve to the same material: `.ultraThinMaterial` is the thinnest SwiftUI defines, and thinning further buys nothing because the transcript stops at the plate's top edge and the plate always sits on flat `canvas`.
+    /// The frost under both chrome planes. Both cases resolve to the same material: `.ultraThinMaterial` is the thinnest SwiftUI defines, and how much of the transcript shows through is set by the theme tint laid over it (`GlassMetrics.chromeTintOpacity`), not by a thinner material.
     var frost: Material {
         switch self {
         case .liquidGlass: return .ultraThinMaterial
@@ -114,40 +125,33 @@ enum ChatChromeMaterial: Equatable {
 }
 
 extension View {
-    /// The glass top bar. The background is declared on every OS deliberately: letting the system paint its own bar on iOS 26 also hands the bar its scroll-edge behaviour, which changes the geometry `.defaultScrollAnchor(.bottom)` resolves against and reproduces BUG-016.
+    /// The top bar. Its own background is declared, and declared visible, on every OS deliberately: letting the system paint its own bar on iOS 26 also hands the bar its scroll-edge behaviour, which changes the geometry `.defaultScrollAnchor(.bottom)` resolves against and reproduces BUG-016. Do not flip it to `.automatic`.
+    /// It is declared clear. The transcript's scroll view already runs up under the bar and the status bar (its top content inset is the bar), so the bar only has to stop hiding it: on iOS 26 the scroll view's own soft scroll-edge effect then frosts and fades the conversation under Back and `⋯`, which is the system's Liquid Glass top edge; below 26 `chatGlassTopPlane()` frosts it instead. The material this used to paint sat over that effect and turned it into a grey slab (BUG-061).
     func chatGlassNavigationBar() -> some View {
-        toolbarBackground(.ultraThinMaterial, for: .navigationBar)
+        toolbarBackground(Color.clear, for: .navigationBar)
             .toolbarBackground(.visible, for: .navigationBar)
-            // Hit-testing off so the band cannot steal Back, ⋯ or scroll. Do not flip `.toolbarBackground` to `.automatic` (BUG-016).
-            .overlay(alignment: .top) {
-                Rectangle()
-                    .fill(.ultraThinMaterial)
-                    .frame(height: ChatChrome.frostEdgeFade)
-                    .mask {
-                        LinearGradient(
-                            colors: [.black, .clear],
-                            startPoint: .top,
-                            endPoint: .bottom
-                        )
-                    }
+    }
+
+    /// The frost under the top bar where the OS draws none: a `GlassPlaneBackground` whose rounded edge sits on the top of the conversation and which reaches up past the bar and the status bar and off the screen. Drawn only when the glass resolves to `.material` (iOS 17 to 25, or the forced fallback); on iOS 26 it would bury the system's own scroll-edge effect.
+    /// Apply it outside the connection banner's `safeAreaInset`, so the plane ends where the bar ends rather than where the banner does. Layout-neutral: an overlay moved by an offset, which moves drawing and nothing else. In demo mode the demo marker is raised above it (`demoModeMarker`).
+    func chatGlassTopPlane() -> some View {
+        overlay(alignment: .top) {
+            if ChatChrome.drawsOwnTopPlane(GlassRendering.current) {
+                GlassPlaneBackground(anchoredTo: .top, cornerRadius: ChatChrome.plateCornerRadius)
+                    .frame(height: GlassMetrics.topPlaneReach)
+                    .offset(y: -GlassMetrics.topPlaneReach)
                     .allowsHitTesting(false)
                     .accessibilityHidden(true)
             }
+        }
     }
 
-    /// One frosted plane for the whole bottom stack rather than one per row, so a row appearing does not put a second frost over the first. A material and never `glassEffect`: a full-width `glassEffect` directly beneath a scroll view is read as a bottom bar, which reproduces BUG-016.
+    /// One frosted plane for the whole bottom stack rather than one per row, so a row appearing does not put a second frost over the first; the rows on it paint no ground of their own. A material and never `glassEffect`: a full-width `glassEffect` directly beneath a scroll view is read as a bottom bar, which reproduces BUG-016.
     func chatGlassChrome() -> some View {
         background {
-            UnevenRoundedRectangle(
-                topLeadingRadius: ChatChrome.plateCornerRadius,
-                bottomLeadingRadius: 0,
-                bottomTrailingRadius: 0,
-                topTrailingRadius: ChatChrome.plateCornerRadius,
-                style: .continuous
-            )
-            .fill(ChatChromeMaterial.current.frost)
-            // BUG-120: shaped materials clip to layout bounds, so the plate escapes into the home-indicator well only.
-            .ignoresSafeArea(ChatChrome.homeIndicatorEscape, edges: .bottom)
+            GlassPlaneBackground(anchoredTo: .bottom, cornerRadius: ChatChrome.plateCornerRadius)
+                // BUG-120: shaped materials clip to layout bounds, so the plate escapes into the home-indicator well only.
+                .ignoresSafeArea(ChatChrome.homeIndicatorEscape, edges: .bottom)
         }
     }
 }
@@ -174,6 +178,11 @@ enum ChatProjectSubtitle: Equatable {
         }
     }
 
+    /// What the conversation header draws on its second line; nil draws nothing. The line is laid out in every state, so the header's height never changes when the answer lands, but an unresolved project is left blank rather than drawn as a bare em dash, which under a title reads as a rendering fault. `text` keeps the dash for the places that show a value cell.
+    var headerText: String? {
+        self == .unknown ? nil : text
+    }
+
     /// The derivation, given one `projects.for_cwd` answer. `didResolve` is whether the call has come back at all, because claiming "no project" before it has makes every header flicker through the wrong answer.
     static func derive(
         cwd: String,
@@ -198,7 +207,12 @@ final class ChatProjectSubtitleModel {
 
     private(set) var subtitle: ChatProjectSubtitle = .unknown
 
+    /// The latest resolve's ticket. Only the resolve holding it may write, because the request does not stop when its task is cancelled and an overtaken answer can arrive last (BUG-093's race).
+    private var generation = 0
+
     func resolve(cwd: String, isConnected: Bool, forCwd: ForCwd?) async {
+        generation += 1
+        let ticket = generation
         guard isConnected, !cwd.isEmpty, let forCwd else {
             subtitle = ChatProjectSubtitle.derive(
                 cwd: cwd,
@@ -209,6 +223,7 @@ final class ChatProjectSubtitleModel {
             return
         }
         let answer = try? await forCwd(cwd)
+        guard ticket == generation, !Task.isCancelled else { return }
         subtitle = ChatProjectSubtitle.derive(
             cwd: cwd,
             projectName: answer?.project ?? "",

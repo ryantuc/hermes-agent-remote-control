@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Report a security vulnerability
+    url: https://github.com/ryantuc/hermes-agent-remote-control/security/advisories/new
+    about: Privately, through GitHub's vulnerability reporting. Please do not open a public issue for a security problem.
+  - name: A problem with hermes serve itself
+    url: https://github.com/NousResearch/hermes-agent/issues
+    about: Bugs in the backend belong to Hermes Agent.

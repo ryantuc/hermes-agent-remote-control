@@ -18,19 +18,43 @@ final class AudioSession {
         case voiceChat
     }
 
+    /// A change to the audio route that a live microphone cannot ride out (BUG-131 B). The system's other reasons — a category change, which our own `begin` causes, a configuration change, waking from sleep — leave the devices where they were and are not reported.
+    enum RouteChange: Equatable {
+        /// A headset, AirPods or a car left the route.
+        case deviceLost
+        /// A headset, AirPods or a car joined the route.
+        case deviceAdded
+        /// Nothing on the route can serve the category, such as no microphone.
+        case noRoute
+
+        init?(reason: AVAudioSession.RouteChangeReason) {
+            switch reason {
+            case .oldDeviceUnavailable: self = .deviceLost
+            case .newDeviceAvailable: self = .deviceAdded
+            case .noSuitableRouteForCategory: self = .noRoute
+            default: return nil
+            }
+        }
+    }
+
     private(set) var active: Set<Use> = []
 
     /// Called when the system interrupts us. One slot is enough because only one
     /// recording use can be live at a time.
     var interruptionHandler: (@MainActor () -> Void)?
 
+    /// Called when a device joins or leaves the route. One slot, for the same reason as `interruptionHandler`; only voice chat installs it.
+    var routeChangeHandler: (@MainActor (RouteChange) -> Void)?
+
     private var observing = false
 
     private init() {}
 
     /// Claim the session for `use`, reconfiguring only if the category changes.
+    ///
+    /// The use is recorded before the session is touched, so it is held even when this throws: the caller ends what it began on every path, failure included, and every caller's failure path does.
     func begin(_ use: Use) throws {
-        observeInterruptionsIfNeeded()
+        observeSystemNotificationsIfNeeded()
         let before = configuration(for: active)
         active.insert(use)
         let after = configuration(for: active)
@@ -95,11 +119,25 @@ final class AudioSession {
         return nil
     }
 
-    // MARK: Interruptions
+    // MARK: Interruptions and route changes
 
-    private func observeInterruptionsIfNeeded() {
+    private func observeSystemNotificationsIfNeeded() {
         guard !observing else { return }
         observing = true
+        NotificationCenter.default.addObserver(
+            forName: AVAudioSession.routeChangeNotification,
+            object: AVAudioSession.sharedInstance(),
+            queue: .main
+        ) { note in
+            let raw = note.userInfo?[AVAudioSessionRouteChangeReasonKey] as? UInt
+            MainActor.assumeIsolated {
+                guard let raw,
+                      let reason = AVAudioSession.RouteChangeReason(rawValue: raw),
+                      let change = RouteChange(reason: reason)
+                else { return }
+                AudioSession.shared.routeChangeHandler?(change)
+            }
+        }
         NotificationCenter.default.addObserver(
             forName: AVAudioSession.interruptionNotification,
             object: AVAudioSession.sharedInstance(),

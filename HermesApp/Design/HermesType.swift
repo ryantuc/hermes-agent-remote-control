@@ -33,7 +33,7 @@ public enum HermesFont {
     public static let heading = HermesTextStyle(size: 17, weight: .semibold, relativeTo: .headline)
     /// Message text. Also the input floor.
     ///
-    /// Do not raise these conversation rungs to the iOS semantic sizes: the composer measures its control row to compute `fieldLineCap`, and at 17 pt that feedback loop stops settling and hangs the composer.
+    /// These conversation rungs sit one step under the iOS semantic sizes. Raising them (body 17, callout 16, subheadline 15, footnote 13, FEAT-017 §5) hung the composer when it was first tried (BUG-056). Re-measured later against a real keyboard, the same sizes pass `ComposerReachabilityUITests`, and the composer's chrome measurement is now damped (`ComposerChromeMeasure`), so the composer no longer blocks the change; whether to make it is a design decision. `TypeLadderTests` pins what ships.
     public static let body = HermesTextStyle(size: 16, weight: .regular, relativeTo: .body)
     /// Emphasis inside a message.
     public static let bodyStrong = HermesTextStyle(size: 16, weight: .medium, relativeTo: .body)

@@ -23,6 +23,8 @@ enum TranscriptScrollLog {
         case containerResize
         /// BUG-016: the content offset was written directly with a forced layout; its absence during a blank says the ladder believed it had already succeeded.
         case offsetSettle
+        /// The trailing scroll after a burst of content growth, once per burst.
+        case followSettle
     }
 
     static func scroll(_ site: Site, isNearBottom: Bool) {

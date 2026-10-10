@@ -116,6 +116,8 @@ public actor HermesClient {
 
     private struct PendingCall {
         let method: String
+        let sessionID: String?
+        let snapshotRevision: Int
         let timeoutSeconds: TimeInterval
         let continuation: CheckedContinuation<JSONValue, Error>
         var timeoutTask: Task<Void, Never>?
@@ -135,7 +137,20 @@ public actor HermesClient {
     private var pending: [String: PendingCall] = [:]
     private var nextID = 0
 
-    private var outbox: [String] = []
+    private struct OutboundFrame {
+        let line: String
+        let generation: Int
+        let completion: CheckedContinuation<Void, Error>?
+    }
+    private var outbox: [OutboundFrame] = []
+    private let handlesServerRequests: Bool
+    private var serverRequests = ServerRequestRegistry()
+    private var capabilitiesID: String?
+    public private(set) var serverRequestMethods: [String] = []
+    /// This connection's backend counts a 4404 as one client abstaining rather than as the answer (`client.capabilities` → `declines_not_shown`).
+    public private(set) var declinesNotShown = false
+    private var requestRefreshTask: Task<Void, Never>?
+    private var eventSequences: [String: Int] = [:]
     private var writerTask: Task<Void, Never>?
 
     private var eventContinuations: [UUID: AsyncStream<GatewayEvent>.Continuation] = [:]
@@ -178,17 +193,19 @@ public actor HermesClient {
 
     /// Production entry point.
     public init(auth: AuthenticationClient, rest: RestAPI, log: ConnectionLog? = nil) {
-        self.init(dialer: GatewayDialer(auth: auth, rest: rest), log: log)
+        self.init(dialer: GatewayDialer(auth: auth, rest: rest), log: log, handlesServerRequests: true)
     }
 
     /// Seam entry point: everything the connect machine touches, injectable.
     public init(
         dialer: GatewayDialer,
         log: ConnectionLog? = nil,
+        handlesServerRequests: Bool = false,
         transportFactory: @escaping TransportFactory = { onFrame, onState in
             WebSocketTransport(onFrame: onFrame, onState: onState)
         }
     ) {
+        self.handlesServerRequests = handlesServerRequests
         self.dialer = dialer
         self.log = log
         self.transportFactory = transportFactory
@@ -468,6 +485,7 @@ public actor HermesClient {
     /// Every transport carries the generation it was created in, and callbacks from an older one
     /// are dropped: a dead socket's receive loop can still be unwinding while the replacement dials.
     private func makeTransport() -> any GatewayTransport {
+        retireServerRequestTransport()
         transportGeneration += 1
         let generation = transportGeneration
         return transportFactory(
@@ -521,6 +539,8 @@ public actor HermesClient {
 
     /// Tear down deliberately. Stops auto-reconnect; `connect()` restarts it.
     public func disconnect() async {
+        // Reject late frames before yielding to a transport whose close callback may arrive later.
+        transportClosedSinceConnect = true
         autoReconnectEnabled = false
         // Cancelling the task is not enough: moving the epoch is what makes a dial already in
         // flight fail instead of finishing (BUG-067B).
@@ -532,7 +552,7 @@ public actor HermesClient {
         finishReady(with: HermesError.connectionClosed("Disconnected"))
         failAllPending(HermesError.connectionClosed("The gateway connection closed."))
         // Queued frames die with the socket they were aimed at; replay is a consent hazard.
-        outbox.removeAll()
+        clearOutbox()
         if let transport = transport { await transport.disconnect() }
         transport = nil
         setState(.idle)
@@ -600,6 +620,8 @@ public actor HermesClient {
         timeout: TimeInterval? = nil
     ) async throws -> JSONValue {
         guard state.isOpen, transport != nil else { throw HermesError.notConnected }
+        let generation = transportGeneration
+        let snapshotRevision = serverRequests.beginSnapshot()
         let effectiveTimeout = timeout ?? Self.defaultTimeout(for: method)
         nextID += 1
         let id = "i\(nextID)"
@@ -613,9 +635,12 @@ public actor HermesClient {
         // Params are never logged: `sudo.respond` carries a password, `secret.respond` an API key.
         await log?.debug("rpc", "→ \(method) [\(id)]")
 
+        guard generation == transportGeneration, state.isOpen else { throw HermesError.notConnected }
         return try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<JSONValue, Error>) in
             pending[id] = PendingCall(
                 method: method,
+                sessionID: params?["session_id"]?.stringValue,
+                snapshotRevision: snapshotRevision,
                 timeoutSeconds: effectiveTimeout,
                 continuation: continuation,
                 timeoutTask: nil
@@ -648,7 +673,14 @@ public actor HermesClient {
         call.continuation.resume(throwing: error)
     }
 
+    private func clearOutbox() {
+        let frames = outbox
+        outbox.removeAll()
+        for frame in frames { frame.completion?.resume(throwing: HermesError.notConnected) }
+    }
+
     private func failAllPending(_ error: Error) {
+        retireServerRequestTransport()
         let calls = pending
         pending.removeAll()
         for (_, call) in calls {
@@ -661,8 +693,12 @@ public actor HermesClient {
 
     /// A single writer drains the queue so wire order matches call order — an `approval.respond`
     /// must not overtake the `prompt.submit` that provoked it.
-    private func enqueue(line: String) {
-        outbox.append(line)
+    private func enqueue(line: String, completion: CheckedContinuation<Void, Error>? = nil) {
+        outbox.append(OutboundFrame(line: line, generation: transportGeneration, completion: completion))
+        startWriterIfIdle()
+    }
+
+    private func startWriterIfIdle() {
         guard writerTask == nil else { return }
         writerTask = Task { [weak self] in
             await self?.drainOutbox()
@@ -671,21 +707,34 @@ public actor HermesClient {
 
     private func drainOutbox() async {
         while !outbox.isEmpty {
-            let line = outbox.removeFirst()
+            let frame = outbox.removeFirst()
+            guard frame.generation == transportGeneration else {
+                frame.completion?.resume(throwing: HermesError.notConnected)
+                continue
+            }
             guard let transport = transport else {
+                frame.completion?.resume(throwing: HermesError.notConnected)
                 failAllPending(HermesError.notConnected)
-                // `approval.respond` is positional FIFO with no request id, so a frame flushed onto
+                // ID-less legacy `approval.respond` is positional FIFO, so a frame flushed onto
                 // the NEXT socket could answer an approval the user never saw.
-                outbox.removeAll()
+                clearOutbox()
                 break
             }
             do {
-                try await transport.send(line: line)
+                try await transport.send(line: frame.line)
+                if frame.generation == transportGeneration, !transportClosedSinceConnect {
+                    frame.completion?.resume()
+                } else {
+                    frame.completion?.resume(throwing: HermesError.notConnected)
+                }
             } catch {
                 let mapped = HermesError.from(error)
+                frame.completion?.resume(throwing: mapped)
+                guard frame.generation == transportGeneration else { continue }
                 await log?.warning("rpc", "send failed: \(mapped.localizedDescription)")
+                guard frame.generation == transportGeneration else { continue }
                 failAllPending(mapped)
-                outbox.removeAll()
+                clearOutbox()
                 // BUG-067A: a send that throws is a socket that is gone, and on a silently
                 // NAT-dropped one no close ever arrives to arm a reconnect by itself.
                 await failSocket(after: mapped)
@@ -693,11 +742,19 @@ public actor HermesClient {
             }
         }
         writerTask = nil
+        // A frame enqueued while this drain sat in an `await` after its last emptiness check (the
+        // socket teardown above, typically) found a writer still set and started none; never leave
+        // it stranded (BUG-146). A frame for a dead socket is failed by the next drain's own guards.
+        if !outbox.isEmpty { startWriterIfIdle() }
     }
 
     /// The `.closed` teardown reached from the other direction: a send that threw rather than a
     /// close that arrived, so the auth exemption is read off the error instead of a close code.
     private func failSocket(after error: HermesError) async {
+        // The socket being failed, pinned now: a reconnect can complete while `disconnect()` below
+        // is awaited, and the socket it installs is not this method's to tear down (BUG-146).
+        let failing = transport
+        let generation = transportGeneration
         let reason = "The connection dropped (\(error.localizedDescription))."
         let wasLive = state.isOpen || state.isBusyConnecting
         transportClosedSinceConnect = true
@@ -722,8 +779,135 @@ public actor HermesClient {
             setState(.idle)
         }
 
-        if let transport = transport { await transport.disconnect() }
-        transport = nil
+        if let failing { await failing.disconnect() }
+        if generation == transportGeneration { transport = nil }
+    }
+
+    // MARK: - Current server requests
+
+    public func openServerRequests(sessionID: String) -> [ServerRequest] {
+        serverRequests.open(in: sessionID)
+    }
+
+    private func publishServerRequests(sessionID: String) {
+        broadcast(GatewayEvent(type: "client.server_requests", sessionID: sessionID,
+                               payload: .null, params: .null,
+                               serverRequests: serverRequests.open(in: sessionID)))
+        guard requestRefreshTask == nil, !serverRequests.sessions.isEmpty else { return }
+        let generation = transportGeneration
+        requestRefreshTask = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 3_000_000_000)
+                guard !Task.isCancelled, let self else { return }
+                guard await self.refreshOpenRequests(generation: generation) else { return }
+            }
+        }
+    }
+
+    private func refreshOpenRequests(generation: Int) async -> Bool {
+        guard generation == transportGeneration, state.isOpen else { return false }
+        let sessions = serverRequests.sessions
+        if sessions.isEmpty { requestRefreshTask = nil; return false }
+        // Official source does not emit request.cancel on another client's successful response.
+        // An authoritative open_requests snapshot is the terminal evidence for that case.
+        for sid in sessions {
+            _ = try? await request("session.events.since", params: .object([
+                "session_id": .string(sid), "last_seen": .number(Double(eventSequences[sid] ?? 0))
+            ]), timeout: 5)
+            guard generation == transportGeneration else { return false }
+        }
+        return true
+    }
+
+    private func retireServerRequestTransport() {
+        let sessions = serverRequests.sessions
+        serverRequests.reset()
+        requestRefreshTask?.cancel()
+        requestRefreshTask = nil
+        capabilitiesID = nil
+        serverRequestMethods = []
+        declinesNotShown = false
+        eventSequences.removeAll()
+        for sid in sessions { publishServerRequests(sessionID: sid) }
+    }
+
+    private func requireOpenRequest(_ identity: ServerRequestIdentity) throws {
+        guard state.isOpen, !transportClosedSinceConnect, identity.generation == transportGeneration,
+              serverRequests.requests[identity] != nil else {
+            throw HermesError.rpc(code: 4009, message: "This request is no longer active on this connection.")
+        }
+    }
+
+    /// A direct JSON-RPC response has no acknowledgement. Completion means written to this socket,
+    /// never proof that the backend accepted a decision before another client or the timeout.
+    public func respond(to identity: ServerRequestIdentity, result: JSONValue) async throws {
+        try requireOpenRequest(identity)
+        let line = try JSONRPCCodec.encodeResponse(id: identity.id.wire, result: result)
+        try await sendServerResponse(identity, line: line)
+    }
+
+    /// Requests only the Desktop window showing the session can answer (`tui_gateway/server_requests.py:24-28`).
+    public static let windowOwnedRequestMethods: Set<String> = ["preview.read", "preview.act", "terminal.read", "window.read", "tour"]
+
+    /// The not-shown code (`server_requests.py:100`): one client's "no window here shows this session".
+    static let notShownCode = 4404
+
+    /// Decline every open window-owned request in `sessionID` with 4404, which settles it at once when no other client can answer and leaves it to a Desktop window that can. Only on a backend that counts declines: an older one settles on the first error and would let this beat that window.
+    @discardableResult
+    private func declineWindowOwnedRequests(in sessionID: String, generation: Int) -> Bool {
+        guard declinesNotShown, generation == transportGeneration, !transportClosedSinceConnect else { return false }
+        var declined = false
+        for request in serverRequests.open(in: sessionID)
+        where request.identity.generation == generation && Self.windowOwnedRequestMethods.contains(request.identity.method) {
+            serverRequests.retire(request.identity)
+            declined = true
+            guard let line = try? JSONRPCCodec.encodeLine(.object([
+                "jsonrpc": .string("2.0"), "id": request.identity.id.wire,
+                "error": .object(["code": .number(Double(Self.notShownCode)),
+                                  "message": .string("No window on this client shows this session.")]),
+            ])) else { continue }
+            enqueue(line: line)
+        }
+        return declined
+    }
+
+    /// Unknown future methods can only be declined by an explicit user action. A JSON-RPC
+    /// error is protocol-defined even when the future method's result shape is unknown.
+    public func declineUnsupportedRequest(_ identity: ServerRequestIdentity) async throws {
+        try requireOpenRequest(identity)
+        let line = try JSONRPCCodec.encodeLine(.object([
+            "jsonrpc": .string("2.0"), "id": identity.id.wire,
+            "error": .object(["code": .number(-32601), "message": .string("User skipped a request this client cannot handle.")])
+        ]))
+        try await sendServerResponse(identity, line: line)
+    }
+
+    private func sendServerResponse(_ identity: ServerRequestIdentity, line: String) async throws {
+        // Revalidate at the final mutation boundary as well as at the public API.
+        try requireOpenRequest(identity)
+        serverRequests.retire(identity)
+        publishServerRequests(sessionID: identity.sessionID)
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            enqueue(line: line, completion: continuation)
+        }
+    }
+
+    public func lockClarify(_ identity: ServerRequestIdentity, questionID: String, answer: String) async throws -> ClarifyRespondResult {
+        try requireOpenRequest(identity)
+        guard identity.method == "clarify", case .string(let id) = identity.id else {
+            throw HermesError.rpc(code: 4002, message: "This request does not support question locks.")
+        }
+        let result = try await request("clarify.lock", params: .object([
+            "request_id": .string(id), "question_id": .string(questionID), "answer": .string(answer)
+        ]))
+        guard identity.generation == transportGeneration else { throw HermesError.notConnected }
+        let status = result["status"]?.stringValue ?? "expired"
+        let remaining = result["remaining"]?.arrayValue.map { $0.compactMap(\.stringValue) }
+        if status == "expired" || remaining == [] { serverRequests.retire(identity) }
+        else if status == "ok" { serverRequests.lock(identity, questionID: questionID, answer: answer) }
+        publishServerRequests(sessionID: identity.sessionID)
+        return ClarifyRespondResult(status: status, remaining: remaining,
+                                    sourceRevision: status == "ok" ? serverRequests.revision : nil)
     }
 
     // MARK: - Inbound
@@ -733,6 +917,16 @@ public actor HermesClient {
         switch frame {
         case .response(let response):
             guard let id = response.id.coercedString else { return }
+            if id == capabilitiesID {
+                capabilitiesID = nil
+                serverRequestMethods = response.error == nil
+                    ? (response.result?["server_requests"]?.arrayValue ?? []).compactMap(\.stringValue) : []
+                declinesNotShown = response.error == nil && response.result?["declines_not_shown"]?.coercedBool == true
+                for sid in serverRequests.sessions where declineWindowOwnedRequests(in: sid, generation: generation) {
+                    publishServerRequests(sessionID: sid)
+                }
+                return
+            }
             guard let call = pending.removeValue(forKey: id) else { return }
             call.timeoutTask?.cancel()
             if let error = response.error {
@@ -742,11 +936,42 @@ public actor HermesClient {
                     throwing: HermesError.rpc(code: error.code, message: error.message, data: error.data)
                 )
             } else {
+                if handlesServerRequests, ["session.resume", "session.activate", "session.events.since"].contains(call.method),
+                   let entries = response.result?["open_requests"]?.arrayValue,
+                   let sid = response.result?["session_id"]?.stringValue ?? call.sessionID, !sid.isEmpty {
+                    serverRequests.reconcile(entries, sessionID: sid, generation: generation,
+                                             startedAt: call.snapshotRevision)
+                    declineWindowOwnedRequests(in: sid, generation: generation)
+                    publishServerRequests(sessionID: sid)
+                }
                 call.continuation.resume(returning: response.result ?? .null)
             }
 
         case .event(let event):
+            if let seq = event.params["seq"]?.intValue, !event.sessionID.isEmpty {
+                eventSequences[event.sessionID] = max(eventSequences[event.sessionID] ?? 0, seq)
+            }
+            if event.type == "request.cancel", handlesServerRequests,
+               let id = event.payload["id"], let method = event.payload["method"]?.stringValue {
+                serverRequests.cancel(id: id, method: method, sessionID: event.sessionID, generation: generation)
+                publishServerRequests(sessionID: event.sessionID)
+            }
+            // The backend's own withdrawal of approvals it deny-resolved; a broadcast, so the session
+            // is in the payload. Retired here, before the event fans out, so a consumer that projects
+            // the registry sees the card gone by the time it sees the notice.
+            if event.type == "approval.cancelled", handlesServerRequests {
+                let cancelled = ApprovalCancelledEvent(payload: event.payload)
+                let changed = serverRequests.retireApprovals(requestIDs: Set(cancelled.requestIDs),
+                                                             sessionID: cancelled.sessionID, generation: generation)
+                for sid in changed { publishServerRequests(sessionID: sid) }
+            }
             if event.type == "gateway.ready" {
+                if handlesServerRequests, !sawReady {
+                    let id = "harc-capabilities-\(generation)"
+                    capabilitiesID = id
+                    if let line = try? JSONRPCCodec.encodeRequest(id: id, method: "client.capabilities",
+                        params: .object(["server_requests": .bool(true)])) { enqueue(line: line) }
+                }
                 sawReady = true
                 changeEventsSupported = event.payload["change_events"]?.coercedBool ?? false
                 sessionMirroringSupported = event.payload["session_mirroring"]?.coercedBool ?? false
@@ -764,16 +989,13 @@ public actor HermesClient {
             }
             broadcast(event)
 
-        case .serverRequest(let id, let method, _):
-            // The dialect has no server-to-client requests today; answer defensively so a future
-            // one can never leave the agent thread parked.
-            await log?.warning("gateway", "unsupported server request: \(method)")
-            if let line = try? JSONRPCCodec.encodeResponse(
-                id: id,
-                result: .object(["ok": .bool(false), "error": .string("unsupported by this client")])
-            ) {
-                enqueue(line: line)
-            }
+        case .serverRequest(let id, let method, let params):
+            // Nothing a person answers is ever answered automatically; the one exception is the window-owned decline, which is no answer at all.
+            guard handlesServerRequests, !transportClosedSinceConnect, let params,
+                  let sid = serverRequests.receive(id: id, method: method, params: params, generation: generation)
+            else { return }
+            declineWindowOwnedRequests(in: sid, generation: generation)
+            publishServerRequests(sessionID: sid)
 
         case .unknown:
             break
@@ -796,7 +1018,7 @@ public actor HermesClient {
             finishReady(with: HermesError.connectionClosed(reason))
             failAllPending(HermesError.connectionClosed("The gateway connection closed."))
             // Frames queued for the dead socket must not survive to the next one.
-            outbox.removeAll()
+            clearOutbox()
             sawReady = false
             if HermesError.authRejectionCloseCodes.contains(closeCode) {
                 let rejected = "The gateway rejected the credential (close \(closeCode))."

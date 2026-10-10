@@ -15,6 +15,10 @@ struct SettingsDetailView: View {
 
     /// The row whose editor sheet is up (text / number / options / list).
     @State private var editing: SettingRowDescriptor?
+    /// The model row whose catalogue picker is up.
+    @State private var pickingModel: SettingRowDescriptor?
+    /// The fallback-chain row whose editor is up.
+    @State private var editingChain: SettingRowDescriptor?
     /// A destructive segment value awaiting its hold (approvals → off).
     @State private var armedHold: (key: String, value: String)?
 
@@ -24,7 +28,10 @@ struct SettingsDetailView: View {
         ScrollView {
             LazyVStack(alignment: .leading, spacing: 0) {
                 if let error = store.loadError {
-                    loadErrorBlock(error)
+                    StatePanel.loadFailure(title: "Couldn't load settings", error: error, hasBackend: app.rest != nil) {
+                        Task { await store.reload() }
+                    }
+                    .containerRelativeFrame(.vertical)
                 } else if store.document == nil {
                     ProgressView()
                         .frame(maxWidth: .infinity)
@@ -40,11 +47,83 @@ struct SettingsDetailView: View {
         .background(t.canvas)
         .navigationTitle(screen.title)
         .navigationBarTitleDisplayMode(.inline)
-        .toolbarBackground(t.canvas, for: .navigationBar)
+        .hermesTopBar()
         .task { await store.loadIfNeeded() }
         .sheet(item: $editing) { row in
             SettingEditorSheet(row: row)
         }
+        .sheet(item: $pickingModel) { row in
+            ModelEffortSheet(choosing: settingPick(for: row))
+        }
+        .sheet(item: $editingChain) { row in
+            FallbackChainEditorSheet(row: row)
+        }
+        #if DEBUG
+        .onAppear { openEditorForScreenshotIfRequested() }
+        #endif
+    }
+
+    #if DEBUG
+    /// The screenshot harness asks for a row's editor by key. A sheet presented during a push transition is dropped, so the ask is repeated a few times with room between.
+    private func openEditorForScreenshotIfRequested() {
+        guard let key = ModelSettingsDemo.autoOpenKey,
+              let row = screen.sections.flatMap(\.rows).first(where: { $0.key == key })
+        else { return }
+        ModelSettingsDemo.autoOpenKey = nil
+        ModelSettingsDemo.log.notice("auto-open requested for \(key, privacy: .public)")
+        Task { @MainActor in
+            for delay: UInt64 in [2_500_000_000, 2_000_000_000, 2_000_000_000] {
+                try? await Task.sleep(nanoseconds: delay)
+                ModelSettingsDemo.log.notice("auto-open presenting \(key, privacy: .public)")
+                switch row.kind {
+                case .model: pickingModel = row
+                case .fallbackChain: editingChain = row
+                default: editing = row
+                }
+            }
+        }
+    }
+    #endif
+
+    /// The picker's choose-for-a-setting mode for a model row: what it shows as current and where the pick is written.
+    private func settingPick(for row: SettingRowDescriptor) -> ModelSettingPick {
+        guard case .model(let target) = row.kind else {
+            return ModelSettingPick(title: row.label, current: ModelPair(provider: "", model: "")) { _, _ in .done }
+        }
+        let store = self.store
+        let title: String
+        switch target {
+        case .mainDefault: title = "Model new chats start with"
+        case .pair: title = row.label
+        case .auxiliary: title = "Model for \(row.label.lowercased())"
+        }
+        return ModelSettingPick(
+            title: title,
+            current: store.modelPair(modelKey: row.key, target: target),
+            marksCatalogueCurrent: target == .mainDefault,
+            inheritLabel: target.canInherit ? SettingsStore.inheritLabel : nil,
+            typedHint: target == .mainDefault
+                ? "For a model the list does not have; the backend works out the provider."
+                : "Type it as provider/model, for one the list does not have.",
+            onPick: { choice, confirmed in
+                switch target.write(for: choice, modelKey: row.key) {
+                case .assign(let slot, let pair):
+                    switch await store.assignModel(pair, slot: slot, rowKey: row.key, confirmExpensive: confirmed) {
+                    case .applied: return .done
+                    case .confirm(let message): return .confirm(message)
+                    case .failed(let message): return .failed(message)
+                    }
+                case .flatModel(let slug):
+                    await store.set(row.key, to: .string(slug))
+                case .pair(let providerKey, let modelKey, let pair):
+                    await store.setModelPair(providerKey: providerKey, modelKey: modelKey, to: pair)
+                case .refuse(let message):
+                    return .failed(message)
+                }
+                if let failure = store.writeFailures[row.key] { return .failed(failure) }
+                return .done
+            }
+        )
     }
 
     @ViewBuilder
@@ -92,6 +171,10 @@ struct SettingsDetailView: View {
                 segmentRow(row, options: options, holdFor: holdFor)
             case .options, .text, .number, .stringList:
                 valueRow(row) { editing = row }
+            case .model:
+                valueRow(row) { pickingModel = row }
+            case .fallbackChain:
+                valueRow(row) { editingChain = row }
             case .display:
                 valueRow(row, chevron: false, action: nil)
             }
@@ -214,6 +297,10 @@ struct SettingsDetailView: View {
         case .stringList:
             let count = store.stringListValue(row.key)?.count ?? 0
             return count == 1 ? "1 entry" : "\(count) entries"
+        case .model(let target):
+            return SettingsStore.modelDisplay(store.modelPair(modelKey: row.key, target: target), target: target)
+        case .fallbackChain:
+            return SettingsStore.chainDisplay(count: store.fallbackChain().count)
         case .display:
             if case .array(let items) = value {
                 return items.count == 1 ? "1 entry" : "\(items.count) entries"
@@ -223,21 +310,6 @@ struct SettingsDetailView: View {
             let raw = value.coercedString ?? ""
             return raw.isEmpty ? "None" : raw
         }
-    }
-
-    private func loadErrorBlock(_ error: String) -> some View {
-        VStack(alignment: .leading, spacing: Space.s5) {
-            Text("Couldn't load settings")
-                .font(HermesFont.heading)
-                .foregroundStyle(t.text1)
-            Text(error)
-                .font(HermesFont.subhead)
-                .foregroundStyle(t.text3)
-            Button("Try again") { Task { await store.reload() } }
-                .buttonStyle(SecondaryButtonStyle())
-                .frame(maxWidth: 220)
-        }
-        .padding(Space.s6)
     }
 }
 

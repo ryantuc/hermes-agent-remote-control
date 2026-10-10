@@ -23,6 +23,73 @@ enum CommandCenterActionGate {
     }
 }
 
+/// What a Command Center tab draws when there is nothing it could load from: one centred "Not connected" note instead of a red error over an empty list.
+///
+/// Sessions are read over the gateway socket; the other three tabs read REST, which the demo never has, so in the demo those three say so rather than offering actions that can only fail.
+enum CommandCenterAvailability {
+    static let title = "Not connected"
+    static let symbol = "bolt.horizontal.circle"
+
+    /// nil when the tab can load; otherwise the line under the title.
+    static func unavailableMessage(tab: String, hasSessionAPI: Bool, hasREST: Bool, isDemo: Bool) -> String? {
+        switch tab {
+        case "Sessions":
+            return hasSessionAPI ? nil : "Connect a backend to see what is running."
+        case "System", "Usage", "Maintenance":
+            guard !hasREST else { return nil }
+            if isDemo { return "The demo has no computer behind it, so there is nothing to show here." }
+            switch tab {
+            case "System": return "Connect a backend to see its status and logs."
+            case "Usage": return "Connect a backend to see its token use and cost."
+            default: return "Connect a backend to run diagnostics or back it up."
+            }
+        default:
+            return nil
+        }
+    }
+
+    /// What the Sessions tab draws over an empty list.
+    enum SessionsEmptyState: Equatable {
+        case notConnected(String)
+        case loading
+        case failed(String)
+        case nothingRunning
+    }
+
+    /// A load in flight outranks a previous failure, so Try again shows progress instead of flashing "Nothing is running" and then the same error.
+    static func sessionsEmptyState(hasSessionAPI: Bool, isLoading: Bool, error: String?) -> SessionsEmptyState {
+        if !hasSessionAPI, let message = unavailableMessage(tab: "Sessions", hasSessionAPI: false, hasREST: false, isDemo: false) {
+            return .notConnected(message)
+        }
+        if isLoading { return .loading }
+        if let error { return .failed(error) }
+        return .nothingRunning
+    }
+}
+
+/// How one `/api/logs` line is classed for the System tab's counts and the log sheet's ink.
+///
+/// BUG-146: read the way the backend reads it, so a line the phone counts or inks as an error is a line the backend's `level=ERROR` filter would return. (The two still cover different windows: the counts read the last 200 lines unfiltered, the filtered sheet the last 300 matching lines.) The backend takes the FIRST whitespace-delimited level word as the line's level (`hermes_cli/logs.py` `_LEVEL_RE`, `_extract_level`) and its ERROR filter keeps CRITICAL (`_LEVEL_ORDER`); lines arrive newline-terminated, and `\s` includes that newline.
+enum LogLineLevel: Equatable {
+    case error
+    case warning
+    case other
+
+    private static let levelPattern = try! NSRegularExpression(pattern: #"\s(DEBUG|INFO|WARNING|ERROR|CRITICAL)\s"#)
+
+    static func of(_ line: String) -> LogLineLevel {
+        let range = NSRange(line.startIndex..., in: line)
+        guard let match = levelPattern.firstMatch(in: line, range: range),
+              let word = Range(match.range(at: 1), in: line)
+        else { return .other }
+        switch line[word] {
+        case "ERROR", "CRITICAL": return .error
+        case "WARNING": return .warning
+        default: return .other
+        }
+    }
+}
+
 /// Command Center: the desktop's four sections at the bottom of
 /// the hub — Sessions · System · Usage · Maintenance. Usage refreshes on
 /// pull only (`session.usage` and the analytics route are not free); every
@@ -38,6 +105,8 @@ struct CommandCenterView: View {
     // Sessions
     @State private var live: [LiveSessionStatus] = []
     @State private var sessionsError: String?
+    /// True from the first frame, so the screen does not say "Nothing is running" before it has asked.
+    @State private var sessionsLoading = true
     @State private var interrupting: Set<String> = []
     /// The row awaiting the foreign-stop confirmation. `LiveSessionStatus` is
     /// already `Identifiable` on the runtime id, which is the id the interrupt
@@ -71,17 +140,21 @@ struct CommandCenterView: View {
                 .padding(.horizontal, Space.s6)
                 .padding(.vertical, Space.s4)
 
-            switch tab {
-            case "System": systemTab
-            case "Usage": usageTab
-            case "Maintenance": maintenanceTab
-            default: sessionsTab
+            if tab != "Sessions", let message = unavailableMessage(for: tab) {
+                StatePanel(symbol: CommandCenterAvailability.symbol, title: CommandCenterAvailability.title, message: message)
+            } else {
+                switch tab {
+                case "System": systemTab
+                case "Usage": usageTab
+                case "Maintenance": maintenanceTab
+                default: sessionsTab
+                }
             }
         }
         .background(t.canvas)
         .navigationTitle("Command Center")
         .navigationBarTitleDisplayMode(.inline)
-        .toolbarBackground(t.canvas, for: .navigationBar)
+        .hermesTopBar()
         .task { await loadSessions(); await loadLogCounts() }
         .onAppear { Task { await loadUsageIfNeeded() } }
         .onChange(of: tab) { _, _ in
@@ -95,6 +168,15 @@ struct CommandCenterView: View {
         }
     }
 
+    private func unavailableMessage(for tab: String) -> String? {
+        CommandCenterAvailability.unavailableMessage(
+            tab: tab,
+            hasSessionAPI: app.sessionAPI != nil,
+            hasREST: app.rest != nil,
+            isDemo: app.isDemoActive
+        )
+    }
+
     private struct LogSelection: Identifiable {
         let file: String
         var id: String { file }
@@ -105,15 +187,29 @@ struct CommandCenterView: View {
     private var sessionsTab: some View {
         ScrollView {
             LazyVStack(alignment: .leading, spacing: 0) {
-                if let sessionsError {
-                    inlineError(sessionsError)
-                }
                 if live.isEmpty {
-                    Text("Nothing is running.")
-                        .font(HermesFont.subhead)
-                        .foregroundStyle(t.text3)
-                        .padding(Space.s6)
+                    // One centred state for an empty list, never a red line over "Nothing is running."
+                    Group {
+                        switch CommandCenterAvailability.sessionsEmptyState(hasSessionAPI: app.sessionAPI != nil, isLoading: sessionsLoading, error: sessionsError) {
+                        case .notConnected(let message):
+                            StatePanel(symbol: CommandCenterAvailability.symbol, title: CommandCenterAvailability.title, message: message)
+                        case .loading:
+                            ProgressView()
+                                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                                .accessibilityLabel("Loading sessions")
+                        case .failed(let error):
+                            StatePanel.loadFailure(title: "Couldn't load sessions", error: error, hasBackend: app.sessionAPI != nil) {
+                                Task { await loadSessions() }
+                            }
+                        case .nothingRunning:
+                            StatePanel(symbol: "bolt.horizontal.circle", title: "Nothing is running", message: "Sessions working on your computer show here.")
+                        }
+                    }
+                    .containerRelativeFrame(.vertical)
                 } else {
+                    if let sessionsError {
+                        inlineError(sessionsError)
+                    }
                     ForEach(live) { session in
                         FlatRow {
                             HStack(spacing: Space.s3) {
@@ -439,6 +535,8 @@ struct CommandCenterView: View {
     #endif
 
     private func loadSessions() async {
+        sessionsLoading = true
+        defer { sessionsLoading = false }
         #if DEBUG
         if ProcessInfo.processInfo.arguments.contains("-hermesDemoLiveSessions") {
             sessionsError = nil
@@ -450,9 +548,10 @@ struct CommandCenterView: View {
             sessionsError = "Not connected to a backend."
             return
         }
-        sessionsError = nil
+        // The previous error stays until a load succeeds, so a retry never passes through "Nothing is running" on its way back to the same failure.
         do {
             live = try await sessionAPI.activeList()
+            sessionsError = nil
         } catch {
             sessionsError = describe(error)
         }
@@ -485,8 +584,8 @@ struct CommandCenterView: View {
             ) else { continue }
             let lines = json["lines"]?.arrayValue?.compactMap { $0.coercedString } ?? []
             logCounts[file] = (
-                errors: lines.filter { $0.contains(" ERROR ") }.count,
-                warnings: lines.filter { $0.contains(" WARNING ") }.count
+                errors: lines.filter { LogLineLevel.of($0) == .error }.count,
+                warnings: lines.filter { LogLineLevel.of($0) == .warning }.count
             )
         }
     }
@@ -657,9 +756,11 @@ private struct LogReaderSheet: View {
     }
 
     private func tone(for line: String) -> Color {
-        if line.contains(" ERROR ") { return t.danger }
-        if line.contains(" WARNING ") { return t.warn }
-        return t.text2
+        switch LogLineLevel.of(line) {
+        case .error: return t.danger
+        case .warning: return t.warn
+        case .other: return t.text2
+        }
     }
 
     private func load() async {

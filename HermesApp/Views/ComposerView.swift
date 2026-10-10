@@ -1,7 +1,10 @@
 import HermesServeKit
+import ImageIO
 import SwiftUI
+import UIKit
+import UniformTypeIdentifiers
 
-/// The composer: one surface with the controls inside it, portrait carrying them on one row with the model beneath and landscape keeping both on a single row.
+/// The composer: one surface with the field and one row of controls inside it, the model riding in that row (portrait falls back to a second row only where the model cannot be named in one).
 /// Attachment routing must stay as it is: images go to `image.attach_bytes`, and everything else, PDFs and video included, goes to `file.attach` and returns a `@file:` reference spliced into the text.
 @MainActor
 struct ComposerView: View {
@@ -16,11 +19,13 @@ struct ComposerView: View {
     /// Which host is mounting this composer, and therefore how it is painted; only Chat's composer is glass over a transcript.
     var chrome: ComposerChrome = .opaque
 
-    /// Everything on this surface that is not the field, measured rather than assumed. The seed is the portrait control row's resting arithmetic, which over-estimates the landscape row, so a preference that never arrives asks for a shorter field rather than a taller one.
+    /// Everything on this surface that is not the field, measured rather than assumed. The seed is the two-row fallback's resting arithmetic, the tallest the controls can be, so a preference that never arrives asks for a shorter field rather than a taller one.
     @State private var measuredChrome: CGFloat = 2 * Hit.min + Space.s3 + Space.s3
 
     @State private var showingOptions = false
     @State private var showingModelSheet = false
+    /// The search the model drawer opens with; set only by a `/model <text>` that matched nothing.
+    @State private var modelSheetQuery = ""
     @State private var showingEffortSheet = false
     @State private var showingFolderPicker = false
     @State private var showingWorktreeSheet = false
@@ -35,9 +40,17 @@ struct ComposerView: View {
     @State private var confirmingForeignStop = false
     /// Whether the composer field holds the keyboard. Plain `@State` and not `@FocusState`, because the field is a `UIViewRepresentable` that no view can claim with `.focused(_:)`, so SwiftUI's focus system discards writes to it.
     @State private var isFocused = false
+    @State private var editorSnapshot = ComposerEditorSnapshot(
+        text: "", selection: NSRange(location: 0, length: 0), isComposing: false, origin: .external
+    )
+    @State private var completionReplacement: ComposerEditorReplacement?
+    @State private var completionContentHeight: CGFloat = 180
+    /// A `/model <name>` still looking its model up; a second Send meanwhile is swallowed rather than sent.
+    @State private var modelCommandInFlight = false
 
     /// Landscape on a phone is compact height; horizontal size class cannot tell the two postures apart.
     @Environment(\.verticalSizeClass) private var verticalSizeClass
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
     /// The pixel grid the field's lines are quantised to (BUG-039).
     @Environment(\.displayScale) private var displayScale
     @Environment(\.scenePhase) private var scenePhase
@@ -87,6 +100,11 @@ struct ComposerView: View {
                 .measuredAsComposerChrome()
             }
 
+            if showsCompletionPanel {
+                completionPanel
+                    .frame(height: completionPanelHeight)
+            }
+
             VStack(alignment: .leading, spacing: 0) {
                 // Not disabled while the transport is down, as on desktop: a flaky network should not block drafting, and `canSend` still guards the send itself on an open socket.
                 // The field is a real `UITextView` and not SwiftUI's `TextField(axis: .vertical)`, which has been observed to refuse intrinsic-height growth and collapse to one internal-scrolling line.
@@ -96,7 +114,12 @@ struct ComposerView: View {
                         placeholder: placeholder,
                         textColor: t.text1,
                         maxLineCount: fieldLineCap,
-                        isFocused: $isFocused
+                        isFocused: $isFocused,
+                        replacement: completionReplacement,
+                        hasCompletions: showsCompletionPanel && !model.slashCompletion.items.isEmpty,
+                        onEditorChange: editorDidChange,
+                        onCompletionKey: handleCompletionKey,
+                        onPasteImages: attachPasted
                     )
                     // The representable owns the field; the placeholder is SwiftUI's, drawn over the empty view and never letting a touch through.
                     if model.draft.isEmpty {
@@ -118,7 +141,7 @@ struct ComposerView: View {
 
                 controlRow
                     // The foreign-turn confirmation belongs to both Stop controls, so it sits on the row that is always in the hierarchy.
-                    .foreignStopConfirmation(isPresented: $confirmingForeignStop) {
+                    .foreignStopConfirmation(isPresented: $confirmingForeignStop, ownershipUnknown: (model.live.executionID != nil && model.live.turnOwnership == .unknown) || model.live.activity.runningSubagents.contains(where: \.originUnknown)) {
                         model.stopTapped()
                     }
                     .padding(.horizontal, Space.s3)
@@ -129,9 +152,9 @@ struct ComposerView: View {
             // Fill and rest stroke are Desktop's: `input` behind a flat one-pixel neutral border that does not change on focus.
             // Not animated: `.animation(_:value:)` here would wrap the subtree that reports the composer's chrome height through a preference, republishing it every frame while the height budget it feeds is recomputing.
             // The focus stroke is a mobile divergence, deliberately: desktop has hover and a persistent caret to say where typing goes, and a phone has neither.
-            // On the Chat host the well is left unfilled so the frost behind it shows through; filling it with `input` would put an opaque slab back over the transcript. Home still paints Desktop's fill.
+            // Both hosts fill the well; the Chat dock at Desktop's own composer share (`GlassMetrics.composerFillOpacity`), which is translucent enough for the plate's frost to read through and solid enough to carry the field over a conversation passing behind.
             .background(
-                chrome == .glass ? Color.clear : t.composerSurface,
+                t.composerSurface.opacity(chrome.wellFillOpacity),
                 in: RoundedRectangle(cornerRadius: Radius.sheet, style: .continuous)
             )
             .overlay(
@@ -148,7 +171,9 @@ struct ComposerView: View {
         // The Chat host's frost is painted once by `ChatView`, behind this whole stack, so there is nothing to paint here.
         .background(chrome == .glass ? Color.clear : t.canvas)
         .onPreferenceChange(ComposerChromeKey.self) { height in
-            measuredChrome = height
+            // BUG-056: damped, so the field's budget cannot chase a measurement that only flickers across a rounding boundary.
+            let settled = ComposerChromeMeasure.settled(previous: measuredChrome, measured: height, displayScale: displayScale)
+            if settled != measuredChrome { measuredChrome = settled }
         }
         // The keyboard's only owner: nothing else in the app holds a focus binding, so if this view does not put it away, nothing does.
         .onChange(of: isPresentingSheet) { _, presented in
@@ -158,6 +183,8 @@ struct ComposerView: View {
         // BUG-012: `isFocused = false` is a request rather than a dismissal, because the field's only `resignFirstResponder` lives inside `updateUIView` and no body update follows a pop. `Keyboard.dismiss()` is responder-chain based and runs synchronously here.
         .onDisappear {
             isFocused = false
+            model.slashCompletion.invalidate()
+            completionReplacement = nil
             Keyboard.dismiss()
             dictation.stop()
         }
@@ -168,6 +195,21 @@ struct ComposerView: View {
         // Keyed on the model's identity rather than its session id, so a fresh session persisting its id is the same `ChatModel` and the phrase cannot flip under the user mid-stream.
         .onChange(of: ObjectIdentifier(model)) { _, _ in
             restingPlaceholder = ComposerPlaceholders.resting(isNewConversation: model.isDraft)
+            completionReplacement = nil
+        }
+        .onChange(of: isFocused) { _, focused in
+            if focused {
+                editorDidChange(editorSnapshot)
+            } else {
+                model.slashCompletion.dismiss()
+            }
+        }
+        .onChange(of: model.slashCompletionScope) { _, _ in
+            completionReplacement = nil
+            var snapshot = editorSnapshot
+            // The backend changed, not the user's edit provenance. The model fences discovery by scope.
+            snapshot.origin = .selection
+            editorDidChange(snapshot)
         }
         .sheet(isPresented: $showingOptions, onDismiss: applyQueuedQuickAction) {
             ComposerOptionsSheet(
@@ -177,7 +219,7 @@ struct ComposerView: View {
             )
         }
         .sheet(isPresented: $showingModelSheet) {
-            ModelEffortSheet(model: model)
+            ModelEffortSheet(model: model, initialQuery: modelSheetQuery)
         }
         .sheet(isPresented: $showingEffortSheet) {
             EffortSheet(model: model)
@@ -309,7 +351,8 @@ struct ComposerView: View {
 
     // MARK: Control row — inside the surface
 
-    /// Portrait takes two rows, the controls then the model beneath them, because one row is 40 pt short of what the model pill needs; landscape stays one row. Driven off `verticalSizeClass` and not horizontal, because a standard iPhone is compact width in either orientation.
+    /// Landscape is one row with the model and effort pills apart. Portrait is one row too wherever the model can still be named in it: first with the model and effort sharing one pill that opens the model drawer (which carries the effort rung), then with the model alone, and only where neither fits, at the largest type sizes or the narrowest phones, the controls and the model on two rows. That is Desktop's progressive collapse (`apps/desktop/src/app/chat/composer/composer-utils.ts`, the pill compacts before the row gives up), and it keeps an empty composer to the field and one row.
+    /// Driven off `verticalSizeClass` and not horizontal, because a standard iPhone is compact width in either orientation. The choice depends on width and type size alone (`pillFloor(showsEffort:at:)`), so it never feeds the field's height budget back into itself.
     @ViewBuilder
     private var controlRow: some View {
         if verticalSizeClass == .compact {
@@ -324,23 +367,57 @@ struct ComposerView: View {
                 sendControl
             }
         } else {
-            VStack(spacing: Space.s3) {
-                HStack(spacing: Space.s3) {
-                    plusButton
-                    Spacer(minLength: Space.s3)
-                    dictateButton
-                    voiceChatButton
-                    if model.showsSecondaryStop { secondaryStopButton }
-                    sendControl
-                }
-                HStack(spacing: Space.s3) {
-                    // The model pill takes what the effort pill leaves: the
-                    // effort is content-sized and never truncates, the model
-                    // name is the one that can.
-                    modelPill
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                    effortPill
-                }
+            ViewThatFits(in: .horizontal) {
+                portraitRow(showsEffort: true)
+                portraitRow(showsEffort: false)
+                stackedControlRows
+            }
+        }
+    }
+
+    /// The narrowest a pill may be offered in the one-row layout at the default type size: wide enough to read a short model name, with the effort when it rides along.
+    private static let modelAndEffortPillMinWidth: CGFloat = 110
+    private static let modelPillMinWidth: CGFloat = 72
+
+    /// The floor portrait's one-row pill is offered at, scaled with the type size the way the pill's own `subheadline` text is. Every other control is a fixed box, so without this the choice depended on screen width alone and the two-row fallback never won (at accessibility sizes the model name collapsed and the effort overflowed onto the dictate button). Apart from the view so a test can read it.
+    static func pillFloor(showsEffort: Bool, at size: DynamicTypeSize) -> CGFloat {
+        let base = showsEffort ? modelAndEffortPillMinWidth : modelPillMinWidth
+        let traits = UITraitCollection(preferredContentSizeCategory: UIContentSizeCategory(size))
+        return UIFontMetrics(forTextStyle: .subheadline).scaledValue(for: base, compatibleWith: traits)
+    }
+
+    /// Portrait's one row. The pill takes whatever the controls leave and truncates the model name in its middle; its ideal width is the floor above, which is what decides whether this row fits at all.
+    private func portraitRow(showsEffort: Bool) -> some View {
+        let floor = Self.pillFloor(showsEffort: showsEffort, at: dynamicTypeSize)
+        return HStack(spacing: Space.s3) {
+            plusButton
+            Group {
+                if showsEffort { modelAndEffortPill } else { modelPill }
+            }
+            .frame(minWidth: floor, idealWidth: floor, maxWidth: .infinity, alignment: .leading)
+            dictateButton
+            voiceChatButton
+            if model.showsSecondaryStop { secondaryStopButton }
+            sendControl
+        }
+    }
+
+    /// The fallback: the controls, then the model and effort beneath them.
+    private var stackedControlRows: some View {
+        VStack(spacing: Space.s3) {
+            HStack(spacing: Space.s3) {
+                plusButton
+                Spacer(minLength: Space.s3)
+                dictateButton
+                voiceChatButton
+                if model.showsSecondaryStop { secondaryStopButton }
+                sendControl
+            }
+            HStack(spacing: Space.s3) {
+                // The model pill takes what the effort pill leaves: the effort is content-sized and never truncates, the model name is the one that can.
+                modelPill
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                effortPill
             }
         }
     }
@@ -386,9 +463,141 @@ struct ComposerView: View {
     private var chromeHeight: CGFloat {
         var rowsAboveField = model.attachments.isEmpty ? 0 : 1
         if case .failed = dictation.state { rowsAboveField += 1 }
+        if showsCompletionPanel { rowsAboveField += 1 }
         return measuredChrome
+            + (showsCompletionPanel ? completionPanelHeight : 0)
             + 2 * Space.s4
             + CGFloat(rowsAboveField) * Space.s4
+    }
+
+    // MARK: Slash completions
+
+    private var showsCompletionPanel: Bool {
+        isFocused && !editorSnapshot.isComposing && completionPanelHeight >= Hit.min
+            && (!model.slashCompletion.items.isEmpty || model.slashCompletion.notice != nil)
+    }
+
+    /// The suggestion scroll area spends only the space left after the controls and one editor line.
+    /// Its fixed budget is included in `chromeHeight`, so long drafts shrink before Send can be obscured.
+    private var completionPanelHeight: CGFloat {
+        let contentHeight = max(Hit.min, completionContentHeight)
+        guard let viewportHeight, viewportHeight > 0 else { return min(180, contentHeight) }
+        let oneLine = GrowingComposerField.height(
+            forLines: 1, font: GrowingComposerField.bodyFont,
+            insets: GrowingComposerField.textInsets, displayScale: displayScale
+        )
+        var aboveRows = model.attachments.isEmpty ? 0 : 1
+        if case .failed = dictation.state { aboveRows += 1 }
+        let available = viewportHeight - measuredChrome - oneLine
+            - 2 * Space.s4 - CGFloat(aboveRows + 1) * Space.s4
+        return max(0, min(220, contentHeight, viewportHeight * 0.30, available))
+    }
+
+    private var completionPanel: some View {
+        ScrollViewReader { proxy in
+            ScrollView {
+                VStack(alignment: .leading, spacing: 0) {
+                    ForEach(Array(model.slashCompletion.items.enumerated()), id: \.offset) { index, item in
+                        Button { complete(item) } label: {
+                            VStack(alignment: .leading, spacing: Space.s2) {
+                                HStack(alignment: .firstTextBaseline) {
+                                    Text(item.display)
+                                        .font(HermesFont.calloutStrong)
+                                        .foregroundStyle(t.text1)
+                                    if let kind = item.kind, !kind.isEmpty {
+                                        Text(kind)
+                                            .font(HermesFont.caption)
+                                            .foregroundStyle(t.text3)
+                                    }
+                                }
+                                if !item.meta.isEmpty {
+                                    Text(item.meta)
+                                        .font(HermesFont.subhead)
+                                        .foregroundStyle(t.text2)
+                                        .fixedSize(horizontal: false, vertical: true)
+                                }
+                            }
+                            .frame(maxWidth: .infinity, minHeight: Hit.min, alignment: .leading)
+                            .padding(.horizontal, Space.s5)
+                            .padding(.vertical, Space.s3)
+                            .background(index == model.slashCompletion.selectedIndex ? t.fill2 : Color.clear)
+                            .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityElement(children: .combine)
+                        .accessibilityHint("Insert completion without sending")
+                        .accessibilityAddTraits(index == model.slashCompletion.selectedIndex ? .isSelected : [])
+                        .id(index)
+                    }
+                    if let notice = model.slashCompletion.notice {
+                        Text(notice)
+                            .font(HermesFont.footnote)
+                            .foregroundStyle(t.text2)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .padding(Space.s5)
+                    }
+                }
+                .background(GeometryReader { geometry in
+                    Color.clear.preference(key: CompletionContentHeightKey.self, value: geometry.size.height)
+                })
+            }
+            .onPreferenceChange(CompletionContentHeightKey.self) { completionContentHeight = $0 }
+            .onChange(of: model.slashCompletion.selectedIndex) { _, index in
+                proxy.scrollTo(index, anchor: .center)
+            }
+            .onChange(of: model.slashCompletion.items) { _, _ in
+                proxy.scrollTo(model.slashCompletion.selectedIndex, anchor: .center)
+            }
+        }
+        // Opaque on purpose, on glass and off it: this is the one list read mid-keystroke. Continuous corners, so it is cut like the well beneath it.
+        .background(t.composerSurface, in: RoundedRectangle(cornerRadius: Radius.sheet, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: Radius.sheet, style: .continuous).strokeBorder(t.composerStroke, lineWidth: Stroke.hairline))
+        .accessibilityIdentifier("Slash completion suggestions")
+    }
+
+    private func editorDidChange(_ snapshot: ComposerEditorSnapshot) {
+        editorSnapshot = snapshot
+        model.slashCompletion.update(
+            text: snapshot.text, selection: snapshot.selection, isComposing: snapshot.isComposing,
+            isPaste: snapshot.origin == .paste, isExternal: snapshot.origin == .external,
+            editedRange: snapshot.editedRange,
+            isUserEdit: snapshot.origin == .typing || snapshot.origin == .completion,
+            scope: model.slashCompletionScope, api: model.slashCommandAPI
+        )
+        if !isFocused { model.slashCompletion.dismiss() }
+    }
+
+    private func complete(_ item: SlashCompletionItem) {
+        guard let edit = model.slashCompletion.replacement(for: item) else { return }
+        completionReplacement = ComposerEditorReplacement(
+            expectedText: edit.sourceText, expectedSelection: edit.sourceSelection,
+            range: edit.range, text: edit.insertion
+        )
+    }
+
+    /// BUG-057: a pasted image joins the attachment strip the way a picked photo does, converted off the main actor like the picker's.
+    private func attachPasted(_ images: [PastedImage]) {
+        let limit = ComposerOptionsSheet.fileByteLimit
+        let stamp = String(Int(Date().timeIntervalSince1970))
+        Task { @MainActor in
+            let outcome = await Task.detached(priority: .userInitiated) {
+                ComposerPaste.payloads(for: images, limit: limit, stamp: stamp)
+            }.value
+            for payload in outcome.payloads {
+                model.addAttachment(data: payload.data, filename: payload.filename, mimeType: payload.mimeType)
+            }
+            if let failure = outcome.failure { model.errorMessage = failure }
+        }
+    }
+
+    private func handleCompletionKey(_ key: ComposerCompletionKey) {
+        switch key {
+        case .up: model.slashCompletion.moveSelection(by: -1)
+        case .down: model.slashCompletion.moveSelection(by: 1)
+        case .tab:
+            if let item = model.slashCompletion.selectedItem { complete(item) }
+        case .escape: model.slashCompletion.dismiss()
+        }
     }
 
     // MARK: Dictate
@@ -479,14 +688,46 @@ struct ComposerView: View {
 
     /// The model, and nothing else; `EffortRung` keeps its place in the model drawer, where the name is not always visible.
     private var modelPill: some View {
-        ComposerPill(isInteractive: isAdjustable, action: { showingModelSheet = true }) {
+        ComposerPill(isInteractive: isAdjustable, action: { modelSheetQuery = ""; showingModelSheet = true }) {
+            modelNameLabel
+        }
+        .accessibilityLabel(pillAccessibilityLabel)
+    }
+
+    /// The model's name, or, before any model is known, the word the control stands for rather than `ValueView`'s bare dash, which read as a broken button.
+    @ViewBuilder
+    private var modelNameLabel: some View {
+        if modelName.isEmpty {
+            Text(ComposerModelLabel.text(for: modelName))
+                .foregroundStyle(t.text3)
+                .lineLimit(1)
+        } else {
             ValueView(pillState) {
                 Text(modelName)
                     .lineLimit(1)
                     .truncationMode(.middle)
             }
         }
-        .accessibilityLabel(pillAccessibilityLabel)
+    }
+
+    /// Portrait's one-row pill: the model and, when the model reports a reasoning configuration, the effort in words after a dot. It opens the model drawer, which carries the effort rung, so the effort is still one sheet away. The model name truncates first; the effort never does.
+    private var modelAndEffortPill: some View {
+        ComposerPill(isInteractive: isAdjustable, action: { modelSheetQuery = ""; showingModelSheet = true }) {
+            HStack(spacing: Space.s2) {
+                modelNameLabel
+                if !effort.isEmpty {
+                    Text(verbatim: "·")
+                        .foregroundStyle(t.text3)
+                        .accessibilityHidden(true)
+                    ValueView(effortPillState) {
+                        Text(effortLabel)
+                            .lineLimit(1)
+                    }
+                    .fixedSize()
+                }
+            }
+        }
+        .accessibilityLabel(effort.isEmpty ? pillAccessibilityLabel : "\(pillAccessibilityLabel), reasoning effort \(effortLabel)")
     }
 
     /// Effort, in words, one tap away. Removed rather than disabled when the model reports no reasoning configuration at all, because the backend distinguishes `""` (no reasoning config) from `"none"` (reasoning explicitly disabled).
@@ -569,23 +810,67 @@ struct ComposerView: View {
                     .background(t.danger, in: Circle())
             }
             .buttonStyle(IconButtonStyle())
-            .accessibilityLabel(model.isForeignStop ? "Stop work another client started" : "Stop")
+            .accessibilityLabel(model.isForeignTurn ? "Stop work another client started" : "Stop")
         } else {
-            Button {
-                // Only on Home, where a send ends that composition; inside a chat the user is likely to type again in the next few seconds.
-                if model.isDraft { isFocused = false }
-                model.sendTapped()
-            } label: {
-                Image(systemName: "arrow.up")
-                    .font(.system(size: 16, weight: .bold))
-                    .foregroundStyle(t.actionInk)
-                    .frame(width: 34, height: 34)
-                    .background(model.canSend ? t.action : t.action.opacity(0.18), in: Circle())
+            Group {
+                // FEAT-040: while Send would run the draft as a command, a long press offers to send it as words instead.
+                // A button menu and not `.contextMenu`: a context menu lifts Send out of the composer and takes the keyboard away while it is open, so the composer fell to the bottom of the screen and left the lifted button floating where it had been.
+                if ComposerSendAsText.isOffered(for: model) {
+                    Menu {
+                        Button("Send as text") { ComposerSendAsText.send(model) }
+                    } label: {
+                        sendGlyph
+                    } primaryAction: {
+                        send()
+                    }
+                    .menuStyle(.button)
+                    .menuIndicator(.hidden)
+                } else {
+                    Button(action: send) { sendGlyph }
+                }
             }
             .buttonStyle(IconButtonStyle())
             .disabled(!model.canSend)
             .accessibilityLabel("Send")
         }
+    }
+
+    private var sendGlyph: some View {
+        Image(systemName: "arrow.up")
+            .font(.system(size: 16, weight: .bold))
+            // The disabled pair: neutral rungs that stay legible, and the accent only when Send can be pressed.
+            .foregroundStyle(model.canSend ? t.actionInk : t.controlDisabledInk)
+            .frame(width: 34, height: 34)
+            .background(model.canSend ? t.action : t.controlDisabledFill, in: Circle())
+    }
+
+    private func send() {
+        if runModelCommand() { return }
+        // Only on Home, where a send ends that composition; inside a chat the user is likely to type again in the next few seconds.
+        if model.isDraft { isFocused = false }
+        model.sendTapped()
+    }
+
+    /// A typed `/model` opens the model drawer, or picks the model it names, instead of being sent; true when the draft was that command.
+    private func runModelCommand() -> Bool {
+        guard let request = ModelCommand.pending(in: model) else { return false }
+        guard !modelCommandInFlight else { return true }
+        guard isAdjustable else {
+            model.errorMessage = "The model can be changed once this conversation has reconnected."
+            return true
+        }
+        let typed = model.draft
+        model.slashCompletion.dismiss()
+        modelCommandInFlight = true
+        Task { @MainActor in
+            let outcome = await ModelCommand.perform(request, on: model, app: app)
+            modelCommandInFlight = false
+            ModelCommand.apply(outcome, typed: typed, to: model) {
+                modelSheetQuery = ModelCommand.searchText(for: request)
+                showingModelSheet = true
+            }
+        }
+        return true
     }
 
     /// Compact Stop beside Send while a turn is active with text or attachments in the composer, because the primary slot is Send then and the desktop's Esc has no equivalent on a phone.
@@ -604,7 +889,7 @@ struct ComposerView: View {
                 .background(t.danger.opacity(0.14), in: Circle())
         }
         .buttonStyle(IconButtonStyle())
-        .accessibilityLabel(model.isForeignStop ? "Stop work another client started" : "Stop")
+        .accessibilityLabel(model.isForeignTurn ? "Stop work another client started" : "Stop")
     }
 
     // MARK: Attachments — the strip sits above the surface
@@ -645,10 +930,80 @@ struct ComposerView: View {
     }
 }
 
-/// How a host paints the composer: `.opaque` is the Desktop-fidelity fill and border on a `canvas` strip, and `.glass` drops both fills so the host's frost shows through.
+/// How a host paints the composer: `.opaque` is the Desktop-fidelity fill and border on a `canvas` strip; `.glass` leaves the strip to the host's frosted plate and fills the well at Desktop's composer share.
 enum ComposerChrome: Equatable {
     case opaque
     case glass
+
+    /// How much of `composerSurface` the well is filled with: opaque on Home, Desktop's 88 % on the Chat dock, so the composer is one component on both screens and the plate's frost still reads around it.
+    var wellFillOpacity: Double {
+        switch self {
+        case .opaque: return 1
+        case .glass: return GlassMetrics.composerFillOpacity
+        }
+    }
+}
+
+/// What the model button says.
+enum ComposerModelLabel {
+    /// Shown until a model is known: a live chat before its `session.info`, or a draft before the backend's default has loaded.
+    static let unknown = "Model"
+
+    static func text(for modelName: String) -> String {
+        modelName.isEmpty ? unknown : modelName
+    }
+}
+
+// MARK: - Pasted images (BUG-057)
+
+/// Images pasted into the field take the photo picker's road: the same in-memory cap, the same naming and format conversion, and `ChatModel.addAttachment`.
+enum ComposerPaste {
+    struct Outcome: Equatable {
+        var payloads: [AttachmentPayload] = []
+        /// The line to show when an image did not make it.
+        var failure: String?
+    }
+
+    /// `stamp` names the files (`pasted-<stamp>-<n>`). An image over `limit` is refused before it is converted, with the picker's own sentence; a pasteboard type that names no image format is read from the bytes.
+    static func payloads(for images: [PastedImage], limit: Int, stamp: String) -> Outcome {
+        var outcome = Outcome()
+        for (index, image) in images.enumerated() {
+            guard image.data.count <= limit else {
+                outcome.failure = AttachmentPick.tooLargeMessage(bytes: image.data.count, limit: limit)
+                continue
+            }
+            outcome.payloads.append(AttachmentPick.photoPayload(
+                data: image.data,
+                contentType: image.contentType ?? sniffedType(of: image.data),
+                baseName: "pasted-\(stamp)-\(index + 1)"
+            ))
+        }
+        return outcome
+    }
+
+    private static func sniffedType(of data: Data) -> UTType? {
+        guard let source = CGImageSourceCreateWithData(data as CFData, nil),
+              let identifier = CGImageSourceGetType(source) as String?
+        else { return nil }
+        return UTType(identifier)
+    }
+}
+
+// MARK: - Send as text (FEAT-040)
+
+/// The explicit way to send a draft that starts with a slash as words to the model rather than as a command, for a literal leading slash such as `/tmp is full`.
+@MainActor
+enum ComposerSendAsText {
+    /// Offered only while Send would run the draft as a command.
+    static func isOffered(for model: ChatModel) -> Bool {
+        model.slashCompletion.commandIntent(for: model.draft)
+    }
+
+    /// Marks the draft literal, then sends it through the ordinary prompt path with its queue, attachments, acknowledgement and retry.
+    static func send(_ model: ChatModel) {
+        model.slashCompletion.markLiteral()
+        model.sendTapped()
+    }
 }
 
 // MARK: - The viewport the composer has to fit in (BUG-040)
@@ -669,11 +1024,28 @@ struct ComposerViewport<Content: View>: View {
 
 // MARK: - Chrome measurement
 
+/// BUG-056: what the composer keeps of each chrome measurement. The field's line cap is computed from the measured chrome (`fieldLineCap`), and the chrome is measured through a preference, so a measurement that flickered by a fraction of a pixel would re-cap the field on every pass. Kept on the pixel grid, so a flicker inside one pixel rounds away and is not written back.
+enum ComposerChromeMeasure {
+    static func settled(previous: CGFloat, measured: CGFloat, displayScale: CGFloat) -> CGFloat {
+        // A detached view can report a scale of 0 before it reaches a window; 2x is the coarsest grid this ships to.
+        let scale = displayScale > 0 ? displayScale : 2
+        let snapped = (measured * scale).rounded() / scale
+        return abs(snapped - previous) < 0.5 / scale ? previous : snapped
+    }
+}
+
 /// The composer's non-field height; `reduce` adds rather than replaces, because the rows are siblings and the budget has to leave room for all of them at once.
 private struct ComposerChromeKey: PreferenceKey {
     static let defaultValue: CGFloat = 0
     static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
         value += nextValue()
+    }
+}
+
+private struct CompletionContentHeightKey: PreferenceKey {
+    static let defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = max(value, nextValue())
     }
 }
 

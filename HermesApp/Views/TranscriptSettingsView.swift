@@ -23,7 +23,7 @@ struct TranscriptSettingsView: View {
         ScrollView {
             LazyVStack(alignment: .leading, spacing: 0) {
                 SectionHeader("Tool calls")
-                    .padding(.top, Space.s6)
+                    .padding(.top, Space.settingsTop)
 
                 VStack(alignment: .leading, spacing: Space.s3) {
                     Text("Default state")
@@ -74,7 +74,7 @@ struct TranscriptSettingsView: View {
                     get: { actionBranch },
                     set: { actionBranch = $0; TranscriptPreferences.showBranchAction = $0 }
                 ))
-                SwitchRow("Copy", isOn: Binding(
+                SwitchRow("Copy", subtitle: "Copies the message, and its reasoning when there is any.", isOn: Binding(
                     get: { actionCopy },
                     set: { actionCopy = $0; TranscriptPreferences.showCopyAction = $0 }
                 ))
@@ -86,12 +86,19 @@ struct TranscriptSettingsView: View {
                     get: { actionRetry },
                     set: { actionRetry = $0; TranscriptPreferences.showRetryAction = $0 }
                 ))
+
+                Text("The buttons under a reply appear in this order. Edit, which resends your message with changes, shows whenever that message can be resent.")
+                    .font(HermesFont.footnote)
+                    .foregroundStyle(t.text3)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .padding(.horizontal, Space.s6)
+                    .padding(.top, Space.s5)
             }
             .padding(.bottom, Space.s10)
         }
         .background(t.canvas)
         .navigationTitle("Transcript")
         .navigationBarTitleDisplayMode(.inline)
-        .toolbarBackground(t.canvas, for: .navigationBar)
+        .hermesTopBar()
     }
 }

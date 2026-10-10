@@ -12,14 +12,15 @@ extension View {
     /// `onStop` is `model.stopTapped()`; a bare `interrupt()` skips the optimistic finalise and the interrupt latch.
     func foreignStopConfirmation(
         isPresented: Binding<Bool>,
+        ownershipUnknown: Bool = false,
         onStop: @escaping () -> Void
     ) -> some View {
         // A foreign turn is worth confirming before it is ended; the backend gates `subagent.interrupt` on transport authority only from 0.21.1.
-        alert(ForeignStopCopy.title, isPresented: isPresented) {
+        alert(ownershipUnknown ? "Stop this session?" : ForeignStopCopy.title, isPresented: isPresented) {
             Button("Cancel", role: .cancel) { }
             Button("Stop", role: .destructive) { onStop() }
         } message: {
-            Text(ForeignStopCopy.message)
+            Text(ownershipUnknown ? "HARC cannot confirm where this turn started. Stopping ends it for every client attached to this session." : ForeignStopCopy.message)
         }
     }
 

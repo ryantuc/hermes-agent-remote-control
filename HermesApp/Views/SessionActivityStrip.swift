@@ -2,29 +2,64 @@ import HermesServeKit
 import SwiftUI
 
 /// The composer's shared status surface, as a plain `VStack` of independent groups.
-/// Its height deliberately does not depend on the wire: one 44 pt line per populated group, 88 pt with both, 0 pt with neither, and no state a tap can put it in. This strip shrinks the transcript's scroll view, and a height change that pushes the bottom sentinel out of the viewport latches `isNearBottom` false for the rest of the turn.
+/// Its height deliberately does not depend on the wire: one 44 pt line per populated group (tasks, agents, automation, processes), so 0 to 176 pt in portrait, and no state a tap can put it in. In a compact height (a phone in landscape) it shows at most two groups, the first two in that order, because the keyboard leaves about 90 pt between the bar and the composer there. This strip shrinks the transcript's scroll view, and a height change that pushes the bottom sentinel out of the viewport latches `isNearBottom` false for the rest of the turn.
 /// BUG-014: a header and not a list, because the row-drawing shape measured 424 pt with both groups full against a 155.7 pt composer. The drawer holds the full list, one tap from the header.
 @MainActor
 struct SessionActivityStrip: View {
     @Environment(\.hermes) private var t
+    @Environment(\.verticalSizeClass) private var verticalSizeClass
 
     let activity: SessionActivity
+    /// The chat's goal, loop and heartbeat; nil draws nothing, and so does a model whose backend has none or lacks the methods.
+    var controls: SessionControlsModel? = nil
+    /// The chat's background processes, on the same terms.
+    var processes: BackgroundProcessesModel? = nil
     var hasBlockingPrompt = false
 
+    /// The four groups, in the order they stack.
+    enum GroupKind: Equatable, CaseIterable {
+        case todos, agents, controls, processes
+    }
+
+    /// How many groups a compact height shows.
+    static let compactHeightGroupCap = 2
+
+    /// Which groups draw. A group whose sheet is open stays even when its line has nothing to say, so the sheet's host does not leave the tree under it.
+    static func groups(activity: SessionActivity, controls: SessionControlsModel?, processes: BackgroundProcessesModel?, compactHeight: Bool) -> [GroupKind] {
+        var present: [GroupKind] = []
+        if !activity.todos.isEmpty { present.append(.todos) }
+        if !activity.subagents.isEmpty { present.append(.agents) }
+        if let controls, controls.isVisible || controls.isSheetPresented { present.append(.controls) }
+        if let processes, processes.isVisible || processes.isSheetPresented { present.append(.processes) }
+        return compactHeight ? Array(present.prefix(compactHeightGroupCap)) : present
+    }
+
+    private var shown: [GroupKind] {
+        Self.groups(activity: activity, controls: controls, processes: processes, compactHeight: verticalSizeClass == .compact)
+    }
+
     var body: some View {
-        if !activity.isEmpty {
+        let shown = shown
+        if !shown.isEmpty {
             VStack(alignment: .leading, spacing: 0) {
-                if !activity.todos.isEmpty {
-                    TodoStripGroup(list: activity.todos, hasBlockingPrompt: hasBlockingPrompt)
-                }
-                // A sibling group rather than a variant of the one above it: the two describe different things and their retention rules point in opposite directions at the same instant.
-                if !activity.subagents.isEmpty {
-                    SubagentStripGroup(rows: activity.subagents, hasBlockingPrompt: hasBlockingPrompt)
+                ForEach(shown, id: \.self) { kind in
+                    switch kind {
+                    case .todos:
+                        TodoStripGroup(list: activity.todos, hasBlockingPrompt: hasBlockingPrompt)
+                    // A sibling group rather than a variant of the one above it: the two describe different things and their retention rules point in opposite directions at the same instant.
+                    case .agents:
+                        SubagentStripGroup(rows: activity.subagents, hasBlockingPrompt: hasBlockingPrompt)
+                    // Two more siblings, each one line and each only while it has something running: what the agent does on its own, and what it left running.
+                    case .controls:
+                        if let controls { SessionControlStripGroup(controls: controls, hasBlockingPrompt: hasBlockingPrompt) }
+                    case .processes:
+                        if let processes { BackgroundProcessesStripGroup(processes: processes, hasBlockingPrompt: hasBlockingPrompt) }
+                    }
                 }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
-            .background(t.canvas)
-            .hairline(.top)
+            // No ground of its own: the strip sits on the conversation dock's one frosted plate, and an opaque band here would cover the plate's rounded edge. Separated from what follows it, not from the plate's edge.
+            .hairline(.bottom)
             .allowsHitTesting(!hasBlockingPrompt)
         }
     }
@@ -76,7 +111,7 @@ private struct TodoStripGroup: View {
             // The caret form is deliberately not used: nothing here toggles, and a chevron would promise an inline expansion that does not exist.
             // `detail` and not `count`, because the bare total is the same number running and finished; `note` carries the task in progress.
             SectionHeader(
-                list.isFinished ? "📋 Tasks done" : "📋 Tasks",
+                list.isFinished ? "Tasks done" : "Tasks",
                 detail: StripProgress.todos(list),
                 note: list.current?.content
             )
@@ -247,10 +282,7 @@ struct TodoToolRow: View {
             HapticFeedback.selection()
         } label: {
             HStack(spacing: Space.s4) {
-                Text(verbatim: ToolCardView.Family.todo.glyph)
-                    .font(HermesFont.codeStrong)
-                    .foregroundStyle(t.text3)
-                    .frame(width: 16)
+                ToolFamilyIcon(family: .todo)
                     .accessibilityHidden(true)
 
                 Text(activity.name.isEmpty ? TodoList.toolName : activity.name)

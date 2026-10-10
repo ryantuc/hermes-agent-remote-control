@@ -3,9 +3,9 @@ import Foundation
 // MARK: - Todos
 
 /// One row of the agent's plan; an update is a whole-list replacement in wire order, never a merge.
-public struct TodoItem: Identifiable, Sendable, Equatable {
+public struct TodoItem: Identifiable, Sendable, Equatable, Codable {
     /// The closed status vocabulary the backend emits; an unknown status is dropped, not coerced.
-    public enum Status: String, Sendable, Equatable, CaseIterable {
+    public enum Status: String, Sendable, Equatable, CaseIterable, Codable {
         case pending
         case inProgress = "in_progress"
         case completed
@@ -43,7 +43,7 @@ extension TodoItem {
 }
 
 /// A session's current plan. Whole-list replacement, capped on write.
-public struct TodoList: Sendable, Equatable {
+public struct TodoList: Sendable, Equatable, Codable {
     /// `private(set)` on purpose: the cap is enforced in `init`, so nothing can append past it.
     public private(set) var items: [TodoItem]
 
@@ -111,6 +111,24 @@ extension TodoList {
     }
 }
 
+/// The backend's authoritative plan snapshot, `todo_state: {todos, revision}` on a `session.resume`
+/// or `session.activate` result (FEAT-037; `tui_gateway/tool_progress.py:110-155`, contract
+/// `tui_gateway/contracts/sessions.py:62-66`). Absent on a backend that predates it, and absent for a
+/// store that was never written (the backend suppresses an empty list at revision 0); an empty list
+/// at a later revision is the agent clearing its plan.
+public struct TodoSnapshot: Sendable, Equatable {
+    public let todos: TodoList
+    public let revision: Int?
+
+    /// Nil unless `todos` is a list, which is the backend's own acceptance rule.
+    public init?(json: JSONValue?) {
+        guard let json, json.objectValue != nil, let raw = json["todos"], raw.arrayValue != nil,
+              let todos = TodoList.parse(raw) else { return nil }
+        self.todos = todos
+        revision = json["revision"]?.coercedInt
+    }
+}
+
 // MARK: - Subagents
 
 /// One subagent's row in the shared activity surface.
@@ -121,6 +139,8 @@ public struct SubagentRow: Identifiable, Sendable, Equatable {
         case completed
         case failed
         case interrupted
+        /// It finished while this client was not watching: the backend's roster no longer lists it and no `subagent.complete` arrived, so the outcome is unknown.
+        case ended
 
         public var isTerminal: Bool { self != .running }
 
@@ -175,6 +195,14 @@ public struct SubagentRow: Identifiable, Sendable, Equatable {
     public var durationSeconds: Double?
     /// Newest last; the cap and the consecutive dedupe live in `appendStream`.
     public private(set) var stream: [String]
+    /// The runtime session that delegated this agent; the address its tail, steer and stop calls use.
+    public var sessionID: String
+    /// The fan-out batch it belongs to, when the wire said; with `taskIndex` it identifies a failed async task.
+    public var delegationID: String
+    /// From `subagent.list` only; nil when no roster has described this agent.
+    public var acceptingSteer: Bool?
+    /// First seen in a roster read, which says nothing about who started it, so `startedByThisClient` is a guess here and a Stop must not claim either way.
+    public var originUnknown: Bool
 
     public var isTerminal: Bool { state.isTerminal }
 
@@ -195,7 +223,11 @@ public struct SubagentRow: Identifiable, Sendable, Equatable {
         taskCount: Int? = nil,
         depth: Int? = nil,
         startedAt: Date = Date(),
-        durationSeconds: Double? = nil
+        durationSeconds: Double? = nil,
+        sessionID: String = "",
+        delegationID: String = "",
+        acceptingSteer: Bool? = nil,
+        originUnknown: Bool = false
     ) {
         self.id = id
         self.wireSubagentID = wireSubagentID
@@ -217,6 +249,18 @@ public struct SubagentRow: Identifiable, Sendable, Equatable {
         self.updatedAt = startedAt
         self.durationSeconds = durationSeconds
         self.stream = []
+        self.sessionID = sessionID
+        self.delegationID = delegationID
+        self.acceptingSteer = acceptingSteer
+        self.originUnknown = originUnknown
+    }
+
+    /// The ids a later roster read could name this row by; retiring a row retires all of them.
+    var retirementKeys: [String] {
+        var keys = [id]
+        if !wireSubagentID.isEmpty, wireSubagentID != id { keys.append(wireSubagentID) }
+        if !delegationID.isEmpty { keys.append("delegation:\(delegationID):\(taskIndex ?? 0)") }
+        return keys
     }
 
     /// How long this agent has been working; a terminal row measures to its last update, not now.
@@ -245,9 +289,33 @@ public struct SubagentRow: Identifiable, Sendable, Equatable {
 /// reducers, one surface: at turn end an active todo list is dropped while a subagent is kept.
 public struct SessionActivity: Sendable, Equatable {
     public var todos = TodoList()
+    /// The backend's write counter for the plan `todos` was last set from, nil when no frame said.
+    /// Monotonic per session store, so it orders a resume snapshot against live updates (FEAT-037);
+    /// clearing the display at `message.start` deliberately leaves it, so that same plan cannot be
+    /// seeded back from a snapshot of the same revision.
+    public var todoRevision: Int?
     public var subagents: [SubagentRow] = []
+    /// Agents this surface already retired, oldest first, so a roster read cannot draw them again; a failed async task stays in the backend's store for a day.
+    public private(set) var retiredSubagentIDs: [String] = []
 
     public init() {}
+
+    /// What Stop leaves behind: an empty surface that still remembers every agent it cleared, so a roster read already in flight cannot put them back.
+    public func clearedForStop() -> SessionActivity {
+        var cleared = SessionActivity()
+        cleared.retiredSubagentIDs = retiredSubagentIDs
+        cleared.retire(subagents)
+        return cleared
+    }
+
+    mutating func retire(_ rows: [SubagentRow]) {
+        for key in rows.flatMap(\.retirementKeys) where !retiredSubagentIDs.contains(key) {
+            retiredSubagentIDs.append(key)
+        }
+        if retiredSubagentIDs.count > Self.retiredLimit {
+            retiredSubagentIDs.removeFirst(retiredSubagentIDs.count - Self.retiredLimit)
+        }
+    }
 
     public var isEmpty: Bool { todos.items.isEmpty && subagents.isEmpty }
 
@@ -267,15 +335,22 @@ public struct SessionActivity: Sendable, Equatable {
     public static let streamLimit = 24
     /// Per stream line.
     public static let streamLineLimit = 220
+    /// Remembered retirements per session.
+    public static let retiredLimit = 256
 
     /// The write barrier on the row count; call it at the end of every mutation of `subagents`.
     public mutating func enforceBounds() {
         guard subagents.count > Self.subagentLimit else { return }
-        var rows = subagents
-        var excess = rows.count - Self.subagentLimit
-        while excess > 0, let index = rows.firstIndex(where: { $0.isTerminal }) {
-            rows.remove(at: index)
-            excess -= 1
+        var excess = subagents.count - Self.subagentLimit
+        // One pass (BUG-146): the oldest finished rows go first, in order, then the oldest of the rest.
+        var rows: [SubagentRow] = []
+        rows.reserveCapacity(subagents.count - excess)
+        for row in subagents {
+            if excess > 0, row.isTerminal {
+                excess -= 1
+                continue
+            }
+            rows.append(row)
         }
         if excess > 0 { rows.removeFirst(excess) }
         subagents = rows
@@ -306,6 +381,8 @@ extension SubagentEvent {
     func merge(into row: inout SubagentRow) {
         // Never unset either of these, however partial the later frames are.
         if !subagentID.isEmpty { row.wireSubagentID = subagentID }
+        if row.sessionID.isEmpty { row.sessionID = sessionID }
+        if !delegationID.isEmpty { row.delegationID = delegationID }
         if phase == .start { row.hasStarted = true }
         if !goal.isEmpty { row.goal = goal }
         if !parentID.isEmpty { row.parentID = parentID }
@@ -331,6 +408,26 @@ extension SubagentEvent {
     }
 }
 
+extension SubagentSnapshot {
+    /// Fill what a live row is missing; only `settling` (no frame since the read went out) lets the roster end a row.
+    func fill(_ row: inout SubagentRow, settling: Bool, at moment: Date) {
+        if row.wireSubagentID.isEmpty { row.wireSubagentID = subagentID }
+        if row.goal.isEmpty, !goal.isEmpty { row.goal = goal }
+        if row.model.isEmpty, !model.isEmpty { row.model = model }
+        if row.parentID.isEmpty, !parentID.isEmpty { row.parentID = parentID }
+        if row.delegationID.isEmpty, !delegationID.isEmpty { row.delegationID = delegationID }
+        if row.depth == nil { row.depth = depth }
+        if let toolCount { row.toolCount = max(row.toolCount, toolCount) }
+        if hasStarted { row.hasStarted = true }
+        row.acceptingSteer = acceptingSteer
+        if settling, let terminalState {
+            row.state = terminalState
+            row.currentTool = ""
+            row.updatedAt = moment
+        }
+    }
+}
+
 extension SessionActivity {
     /// The subagent reducer: upsert by identity, per-field merge, terminal freeze; nil when the
     /// frame was discarded. `turnStartedLocally` is stamped only onto rows this call creates.
@@ -340,15 +437,15 @@ extension SessionActivity {
         defer { enforceBounds() }
 
         if let index = subagents.firstIndex(where: { $0.id == id }) {
-            // A terminal row freezes: a row revived back to `running` would never prune.
-            guard !subagents[index].isTerminal else { return nil }
+            // A terminal row freezes: a row revived back to `running` would never prune. The one exception is a late `complete` naming the real outcome of a row the roster could only call `ended`.
+            guard !subagents[index].isTerminal || (subagents[index].state == .ended && update.phase.isTerminal) else { return nil }
             update.merge(into: &subagents[index])
             return id
         }
 
         // A frame for an id nobody announced is DISCARDED, not promoted into a headless row.
         guard update.phase.createsRow else { return nil }
-        var row = SubagentRow(id: id, startedByThisClient: turnStartedLocally)
+        var row = SubagentRow(id: id, startedByThisClient: turnStartedLocally, sessionID: update.sessionID)
         update.merge(into: &row)
         subagents.append(row)
         return id
@@ -357,8 +454,94 @@ extension SessionActivity {
     /// Retire finished agents and keep working ones; called at `message.start` and nowhere else.
     public mutating func pruneTerminalSubagents() {
         guard subagents.contains(where: \.isTerminal) else { return }
+        retire(subagents.filter(\.isTerminal))
         subagents.removeAll(where: \.isTerminal)
         enforceBounds()
+    }
+
+    /// Fold a `subagent.list` answer into the roster without duplicating what live frames already drew; answers whether anything changed.
+    ///
+    /// Live frames stay authoritative: `observedAt` is when the read went out, and a row a frame touched after it is neither overwritten nor retired by this answer. A started agent the roster no longer lists ended out of sight and settles as `ended`; a queued one may not be registered yet, so it stays.
+    @discardableResult
+    public mutating func reconcile(
+        _ roster: SubagentRoster,
+        observedAt: Date,
+        turnStartedLocally: Bool,
+        sessionID: String,
+        now: Date = Date()
+    ) -> Bool {
+        let before = subagents
+        defer { enforceBounds() }
+        let retired = Set(retiredSubagentIDs)
+
+        for child in roster.subagents where !retired.contains(child.subagentID) {
+            if let index = subagents.firstIndex(where: {
+                $0.id == child.subagentID || $0.wireSubagentID == child.subagentID
+            }) {
+                guard !subagents[index].isTerminal else { continue }
+                let settling = subagents[index].updatedAt <= observedAt
+                child.fill(&subagents[index], settling: settling, at: now)
+                continue
+            }
+            var row = SubagentRow(
+                id: child.subagentID,
+                wireSubagentID: child.subagentID,
+                startedByThisClient: turnStartedLocally,
+                hasStarted: child.hasStarted,
+                goal: child.goal,
+                state: child.terminalState ?? .running,
+                parentID: child.parentID,
+                model: child.model,
+                toolCount: child.toolCount ?? 0,
+                depth: child.depth,
+                startedAt: child.startedAt ?? now,
+                sessionID: sessionID,
+                delegationID: child.delegationID,
+                acceptingSteer: child.acceptingSteer,
+                originUnknown: true
+            )
+            // A roster names the last tool, not one running now, so it seeds history and never `currentTool`.
+            if !child.lastTool.isEmpty { row.appendStream(child.lastTool) }
+            row.updatedAt = now
+            subagents.append(row)
+        }
+
+        let listed = Set(roster.subagents.map(\.subagentID))
+        for index in subagents.indices {
+            let row = subagents[index]
+            guard !row.isTerminal, row.hasStarted, !row.wireSubagentID.isEmpty,
+                  !listed.contains(row.wireSubagentID), row.updatedAt <= observedAt else { continue }
+            subagents[index].state = .ended
+            subagents[index].currentTool = ""
+            subagents[index].updatedAt = now
+        }
+
+        for task in roster.delegations where !retired.contains(task.rowID) {
+            let covered = subagents.contains {
+                $0.id == task.rowID
+                    || (!$0.delegationID.isEmpty && $0.delegationID == task.delegationID && ($0.taskIndex ?? 0) == task.taskIndex)
+            }
+            guard !covered else { continue }
+            let finished = task.completedAt ?? now
+            var row = SubagentRow(
+                id: task.rowID,
+                startedByThisClient: turnStartedLocally,
+                hasStarted: true,
+                goal: task.goal,
+                summary: task.error,
+                state: SubagentRow.State(completeStatus: task.status),
+                taskIndex: task.taskIndex,
+                startedAt: task.dispatchedAt ?? finished,
+                durationSeconds: task.dispatchedAt.map { max(0, finished.timeIntervalSince($0)) },
+                sessionID: sessionID,
+                delegationID: task.delegationID,
+                originUnknown: true
+            )
+            row.updatedAt = finished
+            subagents.append(row)
+        }
+
+        return subagents != before
     }
 
     /// Rows still working; the strip's header count.

@@ -33,19 +33,6 @@ enum DisplayRedaction {
 
     /// Per reference-clients.md §6.4: strip the `@image:` directive lines the backend appends to a persisted user turn so they do not render as literal text.
     static func stripImageDirectives(_ text: String) -> (body: String, refs: [String]) {
-        var refs: [String] = []
-        var lines: [String] = []
-        for line in text.components(separatedBy: "\n") {
-            let trimmed = line.trimmingCharacters(in: .whitespaces)
-            if trimmed.hasPrefix("@image:") {
-                refs.append(String(trimmed.dropFirst("@image:".count)))
-            } else if trimmed == "[screenshot]" {
-                refs.append("[screenshot]")
-            } else {
-                lines.append(line)
-            }
-        }
-        let body = lines.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
-        return (body, refs)
+        UserInputDisplay.project(text)
     }
 }

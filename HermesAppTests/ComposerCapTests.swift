@@ -298,7 +298,10 @@ final class ComposerCapTests: XCTestCase {
         // restating the production arithmetic.
         let chrome = measureComposer(chat: resting, app: harness.app, viewport: nil) - height(lines: 1)
 
-        let tight: CGFloat = 257
+        // Just enough room for three lines above the chrome; the chrome is one
+        // row of controls since the one-row composer, so the viewport is
+        // derived rather than fixed at the old two-row 257 pt.
+        let tight: CGFloat = chrome + height(lines: 3) + 1
         let atTight = measureComposer(chat: full, app: harness.app, viewport: tight)
         print("[composer] tight viewport \(tight) pt · chrome \(chrome) pt · composer \(atTight) pt")
         XCTAssertEqual(atTight, chrome + height(lines: 3), accuracy: 0.5, """
@@ -309,7 +312,7 @@ final class ComposerCapTests: XCTestCase {
         XCTAssertLessThanOrEqual(atTight, tight, "and it still fits the screen it is on")
 
         // Too short for the floor: it yields rather than overflowing.
-        let cramped: CGFloat = 175
+        let cramped: CGFloat = chrome + height(lines: 2) - 1
         let atCramped = measureComposer(chat: full, app: harness.app, viewport: cramped)
         print("[composer] cramped viewport \(cramped) pt · composer \(atCramped) pt")
         XCTAssertLessThanOrEqual(atCramped, cramped, """

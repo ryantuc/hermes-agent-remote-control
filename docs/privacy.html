@@ -24,11 +24,11 @@
   <div class="wrap">
 
     <h1>Privacy Policy for HARC</h1>
-    <p class="updated">Last updated 31 August 2026</p>
+    <p class="updated">Last updated 9 October 2026</p>
 
     <h2>The short version</h2>
     <p>HARC does not collect your data. There is no HARC server, there is no account, and nothing you type into this app is sent to the developer, because the developer operates no service that could receive it.</p>
-    <p>That is a statement about the developer, not a promise that your words stay on your own hardware. Two things are worth reading past the short version for. The first is that your prompts go to the Hermes Agent installation you run, and that installation sends them on to whichever AI provider you configured on it — so when you have set it up that way, your requests do leave your machine, under the arrangement you made with that provider. It is described under <a href="#prompts">Your prompts, and the agent's replies</a>. The second is that when the agent produces an image or a video that lives at an internet address rather than on your own machine, your iPhone fetches that file from that address directly, which is a connection between your phone and a third party. It is described under <a href="#media">Media the agent produces</a>.</p>
+    <p>That is a statement about the developer, not a promise that your words stay on your own hardware. Three things are worth reading past the short version for. The first is that your prompts go to the Hermes Agent installation you run, and that installation sends them on to whichever AI provider you configured on it — so when you have set it up that way, your requests do leave your machine, under the arrangement you made with that provider. It is described under <a href="#prompts">Your prompts, and the agent's replies</a>. The second is that when the agent produces an image or a video that lives at an internet address rather than on your own machine, your iPhone fetches that file from that address directly, which is a connection between your phone and a third party. It is described under <a href="#media">Media the agent produces</a>. The third is that when your agent asks to connect an app or service, that service's sign-in page opens on your iPhone, and what you type there goes to that service. It is described under <a href="#connections">Apps your agent asks to connect</a>.</p>
 
     <h2>What HARC is</h2>
     <p>HARC is a client application for <a href="https://github.com/NousResearch/hermes-agent">Hermes Agent</a>, an open-source AI agent that you install and run on hardware you control. HARC connects to that installation, at an address you supply, using a credential you supply. Everything you send through HARC goes to your own machine first. What happens after that — which AI provider your prompts are forwarded to, what the agent's tools are allowed to read, when it stops to ask your permission — is decided by that installation's own configuration, not by this app. The developer of HARC is not a party to any of it and cannot observe it.</p>
@@ -39,6 +39,9 @@
       <dt id="prompts">Your prompts, and the agent's replies</dt>
       <dd>These travel between your iPhone and the machine running your Hermes Agent installation, over a connection you configure. That connection is whatever you set it up to be: on a private network it is an ordinary HTTP connection unless you have put TLS in front of your own server. They are not sent anywhere else by this app. Your own installation is a different matter. If it is configured to use a third-party AI provider, your prompts reach that provider under the arrangement you made with them, using credentials you hold on that machine — and so does whatever context the agent's tools gather while answering you, which can include the contents of files on that machine. HARC neither selects that provider, holds those credentials, nor decides what the tools may read; your Hermes Agent configuration does.</dd>
 
+      <dt id="recovery">Conversation recovery on your iPhone</dt>
+      <dd>So that a conversation interrupted by the app being closed can be put back when you return to it, HARC keeps a copy of recent conversation content — your messages, the agent's replies and tool activity, and the state of the turn in progress — in the app's cache folder on your iPhone. The copy is protected by iOS file protection until you first unlock the phone after it starts. HARC keeps at most eight conversations, no more than 32 MB in all and 8 MB for any one, and discards anything older than 24 hours. It is never transmitted. Removing a backend profile, or signing out of it, deletes the copies made for it; iOS may clear the cache folder when storage runs low; deleting the app removes it outright. Nothing is written while the demo runs.</dd>
+
       <dt>Backend credentials</dt>
       <dd>The session token, bearer token or password you enter to reach your own server is stored in the iOS Keychain on your device, marked as available only after the first unlock and only on that device. It does not sync to iCloud, and it does not restore onto a different device from a backup. It is transmitted only to the server you entered it for, and never to the developer.</dd>
 
@@ -47,9 +50,13 @@
         <p>A reply can refer to an image or a video in one of two ways, and they behave differently.</p>
         <ul>
           <li>If the file is on the machine running your Hermes Agent installation, HARC asks that machine for it, over the same authenticated connection as everything else. Nobody else is involved.</li>
-          <li>If the file is at an internet address, which is what most image-generation tools return, <strong>your iPhone fetches it from that address directly</strong>. The request carries no credential of yours: not your backend token, not your identity, nothing this app holds. But the host serving that file necessarily sees the request, which means it sees your IP address and the standard information any web request carries. A video at such an address is streamed from that host to your phone as it plays. The address is chosen by the agent and the tools you have given it, not by HARC and not by the developer. HARC will not download a file larger than 32 MB this way, and gives up after 30 seconds.</li>
+          <li>If the file is at an internet address, which is what most image- and video-generation tools return, <strong>your iPhone fetches it from that address directly</strong>. The request carries no credential of yours: not your backend token, not your identity, nothing this app holds. But the host serving that file necessarily sees the request, which means it sees your IP address and the standard information any web request carries. For a video, HARC may ask that host for the file's size as soon as the reply is on screen, but it downloads the video itself only when you open it to play, and again if you save or share it. The address is chosen by the agent and the tools you have given it, not by HARC and not by the developer. HARC will not download an image larger than 32 MB this way, and gives up after 30 seconds.</li>
         </ul>
+        <p>When you save an image or a video to your photo library, the copy goes into Photos on your iPhone like any other photo; HARC asks only for permission to add to your library, not to read it. When you share or copy one, it goes to the app or person you choose in the iOS share sheet, and nowhere else.</p>
       </dd>
+
+      <dt id="connections">Apps your agent asks to connect</dt>
+      <dd>Your Hermes Agent installation can ask to connect an app or service, such as an email or calendar account, so that its tools can use it. HARC shows that request as a card in the conversation. If you tap Sign in, HARC opens the sign-in page your installation supplied — only if it is an https address — in the iOS web sign-in sheet, which first asks your permission to open it. That page is served by the service you are connecting, not by HARC or the developer, and what you type there, such as your username, password or approval, goes to that service. HARC cannot see what happens inside the sheet: when the sign-in finishes, HARC is told only that the sheet has closed, and does not read or keep the address it returns to. Whether the account connected is decided between your installation and that service. Like Safari, the sign-in sheet can use cookies Safari already holds, so a service you are signed in to there may recognise you. If you choose Skip or Continue instead, that choice goes only to your own installation.</dd>
 
       <dt>Voice chat</dt>
       <dd>Speech recognition in voice chat happens entirely on your iPhone. HARC requires on-device recognition and refuses to start a voice conversation on a device or language where iOS cannot provide it, rather than falling back to a network service. Your recorded audio does not leave the phone; only the resulting text is sent, as an ordinary message, to your own Hermes Agent installation.</dd>
@@ -57,11 +64,14 @@
       <dt>Dictation</dt>
       <dd>Dictation offers two engines and the choice is yours. The on-device engine works the same way voice chat does, and the audio stays on the phone. The Hermes engine records to a temporary file on your device, sends that recording to your own Hermes Agent installation to be transcribed, and deletes the file afterwards. In neither case does audio reach the developer.</dd>
 
-      <dt>Photos, documents and files you attach</dt>
-      <dd>When you attach a photo, an image from your library, or a document, it is sent to your own Hermes Agent installation as part of your conversation. From there it is part of that conversation like anything else you type, which means it goes on to your configured AI provider on the same terms as your prompts.</dd>
+      <dt>Photos, videos, documents and files you attach</dt>
+      <dd>When you attach a photo, a video, an image from your library, or a document, it is sent to your own Hermes Agent installation as part of your conversation. From there it is part of that conversation like anything else you type, which means it goes on to your configured AI provider on the same terms as your prompts. A photo in a format your installation does not accept, including the iPhone's default HEIC format, is converted on your iPhone to JPEG (or PNG, where the image has transparency) before it is sent. A photo keeps the information embedded in it, which can include where it was taken. HARC sees only the photos and videos you pick: the iOS photo picker runs outside the app and hands over nothing else from your library.</dd>
 
       <dt>Files the agent made</dt>
       <dd>When you open a file a session produced, HARC fetches it from the machine that made it and writes it into the app's temporary storage on your device so that it can be displayed. iOS clears that storage; deleting the app removes it outright.</dd>
+
+      <dt>Your backend's settings</dt>
+      <dd>Some settings in HARC belong to your Hermes Agent installation rather than to the app — among them the default model, the fallback models and the other backend settings on HARC's Settings screens. When you change one, HARC sends the change to your installation, which stores it in its own configuration. It goes nowhere else.</dd>
 
       <dt>Diagnostics</dt>
       <dd>HARC keeps a short log of connection events, and optionally a log of what moved the conversation view, to help you diagnose problems. These live in memory on your device. They are not uploaded. You can read them on the Diagnostics screen and you can choose to copy or share them, at which point they go wherever you send them. Read one before you send it.</dd>
@@ -76,7 +86,7 @@
       <dd>Notifications and Live Activities in HARC are generated on your device from events sent by your own backend. There is no push notification service in this app, and nothing about your conversations is routed through the developer or any third party to reach your Lock Screen.</dd>
 
       <dt>Demo mode</dt>
-      <dd>While the demo runs, HARC creates no network client and holds no credential. It makes no connections of any kind.</dd>
+      <dd>While the demo runs, HARC creates no network client and holds no credential. It makes no connections of any kind, and it saves nothing.</dd>
     </dl>
 
     <h2>What HARC does not do</h2>
@@ -89,19 +99,19 @@
     </ul>
 
     <h2>Permissions HARC asks for</h2>
-    <p>HARC asks for access to the camera, the photo library, the microphone, speech recognition, Face ID, the local network, and permission to send you notifications. Each is requested only when you first use the feature that needs it, each is used only for that feature, and none of the resulting data reaches the developer. You may decline any of them and continue using the rest of the app.</p>
+    <p>HARC asks for access to the camera, the microphone, speech recognition, Face ID and the local network, for permission to add to your photo library when you save an image or a video, and for permission to send you notifications. Each is requested only when you first use the feature that needs it, each is used only for that feature, and none of the resulting data reaches the developer. You may decline any of them and continue using the rest of the app.</p>
 
     <h2>Opening web pages</h2>
-    <p>Content produced by your agent may contain links, and the app has a screen for browsing artifacts that can display web content. If you open one, where that page goes and what it does is governed by that site's own privacy policy, not this one.</p>
+    <p>Content produced by your agent may contain links, and the app has a screen for browsing artifacts that can display web content. A sign-in page for an app your agent asks to connect opens in the iOS web sign-in sheet, as described above. If you open any of these, where that page goes and what it does is governed by that site's own privacy policy, not this one.</p>
 
     <h2>Children</h2>
     <p>HARC is a developer tool. It is not directed at children, and the developer does not knowingly receive information from anyone, because there is no mechanism by which the developer could receive it.</p>
 
     <h2>Your rights, and how they are satisfied here</h2>
-    <p>Privacy laws including the GDPR, the UK GDPR and the CCPA give you rights to access, correct, port and delete the personal information a company holds about you. The developer of HARC holds none: there is no server, no account and no database, so there is nothing to disclose, correct, export or erase. Everything this app sends goes to your own device and your own machine, both of which are already under your control. Where it goes beyond them — to the AI provider your own installation forwards it to, or to a host serving media the agent chose — is governed by your arrangement with those parties, not by the developer, who is not in the path and holds no copy.</p>
+    <p>Privacy laws including the GDPR, the UK GDPR and the CCPA give you rights to access, correct, port and delete the personal information a company holds about you. The developer of HARC holds none: there is no server, no account and no database, so there is nothing to disclose, correct, export or erase. Everything this app sends goes to your own device and your own machine, both of which are already under your control. Where it goes beyond them — to the AI provider your own installation forwards it to, to a host serving media the agent chose, or to a service whose sign-in page you open — is governed by your arrangement with those parties, not by the developer, who is not in the path and holds no copy.</p>
 
     <h2>Deleting your data</h2>
-    <p>Removing a backend profile in the app removes its stored credential from the Keychain. Deleting the app removes everything else it holds. There is no server-side data to request, correct or delete, because there is no server.</p>
+    <p>Removing a backend profile in the app removes its stored credential from the Keychain and the conversation recovery copies made for it. Deleting the app removes everything else it holds on your iPhone. What your own Hermes Agent installation stores, including your conversations and its settings, stays on that machine and is yours to manage there. There is no server-side data to request, correct or delete, because there is no server.</p>
 
     <h2>Changes</h2>
     <p>If this policy changes, the revised version will be published at this address with a new date at the top.</p>

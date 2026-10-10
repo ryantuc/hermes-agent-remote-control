@@ -82,7 +82,7 @@ enum LiveActivityProbe {
         let tokenA = alpha.pendingApproval?.id.uuidString ?? ""
         let tokenB = bravo.pendingApproval?.id.uuidString ?? ""
         let tokenC = charlie.pendingApproval?.id.uuidString ?? ""
-        log("tokens a=\(tokenA.prefix(8)) b=\(tokenB.prefix(8)) c=\(tokenC.prefix(8))")
+        log("tokens a=\(LiveActivityController.logFingerprint(tokenA)) b=\(LiveActivityController.logFingerprint(tokenB)) c=\(LiveActivityController.logFingerprint(tokenC))")
 
         log("── derivation ──")
         for (key, chat) in [("probe-a", alpha), ("probe-b", bravo)] {

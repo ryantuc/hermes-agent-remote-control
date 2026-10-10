@@ -303,6 +303,7 @@ final class TodoActivityLifecycleTests: XCTestCase {
         XCTAssertTrue(state.activity.todos.items.allSatisfy {
             $0.content.count <= SessionActivity.todoContentLimit
         })
-        XCTAssertLessThanOrEqual(state.entries.count, 2, "a thousand updates are not a thousand cards")
+        // One card per real call since BUG-151: these are a thousand distinct tool ids.
+        XCTAssertEqual(state.entries.count, 1_000, "a thousand distinct plan calls are a thousand cards")
     }
 }

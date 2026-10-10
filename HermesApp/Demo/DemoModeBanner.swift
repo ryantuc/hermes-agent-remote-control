@@ -63,6 +63,15 @@ enum DemoCaptureFlags {
     }
 }
 
+/// The canvas under the demo marker, carried up under the status bar.
+private struct DemoMarkerGround: View {
+    @Environment(\.hermes) private var t
+
+    var body: some View {
+        t.canvas.ignoresSafeArea(.container, edges: .top)
+    }
+}
+
 extension View {
     /// Attach the demo marker above everything, for as long as the demo runs.
     ///
@@ -74,6 +83,9 @@ extension View {
         if isActive && !DemoCaptureFlags.hidesDemoBanner {
             VStack(spacing: 0) {
                 DemoModeBanner(onExit: onExit)
+                    // The conversation draws its transcript past its scroll view's edges so it can pass behind the glass chrome, and a later sibling in a stack draws over an earlier one. Raised, and grounded up under the status bar, so that overflow can reach neither this row nor the clock above it.
+                    .background { DemoMarkerGround() }
+                    .zIndex(1)
                 self
             }
         } else {

@@ -31,7 +31,7 @@ struct BotsHomeView: View {
             }
 
             ScrollView {
-                BotRosterList { bot in
+                BotRosterList(emptyFillsScreen: true) { bot in
                     // The Bots root is the bottom of this stack, so this is an append and Back returns to the list.
                     path.append(.thread(.bot(bot.threadRef)))
                 }
@@ -59,15 +59,7 @@ struct BotsHomeView: View {
                 // The rail is already open; the clear slot keeps the title centred, exactly as Home does it.
                 Color.clear.frame(width: Hit.min, height: Hit.min)
             } else {
-                Button {
-                    hubOpen = true
-                } label: {
-                    Image(systemName: "line.3.horizontal")
-                        .font(.system(size: 17, weight: .medium))
-                        .foregroundStyle(t.text1)
-                }
-                .buttonStyle(IconButtonStyle())
-                .accessibilityLabel("Menu")
+                HomeMenuButton { hubOpen = true }
             }
 
             Spacer(minLength: 0)
@@ -79,7 +71,6 @@ struct BotsHomeView: View {
 
             HomeModeControlButton(mode: mode, action: onToggleMode)
         }
-        .padding(.horizontal, Space.s3)
-        .frame(height: 52)
+        .homeBarRow()
     }
 }

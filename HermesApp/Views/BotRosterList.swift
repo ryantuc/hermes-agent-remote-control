@@ -11,6 +11,8 @@ struct BotRosterList: View {
     @Environment(\.hermes) private var t
     @Environment(AppModel.self) private var app
 
+    /// Whether an empty roster is the screen's whole content (the Bots root), drawn as the shared centred state, rather than one line in the hub's history list.
+    var emptyFillsScreen = false
     /// Performed after `markOpened`, with the bot that was tapped.
     let onOpen: (BotsModel.Bot) -> Void
 
@@ -28,7 +30,13 @@ struct BotRosterList: View {
                 if bots.isLoading && !bots.hasLoadedOnce {
                     loadingRow
                 } else if bots.hasLoadedOnce && visibleError == nil && app.connectionState.isOpen {
-                    emptyRow
+                    let copy = BotRosterEmptyCopy(isDemo: app.isDemoActive)
+                    if emptyFillsScreen {
+                        StatePanel(symbol: "person.2", title: copy.title, message: copy.message)
+                            .containerRelativeFrame(.vertical)
+                    } else {
+                        emptyRow(copy.line)
+                    }
                 }
             } else {
                 ForEach(roster) { bot in
@@ -103,8 +111,8 @@ struct BotRosterList: View {
         .padding(.vertical, Space.s9)
     }
 
-    private var emptyRow: some View {
-        Text("This backend has no profiles yet")
+    private func emptyRow(_ line: String) -> some View {
+        Text(line)
             .font(HermesFont.subhead)
             .foregroundStyle(t.text3)
             .padding(.horizontal, Space.s6)
@@ -137,10 +145,30 @@ struct BotRosterList: View {
     private var groupsFootnote: some View {
         Text("Group chats are managed from Hermes Desktop.")
             .font(HermesFont.footnote)
-            .foregroundStyle(t.text4)
+            .foregroundStyle(t.text3)
             .padding(.horizontal, Space.s6)
             .padding(.vertical, Space.s5)
             .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
+/// What an empty roster says. The demo answers the profiles call with nothing, and an empty state about "this backend" read as a broken backend in an app whose banner says it is not connected.
+struct BotRosterEmptyCopy: Equatable {
+    let title: String
+    let message: String
+    /// The one line the hub's copy of the roster draws.
+    let line: String
+
+    init(isDemo: Bool) {
+        if isDemo {
+            title = "No bots in the demo"
+            message = "Bots appear here once you connect your own Hermes Agent: each profile on it shows up as a bot."
+            line = "Bots appear once you connect your own Hermes Agent"
+        } else {
+            title = "No bots yet"
+            message = "This backend has no profiles yet. Each profile on it appears here as a bot."
+            line = "No bots on this backend yet"
+        }
     }
 }
 
@@ -187,7 +215,7 @@ struct BotRosterRow: View {
             VStack(alignment: .trailing, spacing: Space.s2) {
                 Text(RelativeTime.short(epochSeconds: lastActive))
                     .font(HermesFont.footnote)
-                    .foregroundStyle(t.text4)
+                    .foregroundStyle(t.text3)
                     .lineLimit(1)
                 HStack(spacing: Space.s2) {
                     if isWorking { PulsingDot(color: t.warn, size: 6) }
@@ -203,7 +231,6 @@ struct BotRosterRow: View {
         .padding(.horizontal, Space.s6)
         .frame(minHeight: Self.restingHeight)
         .contentShape(Rectangle())
-        .hairline()
     }
 }
 
@@ -253,7 +280,7 @@ enum BotsDemoRoster {
             BotsModel.Bot(
                 profile: "research",
                 displayName: "Research",
-                description: "Long reads, summarised.",
+                description: "Long reads, summarized.",
                 isDefault: false,
                 hasAvatar: false,
                 preview: "",

@@ -40,6 +40,11 @@ struct WorktreeSheet: View {
     @State private var loadingBranches = false
     @State private var pendingLabel: String?
     @State private var failure: String?
+    /// BUG-092: why the repository list is missing or stale. Separate from `failure` because only this one decides whether "no repositories" may be said, and only this one is fixed by loading again.
+    @State private var reposFailure: String?
+    /// The same rule for the lane and branch lists: an empty list after a failed call is not "not a repository" or "no branches".
+    @State private var lanesFailed = false
+    @State private var branchesFailed = false
     @State private var reposExpanded = false
 
     /// A repository row's identity, from either source.
@@ -151,13 +156,40 @@ struct WorktreeSheet: View {
 
     // MARK: Lanes — the landing view
 
+    /// What a list may say about itself. BUG-092: a list that is empty because its call failed says the call failed and offers it again; only a list the backend answered empty may claim there is nothing.
+    enum ListState: Equatable {
+        case loading
+        case failed
+        case empty
+        case rows
+    }
+
+    static func listState(isLoading: Bool, isEmpty: Bool, failed: Bool) -> ListState {
+        if isLoading { return .loading }
+        if !isEmpty { return .rows }
+        return failed ? .failed : .empty
+    }
+
     @ViewBuilder
     private var laneBody: some View {
-        if loadingRepos {
+        switch Self.listState(isLoading: loadingRepos, isEmpty: repoChoices.isEmpty, failed: reposFailure != nil) {
+        case .loading:
             loadingRow("Finding repositories…")
-        } else if repoChoices.isEmpty {
+        case .failed:
+            failureNote(reposFailure ?? "")
+            if app.projectsAPI != nil {
+                retryRow { await loadRepos() }
+            }
+        case .empty:
             emptyNote("No repositories on the backend yet. Pick a working directory first — a folder becomes a repository the moment a worktree is created in it.")
-        } else {
+        case .rows:
+            // Rows from an earlier answer, or the repository in play, stay up when a refresh fails; the failure is said above them.
+            if let reposFailure {
+                failureNote(reposFailure)
+                if app.projectsAPI != nil {
+                    retryRow { await loadRepos() }
+                }
+            }
             // REPOSITORY comes first but can run to 20+ rows, so collapsed it
             // shows only the repository in play and the count in the header.
             if !repoChoices.isEmpty {
@@ -175,11 +207,19 @@ struct WorktreeSheet: View {
             if !repoRoot.isEmpty {
                 SectionHeader("Lane")
                     .padding(.top, Space.s5)
-                if loadingLanes {
+                switch Self.listState(isLoading: loadingLanes, isEmpty: worktrees.isEmpty, failed: lanesFailed) {
+                case .loading:
                     loadingRow("Reading worktrees…")
-                } else if worktrees.isEmpty {
+                case .failed:
+                    // The reason is in the failure line above the list.
+                    failureNote("Couldn't read this repository's worktrees.")
+                    retryRow {
+                        failure = nil
+                        await loadLanes()
+                    }
+                case .empty:
                     emptyNote("That folder is not a git repository yet.")
-                } else {
+                case .rows:
                     ForEach(worktrees) { lane in
                         laneRow(lane)
                     }
@@ -375,6 +415,13 @@ struct WorktreeSheet: View {
 
             if loadingBranches {
                 loadingRow("Reading branches…")
+            } else if Self.listState(isLoading: false, isEmpty: branches.isEmpty, failed: branchesFailed) == .failed {
+                // The reason is in the failure line above the field.
+                failureNote("Couldn't read this repository's branches.")
+                retryRow {
+                    failure = nil
+                    await loadBranches()
+                }
             } else if filteredBranches.isEmpty {
                 emptyNote(branches.isEmpty ? "No branches on that repository." : "No branch matches that filter.")
             } else {
@@ -457,17 +504,39 @@ struct WorktreeSheet: View {
             .padding(.vertical, Space.s5)
     }
 
+    /// Where an empty note would otherwise make a claim the client cannot back.
+    private func failureNote(_ text: String) -> some View {
+        Text(text)
+            .font(HermesFont.footnote)
+            .foregroundStyle(t.danger)
+            .fixedSize(horizontal: false, vertical: true)
+            .padding(.horizontal, Space.s6)
+            .padding(.top, Space.s5)
+            .padding(.bottom, Space.s3)
+            .accessibilityAddTraits(.isStaticText)
+    }
+
+    private func retryRow(_ reload: @escaping () async -> Void) -> some View {
+        actionRow("Try again", isPrimary: true) {
+            Task { await reload() }
+        }
+    }
+
     // MARK: Loading
 
     private func loadRepos() async {
         loadingRepos = true
         defer { loadingRepos = false }
         guard let projectsAPI = app.projectsAPI else {
-            failure = "Not connected to a backend."
+            reposFailure = "Not connected to a backend."
             return
         }
         failure = nil
-        repos = (try? await projectsAPI.discoverRepos()) ?? []
+        let load = await HostListLoad.run(keeping: repos) {
+            try await projectsAPI.discoverRepos()
+        }
+        repos = load.rows
+        reposFailure = load.failure.map { "Couldn't list the backend's repositories: \($0)" }
 
         // Open on the repository the current working directory is already in,
         // so the sheet lands where the conversation is rather than on a list.
@@ -505,11 +574,13 @@ struct WorktreeSheet: View {
     private func loadLanes() async {
         guard let git = app.gitAPI, !repoRoot.isEmpty else { return }
         loadingLanes = true
+        lanesFailed = false
         defer { loadingLanes = false }
         do {
             worktrees = try await git.worktrees(path: repoRoot)
         } catch {
             worktrees = []
+            lanesFailed = true
             failure = message(error)
         }
     }
@@ -517,11 +588,13 @@ struct WorktreeSheet: View {
     private func loadBranches() async {
         guard let git = app.gitAPI, !repoRoot.isEmpty else { return }
         loadingBranches = true
+        branchesFailed = false
         defer { loadingBranches = false }
         do {
             branches = try await git.branches(path: repoRoot)
         } catch {
             branches = []
+            branchesFailed = true
             failure = message(error)
         }
     }

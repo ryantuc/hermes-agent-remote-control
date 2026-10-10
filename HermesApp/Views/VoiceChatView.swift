@@ -63,7 +63,13 @@ struct VoiceChatView: View {
         .onDisappear { session.end() }
         // `.inactive` is deliberately excluded: it covers transient UI such as the app switcher and notification centre, not leaving the app.
         .onChange(of: scenePhase) { _, phase in
-            if phase == .background { session.end() }
+            guard phase == .background else { return }
+            // BUG-071 B's ruling ends the conversation on leaving the app; a running one says so on return instead of reading Starting….
+            if session.phase.isRunning {
+                session.stop(reason: "Voice chat ended when you left HARC. Tap Done and start it again.")
+            } else {
+                session.end()
+            }
         }
     }
 }
@@ -107,7 +113,7 @@ private struct Waveform: View {
         case .listening: return t.action
         case .thinking: return t.text4
         case .speaking: return t.accent
-        case .idle: return t.text4
+        case .idle, .stopped: return t.text4
         }
     }
 
@@ -123,7 +129,7 @@ private struct Waveform: View {
             return 0.10 + 0.55 * envelope
         case .thinking:
             return 0.06 + 0.10 * envelope
-        case .idle:
+        case .idle, .stopped:
             return 0.05
         }
     }

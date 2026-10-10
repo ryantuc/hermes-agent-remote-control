@@ -37,7 +37,7 @@ struct DiagnosticsView: View {
         .background(t.canvas)
         .navigationTitle("Diagnostics")
         .navigationBarTitleDisplayMode(.inline)
-        .toolbarBackground(t.canvas, for: .navigationBar)
+        .hermesTopBar()
         .toolbar {
             ToolbarItem(placement: .topBarTrailing) {
                 Menu {
@@ -88,7 +88,7 @@ struct DiagnosticsView: View {
                 infoRow("Transport", configuration.isSecure ? "TLS (wss)" : "Plaintext (ws)")
             }
             if let status = app.serverStatus {
-                infoRow("Hermes", status.version)
+                infoRow("Hermes", app.isDemoActive ? "Demo" : status.version)
                 infoRow("Gateway", status.gatewayState.isEmpty ? "unknown" : status.gatewayState)
                 infoRow("Overall", status.overall.isEmpty ? "unknown" : status.overall)
             }

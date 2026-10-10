@@ -93,14 +93,24 @@ struct DenyApprovalFromActivityIntent: LiveActivityIntent {
 enum HermesActivityLink {
     static let scheme = "hermes"
 
-    /// Non-optional on purpose: `Link` needs a `URL`, and the fallback literal lands on Home rather than nowhere.
+    /// Non-optional on purpose: `Link` needs a `URL`, and a key the components cannot carry lands on `home` rather than nowhere.
     static func chat(sessionKey: String) -> URL {
         var components = URLComponents()
         components.scheme = scheme
         components.host = "chat"
         components.path = "/" + sessionKey
-        return components.url ?? URL(string: "\(scheme)://chat")!
+        return components.url ?? home
     }
+
+    /// `hermes://chat`, which `sessionKey(from:)` reads as no chat, so `RootView` lands on Home.
+    ///
+    /// No force-unwrap (BUG-146): this type runs in the widget process too, where a trap blanks every card at once. The file-URL arm is unreachable, because a scheme and a host with no path always form a URL, and `sessionKey(from:)` reads a file URL as no chat as well.
+    static let home: URL = {
+        var components = URLComponents()
+        components.scheme = scheme
+        components.host = "chat"
+        return components.url ?? URL(fileURLWithPath: "/")
+    }()
 
     /// Parses `hermes://chat/<session id>` and returns nil for anything else.
     static func sessionKey(from url: URL) -> String? {

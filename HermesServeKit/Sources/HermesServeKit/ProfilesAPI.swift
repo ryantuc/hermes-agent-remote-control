@@ -256,17 +256,14 @@ public struct ProfilesAPI: Sendable {
 
     /// `profiles.list` — the whole roster, always: no filter, no pagination, default first.
     ///
-    /// `preferredSessionIDs` maps profile name to durable pin, and on an older backend it is the
-    /// ONLY way a hidden Bot Chat appears in this response. Newer backends ignore it and answer on
-    /// `canonical_session`; keep sending it until no supported backend needs it.
-    public func list(preferredSessionIDs: [String: String] = [:]) async throws -> ProfilesListResult {
-        var params: [String: JSONValue] = ["include_sessions": .bool(true)]
-        if !preferredSessionIDs.isEmpty {
-            params["preferred_session_ids"] = .object(
-                preferredSessionIDs.mapValues { JSONValue.string($0) }
-            )
-        }
-        let result = try await client.request("profiles.list", params: .object(params))
+    /// Sends `include_sessions` only. The device's Bot Chat pins (`preferred_session_ids`) are never
+    /// sent: upstream removed that param on 2026-08-22 (`a9860d413d`) in favour of the
+    /// title-resolved `canonical_session`, and on current upstream the declared params are
+    /// `include_sessions` + `profile` and any other key answers 4000, so the roster never loaded.
+    public func list() async throws -> ProfilesListResult {
+        let result = try await client.request("profiles.list", params: .object([
+            "include_sessions": .bool(true),
+        ]))
         return ProfilesListResult(json: result)
     }
 

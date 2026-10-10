@@ -59,7 +59,7 @@ struct SessionSheetView: View {
                         .foregroundStyle(t.action)
                 }
             }
-            .toolbarBackground(t.canvas, for: .navigationBar)
+            .hermesTopBar()
         }
         .presentationDetents([.medium, .large])
         .presentationDragIndicator(.visible)

@@ -67,7 +67,7 @@ Mode is chosen by bind host: loopback ⇒ ungated; anything else ⇒ gated
 
 The roster surface. Read-only from this client: `profiles.configure` would write `ui_meta` whole-object behind a freshness fence, and a blind write clobbers whatever else is in that namespace.
 
-- `profiles.list {include_sessions?, preferred_session_ids?} -> {profiles: [...], bot_mode_protocol}`. Every profile, always, default first — no filter, no pagination. `include_sessions` defaults true; `preferred_session_ids` is `{profile_name: session_id}` and anything that is not an object is silently discarded. `bot_mode_protocol` is presence-based (hardcoded true where it exists, never sent as false) and means the backend injects the Bot Mode teammate protocol itself.
+- `profiles.list {include_sessions?, profile?} -> {profiles: [...], bot_mode_protocol}`. Every profile, always, default first — no filter, no pagination. `include_sessions` defaults true. `preferred_session_ids` was removed upstream on 2026-08-22 (`a9860d413d`, replaced by the title-resolved `canonical_session`); on current upstream any undeclared key answers 4000, so this client never sends it. `bot_mode_protocol` is presence-based (hardcoded true where it exists, never sent as false) and means the backend injects the Bot Mode teammate protocol itself.
 - Row: `{name, path, is_default, model, provider, description, display_name, skill_count, last_session, worker_session, preferred_session?, ui_meta?, ui_meta_revisions, has_avatar}`. `model`/`provider` are genuinely nullable. `ui_meta` appears only when `profile.yaml` carries a non-empty dict; `ui_meta_revisions` is always there and is the feature-detect for gateway-owned CAS.
 - `last_session` is `{id, title, preview, started_at, last_active, message_count}` — **hidden-filtered**, so it can never show a canonical `Bot Chat`. A bots roster orders by `preferred_session` or it orders by nothing.
 - `preferred_session` is **tri-state and all three states are different**: key absent (no pin was supplied for that profile, or the gateway is too old), key present and `null` (the gateway looked and the row is gone / archived / `kanban`-or-`tool` sourced), key present with an object. Its shape is `{id, resolved_id, root_title, title, preview, started_at, last_active, message_count}`, where `id` is the caller's pin echoed back and `resolved_id` is the live compression tip. Its `last_active` reads `last_activity_at` directly and is **not** comparable with `last_session.last_active`.
@@ -140,6 +140,24 @@ turn that died with the process.
 
 ## Reusable code
 
-`apps/shared/src/json-rpc-gateway.ts` (422 lines, MIT, zero deps beyond DOM
-WebSocket) is the entire protocol client — vendored into `hermes-web` and
-used as the specification for the Swift port.
+`apps/shared/src/json-rpc-gateway.ts` (422 lines at v0.19.1, MIT, no dependencies beyond the DOM's `WebSocket`) is upstream's entire protocol client, and `HermesServeKit` used it as the specification for its Swift client.
+
+## Interactive requests, current and legacy
+
+This section and the next describe newer gateway behaviour than the v0.19.1 contract above. The source contracts were checked at upstream revisions `67757285f696a4614b76e928dfd86c9f07ec5704` and `00570550f37e9082676955d50f65c7d9ba846cc9`.
+
+HARC advertises `client.capabilities {server_requests: true}` once per connection. A backend that rejects the method keeps working through the legacy event/respond adapter. Legacy approval queue ids are preserved and sent when provided; truly id-less emitters keep their FIFO wire shape. Current server requests carry their exact typed JSON-RPC id, method, session and socket generation through every user decision; a reconnect never resends a decision from the retired socket. Direct response completion means sent, not an acknowledgement that the backend accepted it before another client answered.
+
+Current interactive methods are `approval`, `clarify` (single and batch), `sudo`, `secret`, `vault.unlock_prompt` and `vault.code`. Approval read and confirmation gates and masked secret entry remain in place. Accepted batch answers are restored from `open_requests`; changed locks are sent before the final missing answer. Values are not logged, written to preferences or added to the transcript by this adapter. The ordinary `secret` workflow may save the supplied value on the backend, as its existing button states; vault unlock and one-time codes use a Send button.
+
+`vault.save_login`, `terminal.read`, `preview.read`, `preview.act`, `window.read`, `tour` and unknown future methods show an action-required card. HARC has no Desktop terminal, preview or native-window surface and does not implement saving a new vault login. The card can be minimized while the user completes the request in Desktop. HARC never responds to those methods automatically. The explicit Skip for all clients button ends the shared request: known string-result methods send an empty value; unknown methods send JSON-RPC method-not-found only upon that user action.
+
+Pending questions reconcile from `session.resume`, `session.activate` and `session.events.since` snapshots. While requests remain open, a three-second read-only replay snapshot poll detects another client's answer, because upstream does not broadcast `request.cancel` on successful settlement. Timeouts and interruption use the exact cancellation identity. Current prompts do not display a guessed local countdown.
+
+## Live transcript recovery
+
+A running conversation keeps a disposable on-device recovery cache in the app's Caches directory, protected by iOS file protection. It holds at most eight checkpoints and 32 MiB, excludes files over 8 MiB, and expires after one day. Signing out or deleting a backend removes its checkpoints.
+
+Checkpoint saving continues after acknowledged corrections and includes a trailing write during quiet intervals. Records attest that earlier history was loaded or recovered; a partial snapshot is never promoted into a complete-history checkpoint. Older records without that attestation are ignored. A backend or profile switch fences deferred writes, and current transport-owned requests are reapplied after historical replay so old terminal events cannot erase a still-open question.
+
+Recovery requires a matching runtime and process epoch, available non-truncated replay, and a server sequence that has not regressed behind the saved cursor. A gateway can evict a session's replay ring and reuse its counter without changing its process epoch. If that counter has already caught up beyond the saved cursor, the present wire protocol cannot prove the ring was not replaced, so the client does not claim durable or gap-free recovery across that indistinguishable case. A missing or ineligible checkpoint produces an informational notice and waits for completed REST history; it never resubmits a prompt or approval automatically.

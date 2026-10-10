@@ -46,7 +46,7 @@ struct BotChatPins: Sendable {
         return (value?.isEmpty == false) ? value : nil
     }
 
-    /// Every pin this backend holds, in exactly the shape `profiles.list preferred_session_ids` wants.
+    /// Every pin this backend holds, keyed by profile name. Device-side only: no backend this client supports accepts them on the wire.
     func pins(backend: UUID?) -> [String: String] {
         var out: [String: String] = [:]
         for (key, value) in stringMap(Self.pinsKey) {

@@ -8,8 +8,8 @@ import SwiftUI
 struct BatchClarifyCard: View {
     @Environment(\.hermes) private var t
 
-    /// Locks one answer. `true` when the backend accepted it.
-    let send: (_ questionID: String, _ answer: String) async -> Bool
+    /// Locks one answer and returns its acknowledgment, or nil on failure.
+    let send: (_ questionID: String, _ answer: String) async -> ClarifyRespondResult?
     /// Every answer landed and the turn has resumed — tear the card down.
     let onConfirmed: () -> Void
     /// Cancel-all. The caller sends the bare `clarify.respond`.
@@ -17,16 +17,19 @@ struct BatchClarifyCard: View {
     /// When the backend's clarify wait runs out, if it has one at all: the answers already locked survive and the rest are reported to the agent as absences.
     let deadline: Date?
 
+    private let request: ClarifyRequestEvent
     @State private var model: BatchClarifyModel
 
     init(
         request: ClarifyRequestEvent,
         deadline: Date?,
-        send: @escaping (_ questionID: String, _ answer: String) async -> Bool,
+        send: @escaping (_ questionID: String, _ answer: String) async -> ClarifyRespondResult?,
         onConfirmed: @escaping () -> Void,
-        onCancelAll: @escaping () -> Void
+        onCancelAll: @escaping () -> Void,
+        initialModel: BatchClarifyModel? = nil
     ) {
-        _model = State(initialValue: BatchClarifyModel(request: request))
+        self.request = request
+        _model = State(initialValue: initialModel ?? BatchClarifyModel(request: request))
         self.deadline = deadline
         self.send = send
         self.onConfirmed = onConfirmed
@@ -51,6 +54,7 @@ struct BatchClarifyCard: View {
             }
         }
         .disabled(model.isSubmitting)
+        .onChange(of: request, initial: true) { _, latest in model.reconcile(latest) }
         .task(id: deadline) { await settleAtDeadline() }
     }
 

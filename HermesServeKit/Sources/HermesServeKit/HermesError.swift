@@ -13,8 +13,8 @@ public enum HermesError: Error, Sendable, Equatable {
     /// The open budget elapsed with neither `gateway.ready` nor a close — the "hung, nothing came back" shape, where a socket that dies instead reports `connectionClosed`.
     case handshakeTimedOut
     case unauthorized(String)
-    /// 503 from the auth gate: the IdP is unreachable, so retry rather than log out (rest-api-and-auth.md §2.11).
-    case providerUnreachable(String)
+    /// Any other non-2xx answer, with the backend's own detail, scrubbed.
+    /// A 503 arrives here too: it is "retry, not sign in again" whether the auth gate or the session store sent it, and the detail says which, so there is no separate auth-outage case to read it wrongly (FEAT-038).
     case httpStatus(code: Int, message: String)
     /// A JSON-RPC error frame; `data` carries the server's structured detail because 4090 alone cannot separate the ownership fence from unrelated refusals (BUG-141).
     case rpc(code: Int, message: String, data: JSONValue? = nil)
@@ -42,8 +42,6 @@ extension HermesError: LocalizedError {
                 + "The server may be unreachable."
         case .unauthorized(let detail):
             return detail.isEmpty ? "Not signed in." : detail
-        case .providerUnreachable(let detail):
-            return "The backend's auth provider is unreachable: \(detail)"
         case .httpStatus(let code, let message):
             return message.isEmpty ? "HTTP \(code)" : "HTTP \(code): \(message)"
         case .rpc(let code, let message, _):

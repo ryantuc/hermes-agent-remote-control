@@ -41,7 +41,7 @@ public struct DisplayMessage: Sendable, Equatable {
         toolContext = json["context"]?.coercedString ?? ""
     }
 
-    public var isBookkeeping: Bool { role == .user && !displayKind.isEmpty }
+    public var isBookkeeping: Bool { role == .user && !displayKind.isEmpty && displayKind != "steer" }
 }
 
 /// `_session_info` (jsonrpc-methods §1.9.3); the full and the reduced lazy variants both decode
@@ -94,6 +94,9 @@ public struct SessionInfo: Sendable, Equatable {
 /// `_inflight_snapshot` (jsonrpc-methods §1.9.2) — how a reconnecting client recovers a turn whose
 /// terminal frame it missed; `error` is the only carrier of a failure lost to the disconnect.
 public struct InflightSnapshot: Sendable, Equatable {
+    public let raw: JSONValue
+    public let startedAt: Date?
+    public let correctionOffsets: [Int]
     public let user: String
     public let assistant: String
     public let streaming: Bool
@@ -107,6 +110,9 @@ public struct InflightSnapshot: Sendable, Equatable {
 
     public init?(json: JSONValue?) {
         guard let json, !json.isNull else { return nil }
+        raw = json
+        startedAt = json["started_at"].flatMap { $0.coercedEpochDate }
+        correctionOffsets = (json["correction_offsets"]?.arrayValue ?? []).compactMap { $0.coercedInt }
         user = json["user"]?.text ?? ""
         assistant = json["assistant"]?.text ?? ""
         streaming = json["streaming"]?.coercedBool ?? false
@@ -145,6 +151,7 @@ public struct SessionCreateResult: Sendable, Equatable {
 }
 
 public struct SessionResumeResult: Sendable, Equatable {
+    public var raw: JSONValue = .null
     public let sessionID: String
     /// Durable id actually bound; resume follows the compression chain to the live tip.
     public let resumed: String
@@ -168,6 +175,11 @@ public struct SessionResumeResult: Sendable, Equatable {
     public let pendingApproval: ApprovalRequestEvent?
     /// The clarify question still blocking this session, same replay contract.
     public let pendingClarify: ClarifyRequestEvent?
+    /// The plan as the backend holds it (FEAT-037); nil on a backend that predates the key or for a
+    /// session whose plan store was never written.
+    public let todoState: TodoSnapshot?
+    /// The open connection operation as its `connection.request` payload, so a client that missed the event restores the card with the server's deadline (`LiveSessionSnapshot.pending_connection`, `tui_gateway/contracts/sessions.py:106-108`, `:108` on an older backend; attached by `server.py:3144-3148`). Nil means nothing is open.
+    public let pendingConnection: ConnectionRequest?
 }
 
 /// `session.active_list` item; absence is authoritative — a runtime seen last poll but not this one
@@ -308,6 +320,13 @@ public struct SessionAPI: Sendable {
     ///
     /// `hidden: true` is deferred intent: the flag is applied when the row materialises on the
     /// first `prompt.submit`, and keeps it out of `session.list` and `GET /api/sessions`.
+    ///
+    /// A sent `cwd` always rides with `cwd_explicit: true`. The app sends `cwd` only for a
+    /// folder the user chose — picked on this draft (`ChatModel.applyCwd`) or the remembered pick the
+    /// folder chip shows (`HomeView.seedDraftProject`) — and sends none otherwise, so the backend's own
+    /// default still applies when nothing was chosen. Without the flag current upstream lets a
+    /// named profile's configured folder beat the request's (`tui_gateway/session_workdir.py:43-45`).
+    /// A backend that predates the flag rejects it, see `rejectsCwdExplicit`.
     public func create(
         columns: Int = defaultColumns,
         cwd: String? = nil,
@@ -322,7 +341,10 @@ public struct SessionAPI: Sendable {
             "cols": .number(Double(columns)),
             "source": .string(Self.sourceTag),
         ]
-        if let cwd, !cwd.isEmpty { params["cwd"] = .string(cwd) }
+        if let cwd, !cwd.isEmpty {
+            params["cwd"] = .string(cwd)
+            params["cwd_explicit"] = .bool(true)
+        }
         if let profile, !profile.isEmpty { params["profile"] = .string(profile) }
         if let model, !model.isEmpty { params["model"] = .string(model) }
         // Model and provider ship together: a bare model the current provider does not serve is
@@ -334,13 +356,32 @@ public struct SessionAPI: Sendable {
         if let title, !title.isEmpty { params["title"] = .string(title) }
         // Sent only when true; the backend reads an omitted key as false anyway.
         if hidden { params["hidden"] = .bool(true) }
-        let result = try await client.request("session.create", params: .object(params))
+        let result: JSONValue
+        do {
+            result = try await client.request("session.create", params: .object(params))
+        } catch let error as HermesError where params["cwd_explicit"] != nil && Self.rejectsCwdExplicit(error) {
+            // The 4000 is answered at dispatch, before the handler runs, so nothing was created and the
+            // same create can go once more without the flag. Such a backend lets the request's `cwd`
+            // win on its own (`session_workdir.py:23-35` on an older backend), so the folder is still honored.
+            params.removeValue(forKey: "cwd_explicit")
+            result = try await client.request("session.create", params: .object(params))
+        }
         return SessionCreateResult(
             sessionID: result["session_id"]?.coercedString ?? "",
             storedSessionID: result["stored_session_id"]?.coercedString ?? "",
             messages: (result["messages"]?.arrayValue ?? []).map(DisplayMessage.init(json:)),
             info: SessionInfo(json: result["info"] ?? .null)
         )
+    }
+
+    /// True for the backend's "undeclared key" refusal of `cwd_explicit`: 4000 with the key path in
+    /// the message (`contracts/registry.py:100-115` on an older backend; the flag was
+    /// declared upstream in `66bc259712` on 2026-09-25). The probe is the rejection itself: no
+    /// capability or contract version names the flag (`DESKTOP_BACKEND_CONTRACT` 8 predates it), and a
+    /// backend that declares the key never names it in a 4000. Any other rejection is the caller's.
+    static func rejectsCwdExplicit(_ error: HermesError) -> Bool {
+        guard case .rpc(let code, let message, _) = error else { return false }
+        return code == 4000 && message.contains("cwd_explicit")
     }
 
     /// `session.cwd.set` — repoint an idle session's working directory; the chip reconciles off the
@@ -374,7 +415,7 @@ public struct SessionAPI: Sendable {
         if watch { params["watch"] = .bool(true) }
         if let profile, !profile.isEmpty { params["profile"] = .string(profile) }
         let result = try await requestResumeAbsorbingSettle(params: .object(params))
-        return Self.decodeResume(result, requested: storedSessionID)
+        return Self.decodeResume(result, requested: storedSessionID, includeLegacyPrompts: await client.serverRequestMethods.isEmpty)
     }
 
     /// The refusal lasts only as long as the disconnect interrupt takes to settle, so a short pause
@@ -408,11 +449,22 @@ public struct SessionAPI: Sendable {
             "cols": .number(Double(columns)),
         ])
         let result = try await client.request("session.activate", params: params)
-        return Self.decodeResume(result, requested: sessionID)
+        return Self.decodeResume(result, requested: sessionID, includeLegacyPrompts: await client.serverRequestMethods.isEmpty)
     }
 
-    static func decodeResume(_ result: JSONValue, requested: String) -> SessionResumeResult {
-        SessionResumeResult(
+    public func eventsSince(sessionID: String, lastSeen: Int) async throws -> SessionEventReplay? {
+        let result = try await client.request("session.events.since", params: .object([
+            "session_id": .string(sessionID), "last_seen": .number(Double(lastSeen))
+        ]))
+        return SessionEventReplay(json: result)
+    }
+
+    static func decodeResume(_ result: JSONValue, requested: String, includeLegacyPrompts: Bool = true) -> SessionResumeResult {
+        // Current official snapshots retain pending_approval as a compatibility summary. It is
+        // not a second FIFO prompt when open_requests owns the actionable identity.
+        let legacyPrompts = includeLegacyPrompts && result["open_requests"]?.arrayValue == nil
+        return SessionResumeResult(
+            raw: result,
             sessionID: result["session_id"]?.coercedString ?? "",
             resumed: result["resumed"]?.coercedString ?? requested,
             sessionKey: result["session_key"]?.coercedString
@@ -428,12 +480,15 @@ public struct SessionAPI: Sendable {
             turnStartedAt: result["turn_started_at"].flatMap { $0.coercedEpochDate },
             // BUG-066: both keys are absent unless something is blocking, so `nil` means "nothing
             // pending". Null is checked too, because a fabricated prompt is worse than a missed one.
-            pendingApproval: Self.pendingPayload(result["pending_approval"]).map {
+            pendingApproval: Self.pendingPayload(legacyPrompts ? result["pending_approval"] : nil).map {
                 ApprovalRequestEvent(sessionID: result["session_id"]?.coercedString ?? "", payload: $0)
             },
-            pendingClarify: Self.pendingPayload(result["pending_clarify"]).map {
+            pendingClarify: Self.pendingPayload(legacyPrompts ? result["pending_clarify"] : nil).map {
                 ClarifyRequestEvent(sessionID: result["session_id"]?.coercedString ?? "", payload: $0)
-            }
+            },
+            todoState: TodoSnapshot(json: result["todo_state"]),
+            pendingConnection: ConnectionRequest(sessionID: result["session_id"]?.coercedString ?? "",
+                                                 payload: Self.pendingPayload(result["pending_connection"]))
         )
     }
 

@@ -26,7 +26,7 @@ enum PhotoSave {
             case .idle, .saving: return nil
             case .saved: return "Saved to Photos."
             case .failed: return "Could not save to Photos."
-            case .denied: return "Hermes cannot add to Photos. Turn it on in Settings › Hermes › Photos."
+            case .denied: return "HARC cannot add to Photos. Turn it on in iOS Settings › HARC › Photos."
             }
         }
 
@@ -46,7 +46,7 @@ enum PhotoSave {
         let status = await withCheckedContinuation { continuation in
             PHPhotoLibrary.requestAuthorization(for: .addOnly) { continuation.resume(returning: $0) }
         }
-        guard status == .authorized || status == .limited else { return .denied }
+        guard canSave(with: status) else { return .denied }
         do {
             try await PHPhotoLibrary.shared().performChanges {
                 PHAssetChangeRequest.creationRequestForAsset(from: image)
@@ -56,5 +56,28 @@ enum PhotoSave {
         } catch {
             return .failed
         }
+    }
+
+    /// A video file into the camera roll, under the same add-only grant; Photos reads the file itself, so nothing is loaded here.
+    @MainActor
+    static func saveVideo(at url: URL) async -> State {
+        let status = await withCheckedContinuation { continuation in
+            PHPhotoLibrary.requestAuthorization(for: .addOnly) { continuation.resume(returning: $0) }
+        }
+        guard canSave(with: status) else { return .denied }
+        do {
+            try await PHPhotoLibrary.shared().performChanges {
+                PHAssetChangeRequest.creationRequestForAssetFromVideo(atFileURL: url)
+            }
+            HapticFeedback.selection()
+            return .saved
+        } catch {
+            return .failed
+        }
+    }
+
+    /// Whether an add-only authorization answer lets the save go ahead. Only `.authorized`: `.limited` is a read-write answer an add-only request never returns, so accepting it was a branch nobody could reach.
+    static func canSave(with status: PHAuthorizationStatus) -> Bool {
+        status == .authorized
     }
 }

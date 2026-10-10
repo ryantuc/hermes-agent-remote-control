@@ -240,4 +240,94 @@ final class ProfileSaveTests: XCTestCase {
 
         await harness.tearDown()
     }
+
+    // MARK: CONTROL-3 — repointing the active row's address discards (BUG-142)
+
+    /// A second machine, by address. Nothing listens here either, so REST fails as fast as it does on the harness's own address; the scripted socket ignores the URL, which is what lets one test stand on "both" machines.
+    private static let otherMachine = "http://127.0.0.1:10"
+
+    /// The same row, the same name, the same Hermes profile — only the machine changed. `update(_:)` compared the Hermes profile alone, so the reconnect kept every conversation and re-resumed the old machine's ids against the new one.
+    func testRepointingTheActiveBackendAtAnotherMachineDiscardsTheOldMachinesChats() async throws {
+        let harness = await AppHarness.make()
+        try await harness.openSocket()
+        let storedID = "20260831_210000_desk"
+        let chat = harness.chat(storedID: storedID)
+        await chat.open()
+        XCTAssertNotNil(chat.runtimeSessionID, "precondition: the chat never bound")
+        let clientBefore = try XCTUnwrap(harness.app.client)
+        let resumesBefore = await harness.backend.calls(to: "session.resume").filter { $0.sessionID == storedID }.count
+
+        var repointed = try XCTUnwrap(harness.app.activeProfile)
+        repointed.baseURLString = Self.otherMachine
+        harness.app.update(repointed)
+
+        let rebuilt = await waitUntil(timeout: 5) { harness.app.client !== clientBefore }
+        XCTAssertTrue(rebuilt, "precondition: a new address must rebuild the connection")
+
+        // `containsChat`, not the runtime id: a preserved chat is re-resumed under a NEW runtime id, so probing the old one would read "gone" for a chat that was kept.
+        let discarded = await waitUntil(timeout: 5) { !harness.app.containsChat(chat) }
+        XCTAssertTrue(
+            discarded,
+            "the conversation from the machine the user just left is still open under the new machine's name — its stored id names a row in another machine's state.db"
+        )
+
+        // Let the new socket open and its post-open sweep finish, then count the resumes it sent for the old machine's id.
+        let reopened = await waitUntil(timeout: 10) {
+            harness.app.connectionState.isOpen && harness.app.isPollingThreads
+        }
+        XCTAssertTrue(reopened, "precondition: the rebuilt connection never finished opening")
+        let resumesAfter = await harness.backend.calls(to: "session.resume").filter { $0.sessionID == storedID }.count
+        XCTAssertEqual(
+            resumesAfter,
+            resumesBefore,
+            "the reconnect re-resumed the old machine's session id against the new machine — on a machine holding a restored copy of the old database that opens a different transcript under the same id"
+        )
+
+        await harness.tearDown()
+    }
+
+    // MARK: CONTROL-4 — `activate` itself refuses to preserve across machines (BUG-142)
+
+    /// The belt-and-braces guard in `activate` compared row ids only, and an address edit keeps the row id, so a caller that asked to preserve was believed.
+    func testActivatePreservingConversationsStillDiscardsWhenTheAddressMoved() async throws {
+        let harness = await AppHarness.make()
+        try await harness.openSocket()
+        let chat = harness.chat(storedID: "20260831_211500_guard")
+        await chat.open()
+        XCTAssertNotNil(chat.runtimeSessionID, "precondition: the chat never bound")
+
+        // Written straight into the list, as a caller that bypasses `update(_:)` would.
+        let index = try XCTUnwrap(harness.app.profiles.firstIndex { $0.id == harness.profileID })
+        harness.app.profiles[index].baseURLString = Self.otherMachine
+        await harness.app.activate(profileID: harness.profileID, connect: true, preservingConversations: true)
+
+        XCTAssertFalse(
+            harness.app.containsChat(chat),
+            "activate preserved a conversation across a change of machine because the row id had not changed — preservation has to be keyed on what names the state.db, not on the row"
+        )
+
+        await harness.tearDown()
+    }
+
+    /// The other half of the guard: the same machine and the same scope still preserve, or BUG-025's rebuild contract breaks.
+    func testActivatePreservingConversationsOnTheSameMachineKeepsTheChat() async throws {
+        let harness = await AppHarness.make()
+        try await harness.openSocket()
+        let chat = harness.chat(storedID: "20260831_212000_same")
+        await chat.open()
+        chat.draft = "still here after the rebuild"
+
+        await harness.app.activate(profileID: harness.profileID, connect: true, preservingConversations: true)
+
+        let reopened = await waitUntil(timeout: 10) { harness.app.connectionState.isOpen }
+        XCTAssertTrue(reopened, "precondition: the rebuilt connection never opened")
+        let rebound = await waitUntil(timeout: 5) {
+            guard let current = chat.runtimeSessionID else { return false }
+            return harness.app.chat(runtimeSessionID: current) === chat
+        }
+        XCTAssertTrue(rebound, "a rebuild against the same machine and scope must keep the open conversation reachable")
+        XCTAssertEqual(chat.draft, "still here after the rebuild")
+
+        await harness.tearDown()
+    }
 }

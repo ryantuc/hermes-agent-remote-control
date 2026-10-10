@@ -14,7 +14,7 @@ xcodebuild test -project HermesMobile.xcodeproj -scheme HermesMobile \
   COMPILER_INDEX_STORE_ENABLE=NO CODE_SIGNING_ALLOWED=NO
 ```
 
-Add `-only-testing:HermesAppTests` to skip the kit's 160.
+Add `-only-testing:HermesAppTests` to skip the kit's tests.
 
 `CODE_SIGNING_ALLOWED=NO` is what makes the suite portable, and it is also worth knowing about: an unsigned build carries neither `application-identifier` nor `keychain-access-groups`, so `securityd` refuses every `SecItem` call with `errSecMissingEntitlement` and `KeychainStore` falls back to a file in the app container. That is deliberate and durable (`KeychainPersistenceTests`, `KeychainContainerTests`), but it means a build installed this way is not exercising the real Keychain. Drop the flag when that is what you want to test.
 
@@ -95,7 +95,7 @@ await harness.backend.dropConnection(code: 4401)   // credential rejection — i
 await harness.backend.deliverThenFailWrite("prompt.submit")  // server gets it, client is told the write failed
 ```
 
-`deliverThenFailWrite` is the *ambiguous write*: the frame reached the server and the client has an error. It is how you stage "did the turn land or not", which is what A4 is about.
+`deliverThenFailWrite` is the *ambiguous write*: the frame reached the server and the client has an error. It is how you stage "did the turn land or not".
 
 ### Staging a race between two callers
 
@@ -140,4 +140,4 @@ Write the failure message so it reads as a bug report — name the file and line
 
 **REST.** `AppModel` builds its own `RestAPI` from the profile, and the harness points that profile at `http://127.0.0.1:9`, which refuses instantly. So `refreshThreads` and `loadTranscript` always fail — fast, and exactly as they do against a backend that has gone away. If a test needs transcript content, put it in `session.resume`'s `messages`, not in REST. A test asserting on `app.threads` or on persisted history needs a REST seam that does not exist yet; add one the same way `AppModel.init(clientFactory:)` was added, and say so here.
 
-**Views.** This target has no UI tests. Assert on the model the view renders.
+**Views.** XCUITests live in `HermesUITests`. Tests here may host a view in a `UIHostingController` or an `ImageRenderer` to measure it, but assert on the model where the model carries the answer.

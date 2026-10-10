@@ -67,12 +67,14 @@ public actor AuthenticationClient {
     private var secretsLoaded = false
 
     /// - Parameter persistsSecrets: when false, secret writes stay in this actor's memory and never reach the Keychain (reads are unaffected), so a provisional profile the user cancels leaves nothing behind.
+    /// - Parameter protocolClasses: URL protocols tried before the system's, so a test can answer this client's requests without a server.
     public init(
         configuration: BackendConfiguration,
         profileID: String,
         keychain: KeychainStore = KeychainStore(),
         persistsSecrets: Bool = true,
-        log: ConnectionLog? = nil
+        log: ConnectionLog? = nil,
+        protocolClasses: [AnyClass] = []
     ) {
         self.configuration = configuration
         self.profileID = profileID
@@ -88,6 +90,9 @@ public actor AuthenticationClient {
         config.requestCachePolicy = .reloadIgnoringLocalCacheData
         config.timeoutIntervalForRequest = 30
         config.waitsForConnectivity = false
+        if !protocolClasses.isEmpty {
+            config.protocolClasses = protocolClasses + (config.protocolClasses ?? [])
+        }
         self.session = URLSession(configuration: config)
     }
 
@@ -229,6 +234,11 @@ public actor AuthenticationClient {
 
     public func performJSON(_ request: URLRequest) async throws -> JSONValue {
         let (data, _) = try await perform(request)
+        return try Self.decodeBody(data)
+    }
+
+    /// A 2xx body as JSON: empty is `.null`, the 204 case, and anything else must decode, because a body that does not is a page or a cut-off reply from something other than the route, not a success the caller can read. `RestAPI.sendJSON` shares it so a write is judged like a read (BUG-146).
+    static func decodeBody(_ data: Data) throws -> JSONValue {
         if data.isEmpty { return .null }
         do {
             return try JSONDecoder().decode(JSONValue.self, from: data)
@@ -239,10 +249,13 @@ public actor AuthenticationClient {
     }
 
     /// Map the gate's documented failure envelopes onto typed errors (rest-api-and-auth.md §2.11).
-    private static func validate(status: Int, data: Data) throws {
+    /// Internal rather than private so the status mapping can be pinned without a network stub.
+    static func validate(status: Int, data: Data) throws {
         guard !(200...299).contains(status) else { return }
         let json = try? JSONDecoder().decode(JSONValue.self, from: data)
+        // A structured detail carries its sentence one level down (`{"detail": {"error": …, "message": …}}`, the session store's 503s), and without this the raw envelope reached the screen.
         let detail = json?["detail"]?.coercedString
+            ?? json?["detail"]?["message"]?.coercedString
             ?? json?["error"]?.coercedString
             ?? String(data: data.prefix(300), encoding: .utf8)
             ?? ""
@@ -253,11 +266,10 @@ public actor AuthenticationClient {
                 throw HermesError.unauthorized("Your session expired. Sign in again.")
             }
             throw HermesError.unauthorized(detail.isEmpty ? "Not authorized." : detail)
-        case 503:
-            throw HermesError.providerUnreachable(detail)
         case 413:
             throw HermesError.httpStatus(code: status, message: detail.isEmpty ? "Payload too large" : detail)
         default:
+            // A 503 lands here with no special case (FEAT-038). The session routes answer 503 for an unreadable `state.db` since 0.21.0, and every auth-gate 503 already names its provider in the detail, so the backend's own sentence is the truth and the client has no cause of its own to add.
             throw HermesError.httpStatus(code: status, message: Redaction.text(detail))
         }
     }
@@ -272,14 +284,49 @@ public actor AuthenticationClient {
         return list.map(AuthProviderInfo.init(json:))
     }
 
+    /// The provider a password sign-in names: the one typed, else the backend's only password provider.
+    /// The route declares `provider` with no default and answers 422 without it, so a blank field cannot simply be omitted; with several password providers the person has to choose, and nothing is sent until they do.
+    static func passwordProvider(typed: String, advertised: [AuthProviderInfo]) throws -> String {
+        let typed = typed.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !typed.isEmpty { return typed }
+        let candidates = advertised.filter(\.supportsPassword).map(\.name).filter { !$0.isEmpty }
+        switch candidates.count {
+        case 1:
+            return candidates[0]
+        case 0:
+            throw HermesError.unauthorized("This backend does not offer password sign-in. Choose another method.")
+        default:
+            throw HermesError.missingCredential("This backend has more than one way to sign in. Enter one of these in Provider: \(candidates.joined(separator: ", ")).")
+        }
+    }
+
+    /// Asked once per client: the provider list only changes when the backend's auth plugins do.
+    private var advertisedPasswordProvider: String?
+
+    private func resolvePasswordProvider(_ typed: String) async throws -> String {
+        let trimmed = typed.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmed.isEmpty { return trimmed }
+        if let advertisedPasswordProvider { return advertisedPasswordProvider }
+        let advertised: [AuthProviderInfo]
+        do {
+            advertised = try await providers()
+        } catch HermesError.httpStatus(let code, _) where code == 503 || code == 404 {
+            advertised = []
+        }
+        let resolved = try Self.passwordProvider(typed: "", advertised: advertised)
+        advertisedPasswordProvider = resolved
+        return resolved
+    }
+
     /// `POST /auth/password-login` — 200 + `Set-Cookie`, no token in the body, rate limited to 10 attempts per IP per 60 s (rest-api-and-auth.md §2.5).
-    public func passwordLogin(provider: String, username: String, password: String) async throws {
-        var body: [String: JSONValue] = [
+    public func passwordLogin(provider typedProvider: String, username: String, password: String) async throws {
+        let provider = try await resolvePasswordProvider(typedProvider)
+        let body: [String: JSONValue] = [
+            "provider": .string(provider),
             "username": .string(username),
             "password": .string(password),
             "next": .string(""),
         ]
-        if !provider.isEmpty { body["provider"] = .string(provider) }
         let data = try JSONRPCCodec.encodeLine(.object(body)).data(using: .utf8) ?? Data()
         var request = URLRequest(url: configuration.restURL("/auth/password-login"))
         request.httpMethod = "POST"
@@ -301,7 +348,7 @@ public actor AuthenticationClient {
         try setSecret(password, kind: .password)
         // BUG-072C: the account name is deliberately absent, because this log is copied into shareable bug reports and `Redaction.text` cannot pattern-match a username.
         await log?.info(
-            "auth", "password login succeeded (provider: \(provider.isEmpty ? "default" : provider))")
+            "auth", "password login succeeded (provider: \(provider)\(typedProvider.isEmpty ? ", chosen automatically" : ""))")
     }
 
     /// Re-run a stored password login after a 401, since the cookies are 15-minute access tokens (rest-api-and-auth.md §2.6).

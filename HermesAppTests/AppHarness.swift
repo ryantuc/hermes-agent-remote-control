@@ -56,7 +56,7 @@ final class AppHarness {
         for key in themeDefaultsKeys { UserDefaults.standard.removeObject(forKey: key) }
     }
 
-    private init() {
+    private init(handlesServerRequests: Bool = false) {
         Self.clearThemeDefaults()
         let backend = ScriptedBackend()
         let hub = TransportHub(backend: backend)
@@ -65,6 +65,7 @@ final class AppHarness {
             HermesClient(
                 dialer: dialer,
                 log: log,
+                handlesServerRequests: handlesServerRequests,
                 transportFactory: { onFrame, onState in
                     hub.make(onFrame: onFrame, onState: onState)
                 }
@@ -90,8 +91,8 @@ final class AppHarness {
     /// The whole setup: model, scripted backend, active profile. The socket is
     /// **not** open yet — open it with `openSocket()` once the test has
     /// registered whatever chats it wants in scope for the post-open sweep.
-    static func make() async -> AppHarness {
-        let harness = AppHarness()
+    static func make(handlesServerRequests: Bool = false) async -> AppHarness {
+        let harness = AppHarness(handlesServerRequests: handlesServerRequests)
         await harness.app.activate(profileID: harness.profileID, connect: false)
         return harness
     }

@@ -20,6 +20,22 @@ import XCTest
 @MainActor
 final class BatchClarifyCardTests: XCTestCase {
 
+    func testReconnectSkipsUnchangedLocksAndSendsEditedLocksBeforeFinalMissingAnswer() async {
+        let request = ClarifyRequestEvent(id: "batch", sessionID: "session", question: "", choices: [], multiSelect: false,
+            questions: [ClarifyQuestion(id: "missing", question: "First", choices: [], multiSelect: false),
+                        ClarifyQuestion(id: "edited", question: "Second", choices: [], multiSelect: false),
+                        ClarifyQuestion(id: "unchanged", question: "Third", choices: [], multiSelect: false)],
+            lockedAnswers: ["edited": "before", "unchanged": "keep"])
+        let model = BatchClarifyModel(request: request)
+        model.setDraft("new", for: model.questions[0])
+        model.setDraft("after", for: model.questions[1])
+        var sent: [String] = []
+        let completed = await model.confirm { qid, _ in sent.append(qid); return ClarifyRespondResult(status: "ok", remaining: nil) }
+        XCTAssertTrue(completed)
+        XCTAssertEqual(sent, ["edited", "missing"])
+        XCTAssertEqual(model.lockedAnswers, ["edited": "after", "unchanged": "keep", "missing": "new"])
+    }
+
     /// Editing is local. A batch card that sent each answer as it was given
     /// would fire the turn the moment the last field was touched, freezing
     /// earlier answers the user was still working on.
@@ -89,7 +105,7 @@ final class BatchClarifyCardTests: XCTestCase {
 
         // A second Confirm must not re-send: the batch is already resolved and
         // the turn has moved on.
-        let again = await model.confirm { _, _ in true }
+        let again = await model.confirm { _, _ in ClarifyRespondResult(status: "ok", remaining: nil) }
         XCTAssertFalse(again)
         let afterSecond = await harness.backend.callCount("clarify.respond")
         XCTAssertEqual(afterSecond, 3)
@@ -116,7 +132,7 @@ final class BatchClarifyCardTests: XCTestCase {
                        "expire must report what survived, not assume everything was discarded")
 
         // And once settled it stays settled — a late Confirm cannot re-open it.
-        let late = await model.confirm { _, _ in true }
+        let late = await model.confirm { _, _ in ClarifyRespondResult(status: "ok", remaining: nil) }
         XCTAssertFalse(late)
         let sent = await harness.backend.callCount("clarify.respond")
         XCTAssertEqual(sent, 0)

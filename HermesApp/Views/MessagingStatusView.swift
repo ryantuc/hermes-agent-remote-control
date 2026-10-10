@@ -30,7 +30,10 @@ struct MessagingStatusView: View {
         ScrollView {
             LazyVStack(alignment: .leading, spacing: 0) {
                 if let loadError {
-                    errorBlock(loadError)
+                    StatePanel.loadFailure(title: "Couldn't load platforms", error: loadError, hasBackend: app.rest != nil) {
+                        Task { await load() }
+                    }
+                    .containerRelativeFrame(.vertical)
                 } else {
                     ForEach(platforms) { platform in
                         platformRow(platform)
@@ -45,7 +48,7 @@ struct MessagingStatusView: View {
         .background(t.canvas)
         .navigationTitle("Messaging")
         .navigationBarTitleDisplayMode(.inline)
-        .toolbarBackground(t.canvas, for: .navigationBar)
+        .hermesTopBar()
         .task { await loadIfNeeded() }
         .refreshable { await load() }
     }
@@ -94,27 +97,13 @@ struct MessagingStatusView: View {
     }
 
     private var footer: some View {
-        Text("Configuration stays on the desktop: adding a bot token means pasting a secret into \(envPath.isEmpty ? "the backend's env file" : envPath), and a phone form that cannot succeed is worse than no form.")
+        Text("Platforms are set up on your computer: adding one means putting its bot token into \(envPath.isEmpty ? "the backend's settings file" : envPath), which this app does not do.")
             .font(HermesFont.footnote)
             .foregroundStyle(t.text3)
             .fixedSize(horizontal: false, vertical: true)
             .padding(Space.s6)
     }
 
-    private func errorBlock(_ message: String) -> some View {
-        VStack(alignment: .leading, spacing: Space.s5) {
-            Text("Couldn't load platforms")
-                .font(HermesFont.heading)
-                .foregroundStyle(t.text1)
-            Text(message)
-                .font(HermesFont.subhead)
-                .foregroundStyle(t.text3)
-            Button("Try again") { Task { await load() } }
-                .buttonStyle(SecondaryButtonStyle())
-                .frame(maxWidth: 220)
-        }
-        .padding(Space.s6)
-    }
 
     private func loadIfNeeded() async {
         guard !loaded else { return }

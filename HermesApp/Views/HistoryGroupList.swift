@@ -69,25 +69,11 @@ struct HistoryGroupList: View {
         Button {
             onOpen(thread)
         } label: {
-            HStack(spacing: Space.s3) {
-                toneDot(thread)
-                VStack(alignment: .leading, spacing: Space.s1) {
-                    Text(thread.displayTitle)
-                        .font(HermesFont.callout)
-                        .foregroundStyle(t.text1)
-                        .lineLimit(1)
-                    Text(meta(thread, showsSourceBadge: showsSourceBadge))
-                        .font(HermesFont.subhead)
-                        .foregroundStyle(t.text3)
-                        .lineLimit(1)
-                }
-                Spacer(minLength: 0)
-            }
-            .padding(.leading, Space.s6 + Space.s5)
-            .padding(.trailing, Space.s6)
-            .padding(.vertical, Space.s4)
-            .frame(minHeight: Hit.commit, alignment: .leading)
-            .contentShape(Rectangle())
+            HistoryRowLabel(
+                title: thread.displayTitle,
+                meta: meta(thread, showsSourceBadge: showsSourceBadge),
+                dot: dot(for: thread)
+            )
         }
         .buttonStyle(.plain)
         .onLongPressGesture(minimumDuration: 0.4) {
@@ -101,13 +87,9 @@ struct HistoryGroupList: View {
     /// Live → pulsing warn; pinned → text-3; otherwise none. (Waiting-for-
     /// approval needs approval events per session, which the hub does not
     /// receive; the chat surface owns that signal.)
-    @ViewBuilder
-    private func toneDot(_ thread: SessionSummary) -> some View {
-        if app.isLiveWorking(thread.id) {
-            PulsingDot(color: t.warn, size: 6)
-        } else if thread.pinned {
-            Circle().fill(t.text3).frame(width: 6, height: 6)
-        }
+    private func dot(for thread: SessionSummary) -> HistoryRowDot {
+        if app.isLiveWorking(thread.id) { return .live }
+        return thread.pinned ? .pinned : .none
     }
 
     private func meta(_ thread: SessionSummary, showsSourceBadge: Bool) -> String {
@@ -141,5 +123,61 @@ struct HistoryGroupList: View {
 
     private static func loadOverrides() -> [String: Bool] {
         (UserDefaults.standard.dictionary(forKey: overridesKey) as? [String: Bool]) ?? [:]
+    }
+}
+
+/// The mark a hub row carries in front of its title.
+enum HistoryRowDot: Equatable {
+    case none
+    case pinned
+    case live
+}
+
+/// One hub row's drawing, apart from the button and gestures that carry it, so a test can render one without an `AppModel`.
+struct HistoryRowLabel: View {
+    @Environment(\.hermes) private var t
+
+    let title: String
+    let meta: String
+    let dot: HistoryRowDot
+
+    /// The dot hangs in a fixed slot in front of the title, under the group header's caret, so a pinned or live row's title starts where every other row's does. In the row's flow it pushed those titles 12 pt right.
+    static let dotSlot: CGFloat = Space.s5
+
+    var body: some View {
+        HStack(spacing: 0) {
+            ZStack(alignment: .leading) {
+                Color.clear.frame(width: Self.dotSlot, height: 1)
+                toneDot
+            }
+            VStack(alignment: .leading, spacing: Space.s1) {
+                Text(title)
+                    .font(HermesFont.callout)
+                    .foregroundStyle(t.text1)
+                    .lineLimit(1)
+                Text(meta)
+                    .font(HermesFont.subhead)
+                    .foregroundStyle(t.text3)
+                    .lineLimit(1)
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(.leading, Space.s6)
+        .padding(.trailing, Space.s6)
+        .padding(.vertical, Space.s4)
+        .frame(minHeight: Hit.commit, alignment: .leading)
+        .contentShape(Rectangle())
+    }
+
+    @ViewBuilder
+    private var toneDot: some View {
+        switch dot {
+        case .live:
+            PulsingDot(color: t.warn, size: 6)
+        case .pinned:
+            Circle().fill(t.text3).frame(width: 6, height: 6)
+        case .none:
+            EmptyView()
+        }
     }
 }

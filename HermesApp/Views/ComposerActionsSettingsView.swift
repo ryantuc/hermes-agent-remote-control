@@ -18,7 +18,7 @@ struct ComposerActionsSettingsView: View {
         ScrollView {
             LazyVStack(alignment: .leading, spacing: 0) {
                 SectionHeader("Shown in the + sheet")
-                    .padding(.top, Space.s6)
+                    .padding(.top, Space.settingsTop)
                 if enabled.isEmpty {
                     Text("Nothing yet — the + sheet shows only the three tiles.")
                         .font(HermesFont.footnote)
@@ -77,7 +77,7 @@ struct ComposerActionsSettingsView: View {
         .background(t.canvas)
         .navigationTitle("Composer actions")
         .navigationBarTitleDisplayMode(.inline)
-        .toolbarBackground(t.canvas, for: .navigationBar)
+        .hermesTopBar()
     }
 
     private func arrowButton(_ icon: String, enabled: Bool, label: String, action: @escaping () -> Void) -> some View {

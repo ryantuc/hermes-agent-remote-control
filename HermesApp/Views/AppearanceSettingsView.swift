@@ -15,6 +15,7 @@ struct AppearanceSettingsView: View {
         ScrollView {
             LazyVStack(alignment: .leading, spacing: 0) {
                 SectionHeader("Skin")
+                    .padding(.top, Space.settingsTop)
                 skinGrid
                     .padding(.horizontal, Space.s6)
                     .padding(.bottom, Space.s6)
@@ -70,7 +71,7 @@ struct AppearanceSettingsView: View {
         .background(t.canvas)
         .navigationTitle("Appearance")
         .navigationBarTitleDisplayMode(.inline)
-        .toolbarBackground(t.canvas, for: .navigationBar)
+        .hermesTopBar()
     }
 
     // MARK: Skin grid — 2 across
@@ -111,6 +112,22 @@ struct AppearanceSettingsView: View {
         scheme == .dark ? preset.dark : preset.light
     }
 
+    private func otherSwatch(_ preset: SkinPreset) -> HermesSkin {
+        scheme == .dark ? preset.light : preset.dark
+    }
+
+    /// One half of a skin's preview: its canvas with its accent dot.
+    private func swatchHalf(_ skin: HermesSkin) -> some View {
+        Rectangle()
+            .fill(skin.bg.color)
+            .overlay(alignment: .bottomLeading) {
+                Circle()
+                    .fill(skin.accent.color)
+                    .frame(width: 12, height: 12)
+                    .padding(Space.s4)
+            }
+    }
+
     private func skinCard(_ preset: SkinPreset) -> some View {
         let isSelected = theme.effectiveSkinName == preset.name
         return Button {
@@ -119,16 +136,17 @@ struct AppearanceSettingsView: View {
             HapticFeedback.selection()
         } label: {
             VStack(alignment: .leading, spacing: Space.s3) {
-                // The dot is the skin's accent rather than Desktop's foreground, because the accent is the one seed distinct for every theme in both polarities and a foreground dot makes Light ten white cards with ten black dots.
-                RoundedRectangle(cornerRadius: Radius.control, style: .continuous)
-                    .fill(swatch(preset).bg.color)
-                    .frame(height: 56)
-                    .overlay(alignment: .bottomLeading) {
-                        Circle()
-                            .fill(swatch(preset).accent.color)
-                            .frame(width: 12, height: 12)
-                            .padding(Space.s4)
-                    }
+                // The dot is the skin's accent rather than Desktop's foreground, because the accent is the one seed distinct for every theme in both polarities. Both canvases show, the current appearance first, because most skins share a white light canvas and one half alone made seven of ten light cards look the same.
+                HStack(spacing: 0) {
+                    swatchHalf(swatch(preset))
+                    swatchHalf(otherSwatch(preset))
+                }
+                .frame(height: 56)
+                .clipShape(RoundedRectangle(cornerRadius: Radius.control, style: .continuous))
+                .overlay(
+                    RoundedRectangle(cornerRadius: Radius.control, style: .continuous)
+                        .strokeBorder(t.stroke1, lineWidth: 0.5)
+                )
                 Text(preset.label)
                     .font(HermesFont.calloutStrong)
                     .foregroundStyle(t.text1)

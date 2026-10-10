@@ -38,12 +38,15 @@ public struct GatewayEvent: Sendable {
     public let payload: JSONValue
     /// The full params object, for events that carry extra fields.
     public let params: JSONValue
+    /// Local typed state; never decoded from a remote event payload.
+    public let serverRequests: [ServerRequest]?
 
-    public init(type: String, sessionID: String, payload: JSONValue, params: JSONValue) {
+    public init(type: String, sessionID: String, payload: JSONValue, params: JSONValue, serverRequests: [ServerRequest]? = nil) {
         self.type = type
         self.sessionID = sessionID
         self.payload = payload
         self.params = params
+        self.serverRequests = serverRequests
     }
 }
 

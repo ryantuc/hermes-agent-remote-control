@@ -68,6 +68,8 @@ final class HermesClientSendFailureTests: XCTestCase {
         /// -32000 "gateway not connected" whenever its task is nil or its state
         /// is not `.open`, and **no close ever arrives** to say so.
         func failSends(with error: HermesError) { sendError = error }
+
+        func receive(_ frame: JSONRPCFrame) async { await onFrame(frame) }
     }
 
     private final class Hub: @unchecked Sendable {
@@ -153,6 +155,35 @@ final class HermesClientSendFailureTests: XCTestCase {
         HermesError.rpc(code: -32000, message: "gateway not connected")
     }
 
+    /// An observer that has never advertised server-request support must not settle
+    /// another client's prompt. A later RPC is an outbox barrier, not a timing guess.
+    func testUnadvertisedObserverDoesNotAnswerSharedServerRequests() async throws {
+        let (client, hub) = makeClient(dialer: Dialer())
+        try await client.connect()
+        let transport = hub.transports[0]
+        await transport.receive(.serverRequest(
+            id: .string("srq-example"), method: "clarify",
+            params: .object(["session_id": .string("shared"), "question": .string("Which example?")])
+        ))
+        let barrier = Task { try await client.request("session.list") }
+        let flushed = await waitUntil {
+            let lines = await transport.sentLines
+            return lines.contains { line in
+                guard case .serverRequest(_, let method, _) = try? JSONRPCCodec.decodeFrame(line) else { return false }
+                return method == "session.list"
+            }
+        }
+        XCTAssertTrue(flushed, "ordinary requests must still leave the outbox")
+        let lines = await transport.sentLines
+        XCTAssertEqual(lines.count, 1, "an unsupported reply would settle Desktop's shared question")
+        for line in lines {
+            guard case .serverRequest(let id, let method, _) = try JSONRPCCodec.decodeFrame(line),
+                  method == "session.list" else { continue }
+            await transport.receive(.response(JSONRPCResponse(id: id, result: .object([:]), error: nil)))
+        }
+        _ = try await barrier.value
+        await client.disconnect()
+    }
     // MARK: - A: a send failure is a close
 
     func testASendFailureMovesTheClientOffOpen() async throws {

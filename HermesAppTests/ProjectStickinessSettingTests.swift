@@ -144,11 +144,4 @@ final class ProjectStickinessSettingTests: XCTestCase {
         XCTAssertEqual(Set(ProjectStickiness.allCases.map(\.label)).count, ProjectStickiness.allCases.count,
                        "two rungs read the same on the control")
     }
-
-    // MARK: The forwarding constant
-
-    /// FEAT-018's name still resolves to FEAT-018's number, so the three docstrings that cite it are not lying.
-    func testTheOldConstantStillNamesTheDefaultWindow() {
-        XCTAssertEqual(LastProjectStore.stickyWindow, 10 * 60, accuracy: 0.001)
-    }
 }

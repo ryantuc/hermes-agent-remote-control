@@ -56,10 +56,23 @@ actor ScriptedGatewayTransport: GatewayTransport {
         var queue = replies[method] ?? []
         let result = queue.isEmpty ? JSONValue.object([:]) : queue.removeFirst()
         replies[method] = queue
-        let frame = JSONRPCFrame.response(JSONRPCResponse(id: id, result: result, error: nil))
+        let frame: JSONRPCFrame
+        if let error = Self.scriptedError(result) {
+            frame = .response(JSONRPCResponse(id: id, result: nil, error: error))
+        } else {
+            frame = .response(JSONRPCResponse(id: id, result: result, error: nil))
+        }
         // Handed off rather than awaited so the reply never re-enters the
         // client actor from inside its own writer task.
         Task { await self.onFrame(frame) }
+    }
+
+    /// The key `ScriptedGateway.rpcError` wraps a queued error reply in; no real result carries it.
+    static let errorMarker = "__scripted_rpc_error__"
+
+    private static func scriptedError(_ value: JSONValue) -> JSONRPCError? {
+        guard let body = value[errorMarker] else { return nil }
+        return JSONRPCError(code: body["code"]?.coercedInt ?? 0, message: body["message"]?.coercedString ?? "")
     }
 
     /// The `params` object of the most recent request for `method`, or nil when
@@ -109,6 +122,14 @@ private final class TransportBox: @unchecked Sendable {
 }
 
 enum ScriptedGateway {
+    /// A queued reply that answers as a JSON-RPC error frame instead of a result.
+    static func rpcError(code: Int, message: String) -> JSONValue {
+        .object([ScriptedGatewayTransport.errorMarker: .object([
+            "code": .number(Double(code)),
+            "message": .string(message),
+        ])])
+    }
+
     /// An open `HermesClient` whose socket answers `replies`, plus the socket
     /// itself so a test can read back what was sent.
     static func connected(

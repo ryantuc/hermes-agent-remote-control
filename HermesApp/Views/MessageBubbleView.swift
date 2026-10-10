@@ -1,4 +1,5 @@
 import HermesServeKit
+import os
 import SwiftUI
 import UIKit
 
@@ -7,6 +8,8 @@ struct MessageActions {
     var canBranch = false
     var onBranch: (() -> Void)?
     var onRetry: (() -> Void)?
+    /// Desktop parity: load the user turn above into the composer to replace it.
+    var onEdit: (() -> Void)?
 }
 
 /// One transcript row. Flat rather than boxed: the assistant turn is bare text on the canvas, and the user turn's fill is the single exception because it is the only way to tell speakers apart without avatars.
@@ -92,6 +95,9 @@ struct MessageActionRow: View {
             }
             if TranscriptPreferences.showRetryAction, let onRetry = actions.onRetry {
                 iconButton("arrow.counterclockwise", label: "Retry this turn", action: onRetry)
+            }
+            if let onEdit = actions.onEdit {
+                iconButton("pencil", label: "Edit and resend the message above", action: onEdit)
             }
             if let confirmed {
                 // The row already ends in a `Spacer`, so this costs no height and moves nothing.
@@ -256,6 +262,8 @@ private struct UserTurn: View {
         switch entry.noticeKind {
         case "queued": return "Queued — runs after the current turn"
         case "correction": return "Mid-turn correction"
+        case "cancelled": return "Cancelled before starting"
+        case "unconfirmed": return "Delivery unconfirmed"
         default: return nil
         }
     }
@@ -408,8 +416,8 @@ struct ReasoningBlock: View {
     @AppStorage("hermes.reasoning.mode") private var storedMode = Mode.truncated.rawValue
     @State private var isExpanded = false
     @State private var showingReader = false
-    /// Two lines of `HermesFont.subhead`, scaled because the text inside it is.
-    @ScaledMetric(relativeTo: .subheadline) private var previewHeight: CGFloat = 34
+    /// The preview's box: two lines of `HermesFont.subhead` with half a line to spare, so two whole lines always fit and a third never does. Scaled because the text inside it is.
+    @ScaledMetric(relativeTo: .subheadline) private var previewHeight: CGFloat = ReasoningPreview.baseBoxHeight
 
     let text: String
     let isStreaming: Bool
@@ -486,29 +494,31 @@ struct ReasoningBlock: View {
     /// Past this, a 380 pt window is a keyhole and the full-screen reader is the honest way to read the trace.
     private static let readerThreshold = 4_000
 
-    /// The two newest lines of the trace, fading out at the old edge. A bottom-aligned clipping frame rather than a line limit, because `lineLimit` tail-truncates and would eat the newest text.
+    /// The newest words of the trace in at most two whole lines: the longest candidate that fits, each starting on a word and opening with an ellipsis when it was shortened.
+    /// Nothing is clipped and nothing is masked. The clipped window this replaces cut its first visible line through the glyphs and faded it with a gradient. `lineLimit` alone is no substitute, because it tail-truncates and would eat the newest text.
     private var preview: some View {
-        Text(tail)
+        let candidates = ReasoningPreview.candidates(for: text)
+        return ViewThatFits(in: .vertical) {
+            ForEach(Array(candidates.enumerated()), id: \.offset) { index, candidate in
+                if index == candidates.count - 1 {
+                    // The last resort, for type sizes where even the shortest candidate wraps to three lines: it truncates at its old end.
+                    previewText(candidate)
+                        .lineLimit(2)
+                        .truncationMode(.head)
+                } else {
+                    previewText(candidate)
+                }
+            }
+        }
+        .frame(maxWidth: .infinity, minHeight: previewHeight, maxHeight: previewHeight, alignment: .topLeading)
+        .padding(.leading, Space.s5)
+    }
+
+    private func previewText(_ candidate: String) -> some View {
+        Text(candidate)
             .font(HermesFont.subhead)
             .foregroundStyle(t.text3)
             .frame(maxWidth: .infinity, alignment: .leading)
-            // Full intrinsic height first, so the frame below clips rather than proposing a height the `Text` would truncate itself into.
-            .fixedSize(horizontal: false, vertical: true)
-            .frame(height: previewHeight, alignment: .bottom)
-            .clipped()
-            .padding(.leading, Space.s5)
-            .mask(
-                LinearGradient(
-                    colors: [.clear, .black, .black],
-                    startPoint: .top,
-                    endPoint: .bottom
-                )
-            )
-    }
-
-    /// The window the preview lays out, wide enough to fill two lines at any text size; the frame above decides how much of it is on screen.
-    private var tail: String {
-        String(text.suffix(220)).trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     /// A nil duration is a first-class answer rather than a zero: a transcript loaded from history never watched the think happen, and a trace that arrived whole has no interval to report.
@@ -516,6 +526,52 @@ struct ReasoningBlock: View {
         if isStreaming { return "Thinking" }
         guard let duration else { return "Thought" }
         return "Thought for \(RelativeTime.duration(duration))"
+    }
+}
+
+/// What the collapsed reasoning preview may show of a trace, longest first.
+enum ReasoningPreview {
+    /// Character budgets for the candidates. The longest fills two lines on a wide screen at a small size; the shortest fits two lines of the narrowest phone at the largest default size.
+    static let budgets = [240, 180, 140, 110, 84, 64]
+
+    /// Two lines of `HermesFont.subhead` plus half a line, before Dynamic Type scales it.
+    static let baseBoxHeight: CGFloat = (UIFont.systemFont(ofSize: HermesFont.subhead.size).lineHeight * 2.5).rounded(.up)
+
+    /// The trace's newest words with every run of spaces and line breaks closed to one space, then the newest of them under each budget. A candidate that is not the whole trace starts on a word and opens with an ellipsis, so the reader can see it was shortened. Strictly shorter as they go.
+    /// Only the trace's tail is read, so a long trace streaming in costs the same on every body pass as a short one.
+    static func candidates(for text: String) -> [String] {
+        let window = text.suffix((budgets.first ?? 240) + 64)
+        let isWhole = window.startIndex == text.startIndex
+        var words = window.split(whereSeparator: { $0.isWhitespace || $0.isNewline }).map(String.init)
+        // A word the window cut through is not shown.
+        if !isWhole, words.count > 1, window.first?.isWhitespace == false,
+           !text[text.index(before: window.startIndex)].isWhitespace {
+            words.removeFirst()
+        }
+        guard !words.isEmpty else { return [""] }
+        let whole = words.joined(separator: " ")
+        var candidates: [String] = []
+        for budget in budgets {
+            let candidate = isWhole && whole.count <= budget ? whole : shortened(words, budget: budget)
+            if candidate.count < (candidates.last?.count ?? .max) { candidates.append(candidate) }
+        }
+        return candidates
+    }
+
+    /// The newest words that fit `budget` characters with the ellipsis; a single word longer than that (a hash, a path) keeps its newest characters.
+    private static func shortened(_ words: [String], budget: Int) -> String {
+        var kept: [String] = []
+        var length = 1
+        for word in words.reversed() {
+            let added = word.count + (kept.isEmpty ? 0 : 1)
+            guard length + added <= budget else { break }
+            kept.insert(word, at: 0)
+            length += added
+        }
+        if kept.isEmpty, let last = words.last {
+            return "…" + String(last.suffix(budget - 1))
+        }
+        return "…" + kept.joined(separator: " ")
     }
 }
 
@@ -534,6 +590,12 @@ struct TurnError: View {
             // Nothing here gates the card: an absent descriptor, an unknown layer or an unset `retryable` each drops its own line and leaves the rest standing.
             if let note = surface?.layerNote {
                 Text(note)
+                    .font(HermesFont.footnote)
+                    .foregroundStyle(t.text3)
+            }
+            // Desktop parity: when a usage limit lifts, from `error_surface.resets_at`.
+            if let reset = surface?.resetNote() {
+                Text(reset)
                     .font(HermesFont.footnote)
                     .foregroundStyle(t.text3)
             }
@@ -646,7 +708,7 @@ struct DaySeparator: View {
 
 /// A `data:` URL renders inline immediately; a gateway-local path resolves through `GET /api/media?path=` and renders inline once the bytes arrive.
 @MainActor
-private struct AttachmentChips: View {
+struct AttachmentChips: View {
     @Environment(\.hermes) private var t
     let refs: [String]
 
@@ -660,10 +722,13 @@ private struct AttachmentChips: View {
 
     var body: some View {
         VStack(alignment: .trailing, spacing: Space.s3) {
-            ForEach(Array(refs.enumerated()), id: \.offset) { index, ref in
-                if let pair = Self.inlineThumbnail(ref) {
-                    thumbnail(pair.image, data: pair.data, id: "inline-\(index)")
-                } else if Self.isResolvablePath(ref) {
+            ForEach(Array(Self.displayRefs(refs).enumerated()), id: \.offset) { index, ref in
+                if InlineThumbnail.isInline(ref) {
+                    // BUG-075 B: decoded once, off the body, and kept for the life of the chip; deciding that a ref is inline is a prefix check, never a decode.
+                    InlineImageChip(ref: ref) { data in
+                        viewing = ViewerItem(id: "inline-\(index)", data: data)
+                    }
+                } else if Self.isResolvablePath(ref) || MediaByteCache.shared.holds(ref) {
                     RemoteMediaImage(path: ref) { data, id in
                         viewing = ViewerItem(id: id, data: data)
                     }
@@ -677,20 +742,6 @@ private struct AttachmentChips: View {
         }
     }
 
-    private func thumbnail(_ image: UIImage, data: Data, id: String) -> some View {
-        Button {
-            viewing = ViewerItem(id: id, data: data)
-        } label: {
-            Image(uiImage: image)
-                .resizable()
-                .scaledToFit()
-                .frame(maxWidth: 220, maxHeight: 220)
-                .clipShape(RoundedRectangle(cornerRadius: Radius.enclosure, style: .continuous))
-        }
-        .buttonStyle(.plain)
-        .accessibilityLabel("Attached image. Double tap to view full screen.")
-    }
-
     private func nameChip(_ ref: String) -> some View {
         Text(Self.displayName(ref))
             .font(HermesFont.footnote)
@@ -700,30 +751,118 @@ private struct AttachmentChips: View {
             .background(t.surface2, in: Capsule())
     }
 
-    /// Downsampled chip for an in-chat `data:image/…` ref, returning the encoded bytes too so the viewer can full-decode on open.
-    private static func inlineThumbnail(_ ref: String) -> (image: UIImage, data: Data)? {
+    /// The session store flattens a native-vision turn by standing a `[screenshot]` line in for each image part, beside the `@image:` line that names the same file. The placeholder is dropped whenever a real ref is present, as Desktop's `extractImageRefs` drops it; alone, it stays, because it is then the only sign an image was sent.
+    static func displayRefs(_ refs: [String]) -> [String] {
+        guard refs.contains(where: { $0 != InlineThumbnail.screenshotPlaceholder }) else { return refs }
+        return refs.filter { $0 != InlineThumbnail.screenshotPlaceholder }
+    }
+
+    /// Path-shaped refs resolve over the media route, and the backend's paths are the host's: POSIX, `~`, a Windows drive, a UNC share. Markers like `[screenshot]` have no path to resolve.
+    static func isResolvablePath(_ ref: String) -> Bool {
+        ref.hasPrefix("@image:") || MediaDirective.isResolvableFilePath(ref)
+    }
+
+    /// The filename alone, read with the host's separators: `NSString.lastPathComponent` knows one separator and returned the whole of a Windows path.
+    static func displayName(_ ref: String) -> String {
+        if ref == InlineThumbnail.screenshotPlaceholder { return "Screenshot" }
+        return MediaDirective.name(of: path(of: ref))
+    }
+
+    /// The host path a ref names, without the `@image:` prefix or the quotes the backend puts around a path with a space in it.
+    static func path(of ref: String) -> String {
+        UserInputDisplay.unquote(ref.hasPrefix("@image:") ? String(ref.dropFirst("@image:".count)) : ref)
+    }
+}
+
+/// An in-chat `data:image/…` ref decoded into a chip-sized thumbnail, with the encoded bytes kept so the viewer can full-decode on open.
+enum InlineThumbnail {
+    /// A decoded chip. `UIImage` is immutable once made, so handing it from the decoding task to the view is safe.
+    struct Decoded: @unchecked Sendable {
+        let image: UIImage
+        let data: Data
+    }
+
+    /// How many decodes have run, process-wide; a test reads it to tell a decode inside a body pass from one off it.
+    static var decodeCount: Int { counter.withLock { $0 } }
+    private static let counter = OSAllocatedUnfairLock(initialState: 0)
+
+    /// Whether a ref is an inline image, by its prefix alone, so the body can decide without decoding.
+    static func isInline(_ ref: String) -> Bool {
+        ref.hasPrefix("data:image/")
+    }
+
+    /// The store's stand-in for an image part it flattened out of a user row.
+    static let screenshotPlaceholder = "[screenshot]"
+
+    static func decode(_ ref: String) -> Decoded? {
+        counter.withLock { $0 += 1 }
         guard let data = DownsampledImage.data(fromDataURL: ref),
               let image = DownsampledImage.thumbnail(data: data)
         else { return nil }
-        return (image, data)
+        return Decoded(image: image, data: data)
     }
+}
 
-    /// Path-shaped refs resolve over the media route; markers like `[screenshot]` have no path to resolve.
-    private static func isResolvablePath(_ ref: String) -> Bool {
-        ref.hasPrefix("/") || ref.hasPrefix("~") || ref.hasPrefix("@image:")
-    }
+/// One inline image on a user turn, decoded on a background task the first time the chip appears and held in its state after that, so a row re-rendering while a reply streams costs nothing. The placeholder is the box `RemoteMediaImage` draws while it resolves.
+@MainActor
+private struct InlineImageChip: View {
+    @Environment(\.hermes) private var t
+    let ref: String
+    let onTap: (Data) -> Void
 
-    private static func displayName(_ ref: String) -> String {
-        if ref == "[screenshot]" { return "Screenshot" }
-        return (ref as NSString).lastPathComponent
+    @State private var decoded: InlineThumbnail.Decoded?
+    @State private var failed = false
+
+    var body: some View {
+        Group {
+            if let decoded {
+                Button {
+                    onTap(decoded.data)
+                } label: {
+                    Image(uiImage: decoded.image)
+                        .resizable()
+                        .scaledToFit()
+                        .frame(maxWidth: 220, maxHeight: 220)
+                        .clipShape(RoundedRectangle(cornerRadius: Radius.enclosure, style: .continuous))
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Attached image. Double tap to view full screen.")
+            } else if failed {
+                Text("Image")
+                    .font(HermesFont.footnote)
+                    .foregroundStyle(t.text2)
+                    .padding(.horizontal, Space.s5)
+                    .frame(height: 30)
+                    .background(t.surface2, in: Capsule())
+                    .accessibilityLabel("Attached image that could not be shown")
+            } else {
+                RoundedRectangle(cornerRadius: Radius.enclosure, style: .continuous)
+                    .fill(t.surface2)
+                    .frame(width: 220, height: 140)
+                    .accessibilityLabel("Loading image")
+            }
+        }
+        // Keyed on the ref, whose storage is shared with the entry, so the comparison on each body pass is a pointer check and not a walk over the encoded bytes.
+        .task(id: ref) {
+            guard decoded == nil else { return }
+            let ref = ref
+            let result = await Task.detached(priority: .userInitiated) { InlineThumbnail.decode(ref) }.value
+            guard !Task.isCancelled else { return }
+            if let result { decoded = result } else { failed = true }
+        }
     }
 }
 
 /// Whether a gateway-local image chip should try to resolve.
 enum ImageChipLoadGate {
-    /// Retry is allowed whenever there is still no thumbnail; the view bounds how often `.task` re-runs, so this cannot become a hot loop.
-    static func shouldLoad(hasThumbnail: Bool, failed: Bool) -> Bool {
+    /// Retry is allowed whenever there is still no thumbnail, failed or not (BUG-027); the view bounds how often `.task` re-runs, so this cannot become a hot loop.
+    static func shouldLoad(hasThumbnail: Bool) -> Bool {
         !hasThumbnail
+    }
+
+    /// BUG-027's statement form: a failure is deliberately not an input, and `ImageChipLoadGateTests` pins that it changes nothing. Production calls the one-argument form.
+    static func shouldLoad(hasThumbnail: Bool, failed: Bool) -> Bool {
+        shouldLoad(hasThumbnail: hasThumbnail)
     }
 }
 
@@ -739,6 +878,7 @@ enum ImageChipRetry {
 private struct RemoteMediaImage: View {
     @Environment(\.hermes) private var t
     @Environment(AppModel.self) private var app
+    @Environment(\.mediaProfile) private var mediaProfile
 
     let path: String
     let onTap: (Data, String) -> Void
@@ -768,7 +908,7 @@ private struct RemoteMediaImage: View {
                     failed = next.failed
                     retryToken = next.token
                 } label: {
-                    Text((path as NSString).lastPathComponent)
+                    Text(AttachmentChips.displayName(path))
                         .font(HermesFont.footnote)
                         .foregroundStyle(t.text2)
                         .padding(.horizontal, Space.s5)
@@ -785,30 +925,56 @@ private struct RemoteMediaImage: View {
             }
         }
         .task(id: "\(path)#\(retryToken)") {
-            guard ImageChipLoadGate.shouldLoad(hasThumbnail: thumbnail != nil, failed: failed) else { return }
+            guard ImageChipLoadGate.shouldLoad(hasThumbnail: thumbnail != nil) else { return }
             await load()
         }
     }
 
+    /// Bytes the phone still holds (a photo it just sent, a thumbnail it already fetched) are used first; otherwise the media route. The downsample runs off the main actor either way (BUG-075).
     private func load() async {
-        guard let rest = app.rest else {
+        let path = path
+        let cleanPath = AttachmentChips.path(of: path)
+        let rest = app.rest
+        let profile = mediaProfile
+        let result = await Task.detached(priority: .userInitiated) { () async -> InlineThumbnail.Decoded? in
+            let bytes: Data?
+            if let held = MediaByteCache.shared.data(for: path) ?? MediaByteCache.shared.data(for: cleanPath) {
+                bytes = held
+            } else if let rest, let dataURL = await Self.dataURL(rest: rest, path: cleanPath, profile: profile) {
+                bytes = DownsampledImage.data(fromDataURL: dataURL)
+            } else {
+                bytes = nil
+            }
+            guard let bytes, let loaded = DownsampledImage.thumbnail(data: bytes) else { return nil }
+            MediaByteCache.shared.remember(bytes, keys: [path, cleanPath])
+            return InlineThumbnail.Decoded(image: loaded, data: bytes)
+        }.value
+        guard !Task.isCancelled else { return }
+        guard let result else {
             failed = true
             return
         }
-        let cleanPath = path.hasPrefix("@image:") ? String(path.dropFirst("@image:".count)) : path
-        do {
-            let dataURL = try await rest.mediaDataURL(path: cleanPath)
-            guard let data = DownsampledImage.data(fromDataURL: dataURL),
-                  let loaded = DownsampledImage.thumbnail(data: data)
-            else {
-                failed = true
-                return
-            }
-            encoded = data
-            thumbnail = loaded
-        } catch {
-            failed = true
-        }
+        encoded = result.data
+        thumbnail = result.image
+    }
+
+    /// The media route first; a chat under a named Hermes profile uploads into that profile's own `images`, which `/api/media` refuses, so its file is read through the profile-scoped file route instead.
+    nonisolated static func dataURL(rest: RestAPI, path: String, profile: String?) async -> String? {
+        if let dataURL = try? await rest.mediaDataURL(path: path) { return dataURL }
+        guard let profile, !profile.isEmpty else { return nil }
+        return try? await rest.readDataURL(path: path, profile: profile)
+    }
+}
+
+private struct MediaProfileKey: EnvironmentKey {
+    static let defaultValue: String? = nil
+}
+
+extension EnvironmentValues {
+    /// The Hermes profile the open chat lives under, nil for the backend's own; set by `ChatView` for the images in its transcript.
+    var mediaProfile: String? {
+        get { self[MediaProfileKey.self] }
+        set { self[MediaProfileKey.self] = newValue }
     }
 }
 
@@ -850,57 +1016,34 @@ struct MediaViewer: View {
                     .tint(.white)
             }
         }
+        // Each control is a dark glass disc, so its white glyph holds over a light photo as well as over the black ground; the row is the same one the video player wears.
         .overlay(alignment: .top) {
-            HStack {
-                Button {
-                    dismiss()
-                } label: {
-                    Image(systemName: "xmark")
-                        .font(.system(size: 15, weight: .semibold))
-                        .foregroundStyle(.white)
-                }
-                .buttonStyle(IconButtonStyle())
-                .accessibilityLabel("Close")
-
-                Spacer()
-
-                if let image {
+            if let image {
+                MediaViewerControls(
+                    noun: "image",
+                    onCopy: { UIPasteboard.general.image = image },
+                    onSave: { await PhotoSave.save(image) },
+                    share: {
+                        ShareLink(item: Image(uiImage: image), preview: SharePreview("Image", image: Image(uiImage: image))) {
+                            MediaViewerControls<EmptyView>.control("square.and.arrow.up")
+                        }
+                    },
+                    saveState: $saveState
+                )
+            } else {
+                HStack {
                     Button {
-                        UIPasteboard.general.image = image
-                        HapticFeedback.selection()
+                        dismiss()
                     } label: {
-                        Image(systemName: "doc.on.doc")
-                            .font(.system(size: 15))
-                            .foregroundStyle(.white)
-                    }
-                    .buttonStyle(IconButtonStyle())
-                    .accessibilityLabel("Copy image")
-
-                    // The glyph flips to a tick the moment the write lands and rolls back visibly to an exclamation if the grant is refused, never a silent no-op.
-                    Button {
-                        Task { saveState = await PhotoSave.save(image) }
-                    } label: {
-                        Image(systemName: saveState.glyph)
-                            .font(.system(size: 15))
-                            .foregroundStyle(saveState == .failed ? t.danger : .white)
-                            .frame(width: Hit.min, height: Hit.min)
-                            .contentShape(Rectangle())
+                        MediaViewerControls<EmptyView>.control("xmark", weight: .semibold)
                     }
                     .buttonStyle(.plain)
-                    .disabled(saveState == .saving)
-                    .accessibilityLabel(saveState.accessibilityLabel)
-
-                    ShareLink(item: Image(uiImage: image), preview: SharePreview("Image", image: Image(uiImage: image))) {
-                        Image(systemName: "square.and.arrow.up")
-                            .font(.system(size: 15))
-                            .foregroundStyle(.white)
-                            .frame(width: Hit.min, height: Hit.min)
-                            .contentShape(Rectangle())
-                    }
-                    .accessibilityLabel("Share image")
+                    .accessibilityLabel("Close")
+                    Spacer()
                 }
+                .padding(.horizontal, Space.s4)
+                .environment(\.colorScheme, .dark)
             }
-            .padding(.horizontal, Space.s4)
         }
         .overlay(alignment: .bottom) {
             if let note = saveState.note {

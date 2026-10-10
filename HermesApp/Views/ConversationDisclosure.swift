@@ -104,23 +104,44 @@ struct ConversationDisclosure: View {
     @ViewBuilder
     private var expansion: some View {
         VStack(alignment: .leading, spacing: Space.s5) {
-            if let assistant, !assistant.reasoning.isEmpty {
-                ReasoningBlock(
-                    text: assistant.reasoning,
-                    isStreaming: assistant.isStreaming,
-                    duration: assistant.reasoningDuration
-                )
-            }
-            let items = ChatView.groupItems(tools, grouping: TranscriptPreferences.groupRepeatedCalls)
-            ForEach(items) { item in
-                switch item {
-                case .entry(let entry):
+            ForEach(Self.sections(assistant: assistant, tools: tools, grouping: TranscriptPreferences.groupRepeatedCalls)) { section in
+                switch section {
+                case .reasoning(let assistant):
+                    ReasoningBlock(
+                        text: assistant.reasoning,
+                        isStreaming: assistant.isStreaming,
+                        duration: assistant.reasoningDuration
+                    )
+                case .tool(.entry(let entry)):
                     if let tool = entry.tool { ToolCardView(activity: tool) }
-                case .toolGroup(let entries):
+                case .tool(.toolGroup(let entries)):
                     ToolGroupCard(entries: entries)
                 }
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    /// One block of the expansion: the turn's reasoning trace, or one tool row grouped as Sessions mode groups them.
+    enum Section: Identifiable {
+        case reasoning(ChatEntry)
+        case tool(ChatView.TranscriptItem)
+
+        var id: String {
+            switch self {
+            case .reasoning(let assistant): return "reasoning-\(assistant.id)"
+            case .tool(let item): return item.id
+            }
+        }
+    }
+
+    /// The expansion's blocks, in the order they happened: the tools first, then the reasoning.
+    /// `ConversationGrouping` folds the tools that ran before an assistant entry under it, and the engine closes an assistant entry when a tool card is appended, so this entry was opened after those tools and its reasoning was thought after they ran. Drawing it first put a later thought above the work it followed, the order already fixed for the Sessions renderer.
+    static func sections(assistant: ChatEntry?, tools: [ChatEntry], grouping: Bool) -> [Section] {
+        var sections = ChatView.groupItems(tools, grouping: grouping).map(Section.tool)
+        if let assistant, !assistant.reasoning.isEmpty {
+            sections.append(.reasoning(assistant))
+        }
+        return sections
     }
 }

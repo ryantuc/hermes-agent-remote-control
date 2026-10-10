@@ -42,7 +42,49 @@ enum HomeModeControl {
     static let ringWidth: CGFloat = 2
 }
 
-/// The top bar's mode control. 44 pt, `IconButtonStyle`, identical frame in both modes so the two screens' trailing edges line up exactly.
+/// The disc every control in the root screens' top bars stands on (Home, Bots, and the first-run screen's gear): a 44 pt circle of the app's floating glass, which on iOS 26 is the same Liquid Glass circle the system draws under the conversation's Back and `⋯`, and a material disc with a rim below 26.
+///
+/// The root bars stay the app's own 52 pt rows rather than system toolbar items, so they stay inside the stack `ComposerViewport` measures on Home (BUG-040) and under BUG-118's clip; only their controls take the conversation's look. A bare glyph on the canvas beside a glass Back one push away read as two bar systems.
+struct HomeBarButtonStyle: ButtonStyle {
+    /// The disc's diameter: the hit box itself, as the system's bar circles are.
+    static let discDiameter: CGFloat = Hit.min
+
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .frame(width: Self.discDiameter, height: Self.discDiameter)
+            .glassFloating(in: Circle())
+            .opacity(configuration.isPressed ? 0.7 : 1)
+            .contentShape(Circle())
+    }
+}
+
+extension View {
+    /// The root screens' bar row: 52 pt tall, with its discs inset from the screen's edges by the 16 pt the system insets the conversation's Back and `⋯` by, so a disc sits in the same place before and after a push. The 6 pt inset these rows used put a glass disc almost against the glass of the display's edge.
+    func homeBarRow() -> some View {
+        padding(.horizontal, Space.s6)
+            .frame(height: 52)
+    }
+}
+
+/// The hamburger both root screens lead with, declared once so Home's and Bots' leading edges are one declaration and cannot drift apart again (BUG-063 aligned them by hand).
+@MainActor
+struct HomeMenuButton: View {
+    @Environment(\.hermes) private var t
+
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            Image(systemName: "line.3.horizontal")
+                .font(.system(size: HomeModeControl.glyphSize, weight: .medium))
+                .foregroundStyle(t.text1)
+        }
+        .buttonStyle(HomeBarButtonStyle())
+        .accessibilityLabel("Menu")
+    }
+}
+
+/// The top bar's mode control. 44 pt, on the root bars' glass disc, identical frame in both modes so the two screens' trailing edges line up exactly.
 @MainActor
 struct HomeModeControlButton: View {
     @Environment(\.hermes) private var t
@@ -54,14 +96,14 @@ struct HomeModeControlButton: View {
 
     var body: some View {
         Button(action: action) {
-            // BUG-063: the ring is applied here rather than inside `glyph` so both cases get it from one declaration.
+            // BUG-063: the ring is applied here rather than inside `glyph` so both cases get it from one declaration. It was asked for ("a circle around it in the same color as the composer send button") and stays, inside the glass disc every bar control now stands on.
             glyph
                 .frame(width: HomeModeControl.ringDiameter, height: HomeModeControl.ringDiameter)
                 .overlay(
                     Circle().strokeBorder(t.action, lineWidth: HomeModeControl.ringWidth)
                 )
         }
-        .buttonStyle(IconButtonStyle())
+        .buttonStyle(HomeBarButtonStyle())
         .accessibilityLabel(HomeModeControl.accessibilityLabel(for: mode))
         .accessibilityHint("Switches between your sessions and your bots")
     }

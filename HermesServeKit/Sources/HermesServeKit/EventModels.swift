@@ -6,7 +6,7 @@ import Foundation
 ///
 /// Advisory, and absence is normal: the backend's builders swallow their own errors, so any turn
 /// may fail without one. Nothing may gate the rendering of an error on this being present.
-public struct ErrorSurface: Sendable, Equatable {
+public struct ErrorSurface: Sendable, Equatable, Codable {
     /// `provider` | `streaming` | `auth` | `gateway` | `runtime` | … — open-ended, and an
     /// unrecognised layer is rendered as a plain error, never dropped.
     public let layer: String
@@ -14,11 +14,14 @@ public struct ErrorSurface: Sendable, Equatable {
     public let code: String
     /// Nil is not `false`: it means the backend did not say, and the retry affordance stands.
     public let retryable: Bool?
+    /// When the provider said its limit lifts (`resets_at`, epoch seconds: a 429's Retry-After or body field), declared at `tui_gateway/contracts/events.py:162-172`, `:161-170` on an older backend. Nil when the provider named no reset, and on every older encoded checkpoint.
+    public let resetsAt: Date?
 
-    public init(layer: String, code: String, retryable: Bool?) {
+    public init(layer: String, code: String, retryable: Bool?, resetsAt: Date? = nil) {
         self.layer = layer
         self.code = code
         self.retryable = retryable
+        self.resetsAt = resetsAt
     }
 
     /// Nil unless the payload carries a descriptor with something in it.
@@ -33,6 +36,26 @@ public struct ErrorSurface: Sendable, Equatable {
         self.layer = layer
         self.code = code
         self.retryable = retryable
+        // Desktop accepts only a finite positive number (`apps/desktop/src/lib/error-surface.ts:134-136`); `coercedEpochDate` is the same rule.
+        self.resetsAt = json["resets_at"]?.coercedEpochDate
+    }
+
+    /// The sentence for the turn's error card when the provider named its reset; nil otherwise. Desktop shows "Limit resets at HH:mm" beside Retry (`error-surface.ts:93-96`); a phone message can be read hours later, so a reset on another day names the day, and one already past says so.
+    public func resetNote(now: Date = Date(), calendar: Calendar = .current, locale: Locale = .current) -> String? {
+        guard let resetsAt else { return nil }
+        let time = DateFormatter()
+        time.locale = locale
+        time.timeZone = calendar.timeZone
+        time.dateStyle = .none
+        time.timeStyle = .short
+        let clock = time.string(from: resetsAt)
+        if resetsAt <= now { return "The limit reset at \(clock)." }
+        if calendar.isDate(resetsAt, inSameDayAs: now) { return "The limit resets at \(clock)." }
+        let day = DateFormatter()
+        day.locale = locale
+        day.timeZone = calendar.timeZone
+        day.setLocalizedDateFormatFromTemplate("MMMd")
+        return "The limit resets \(day.string(from: resetsAt)) at \(clock)."
     }
 
     /// The layers this client has words for; anything else falls through to the generic wording.
@@ -132,6 +155,9 @@ public struct ToolCompleteEvent: Sendable, Equatable {
     /// `args.todos` may be a partial merge and `tool.progress` never carries todos. `nil` means no
     /// typed data, while an empty non-nil list means the agent cleared its plan.
     public let todos: TodoList?
+    /// The plan store's write counter riding beside `todos`: the backend merges its normalised
+    /// snapshot into the payload (`tool_progress.py:354-358`). Nil on a backend that predates it.
+    public let todoRevision: Int?
     public var isError: Bool { !error.isEmpty }
 
     public init(
@@ -143,7 +169,8 @@ public struct ToolCompleteEvent: Sendable, Equatable {
         error: String,
         durationSeconds: Double?,
         inlineDiff: String,
-        todos: TodoList? = nil
+        todos: TodoList? = nil,
+        todoRevision: Int? = nil
     ) {
         self.sessionID = sessionID
         self.toolID = toolID
@@ -154,13 +181,20 @@ public struct ToolCompleteEvent: Sendable, Equatable {
         self.durationSeconds = durationSeconds
         self.inlineDiff = inlineDiff
         self.todos = todos
+        self.todoRevision = todoRevision
     }
 }
 
-/// `approval.request` — the one blocking prompt with no `request_id`; resolution is FIFO on a
-/// per-session queue (reference §5.1, §5.2).
+/// Approval presentation shared by legacy events and identified current server requests.
+/// Legacy queue IDs are optional; older ID-less emitters resolve through the session FIFO.
 public struct ApprovalRequestEvent: Sendable, Equatable, Identifiable {
-    /// Client-side identity only. The wire carries nothing to correlate on.
+    public let serverRequest: ServerRequestIdentity?
+    /// Some legacy emitters identify the queue entry; preserve it instead of falling back to FIFO.
+    public let legacyRequestID: String?
+    /// The backend approval-queue entry's `request_id`, whichever path delivered the prompt; it is
+    /// what `approval.cancelled` names. Correlation only, never sent on a response.
+    public let queueRequestID: String?
+    /// Stable presentation identity; wire correlation is held separately below.
     public let id: UUID
     public let sessionID: String
     /// Already redacted server-side; re-scrubbed here for defence in depth.
@@ -174,8 +208,12 @@ public struct ApprovalRequestEvent: Sendable, Equatable, Identifiable {
     public let choices: [ApprovalChoice]
     public let receivedAt: Date
 
-    init(sessionID: String, payload: JSONValue) {
-        id = UUID()
+    init(sessionID: String, payload: JSONValue, id: UUID = UUID(), serverRequest: ServerRequestIdentity? = nil, receivedAt: Date = Date()) {
+        self.id = id
+        self.serverRequest = serverRequest
+        let queueID = payload["request_id"]?.stringValue
+        legacyRequestID = serverRequest == nil && queueID?.isEmpty == false ? queueID : nil
+        queueRequestID = queueID?.isEmpty == false ? queueID : nil
         self.sessionID = sessionID
         command = Redaction.text(payload["command"]?.text ?? "")
         let described = payload["description"]?.coercedString ?? ""
@@ -190,7 +228,7 @@ public struct ApprovalRequestEvent: Sendable, Equatable, Identifiable {
         }()
         allowPermanent = permanent != false
         smartDenied = payload["smart_denied"]?.coercedBool == true
-        receivedAt = Date()
+        self.receivedAt = receivedAt
 
         if let raw = payload["choices"]?.arrayValue {
             let parsed = raw.compactMap { $0.coercedString }.compactMap(ApprovalChoice.init(rawValue:))
@@ -258,6 +296,9 @@ public struct ClarifyQuestion: Sendable, Equatable, Identifiable {
 /// not substituted. Timeout is not on the wire today, so callers fall back to configured
 /// `agent.clarify_timeout`, then `defaultTimeoutSeconds`.
 public struct ClarifyRequestEvent: Sendable, Equatable, Identifiable {
+    public let serverRequest: ServerRequestIdentity?
+    /// Client-local ordering for current-request projections; never decoded from the wire. Legacy events have no revision.
+    public let sourceRevision: Int?
     public let id: String
     public let sessionID: String
     public let question: String
@@ -289,7 +330,9 @@ public struct ClarifyRequestEvent: Sendable, Equatable, Identifiable {
         receivedAt: Date = Date(),
         wireTimeoutSeconds: Double? = nil,
         questions: [ClarifyQuestion] = [],
-        lockedAnswers: [String: String] = [:]
+        lockedAnswers: [String: String] = [:],
+        serverRequest: ServerRequestIdentity? = nil,
+        sourceRevision: Int? = nil
     ) {
         self.id = id
         self.sessionID = sessionID
@@ -300,27 +343,31 @@ public struct ClarifyRequestEvent: Sendable, Equatable, Identifiable {
         self.wireTimeoutSeconds = wireTimeoutSeconds
         self.questions = questions
         self.lockedAnswers = lockedAnswers
+        self.serverRequest = serverRequest
+        self.sourceRevision = sourceRevision
     }
 
     /// Decode the wire payload — the live frame's and the identical snapshot `session.resume`
     /// replays — through one decoder, so the two paths cannot diverge (BUG-066). `questions`
     /// arrives INSTEAD of `question` / `choices`, and reading only the historical keys is what made
     /// a batch render as a blank card (BUG-041).
-    init(sessionID: String, payload: JSONValue) {
+    init(sessionID: String, payload: JSONValue, serverRequest: ServerRequestIdentity? = nil, receivedAt: Date = Date(), sourceRevision: Int? = nil) {
         self.init(
             id: payload["request_id"]?.coercedString ?? "",
             sessionID: sessionID,
             question: payload["question"]?.text ?? "",
             choices: (payload["choices"]?.arrayValue ?? []).compactMap { $0.coercedString },
             multiSelect: payload["multi_select"]?.coercedBool ?? false,
-            receivedAt: Date(),
+            receivedAt: receivedAt,
             // Not emitted by current backends; accept either name if one appears.
             wireTimeoutSeconds: payload["timeout"]?.coercedDouble
                 ?? payload["timeout_seconds"]?.coercedDouble,
             questions: (payload["questions"]?.arrayValue ?? [])
                 .compactMap(ClarifyQuestion.init(wire:)),
             lockedAnswers: (payload["answers"]?.objectValue ?? [:])
-                .compactMapValues { $0.coercedString }
+                .compactMapValues { $0.coercedString },
+            serverRequest: serverRequest,
+            sourceRevision: sourceRevision
         )
     }
 }
@@ -330,6 +377,7 @@ public struct SudoRequestEvent: Sendable, Equatable, Identifiable {
     public let id: String
     public let sessionID: String
     public let receivedAt: Date
+    public var serverRequest: ServerRequestIdentity? = nil
     public var timeoutSeconds: Double { 120 }
 }
 
@@ -340,6 +388,11 @@ public struct SecretRequestEvent: Sendable, Equatable, Identifiable {
     public let prompt: String
     public let envVar: String
     public let receivedAt: Date
+    public var serverRequest: ServerRequestIdentity? = nil
+    public var requiresDesktop: Bool {
+        guard let serverRequest else { return false }
+        return !["secret", "vault.unlock_prompt", "vault.code"].contains(serverRequest.method)
+    }
     public var timeoutSeconds: Double { 300 }
 }
 
@@ -384,6 +437,39 @@ public struct BackgroundCompleteEvent: Sendable, Equatable {
     public let sessionID: String
     public let taskID: String
     public let text: String
+}
+
+/// `btw.complete {task_id, text, question}` — the answer to a `/btw` side question, emitted on the asking session (`SideAgentCompletePayload`, `tui_gateway/contracts/events.py:459-468`, `:421-430` on an older backend; emitter `tui_gateway/methods_prompt.py:1207-1209`). A failed side agent answers `error: <reason>` in `text`.
+public struct SideQuestionAnswerEvent: Sendable, Equatable {
+    public let sessionID: String
+    public let taskID: String
+    public let question: String
+    public let text: String
+}
+
+/// `approval.cancelled {session_id, stored_session_id, reason, cancelled_count, request_ids}` — the
+/// backend deny-resolved pending approvals itself on an interrupt, reap or teardown (#106678;
+/// contract `tui_gateway/contracts/events.py:418-435`, emitter `session_lifecycle.py:469-498`).
+/// A BROADCAST: `_broadcast_global_event` frames it with an empty envelope `session_id`
+/// (`server.py:725-741`), so the session comes from the payload. `request_ids` omits entries that
+/// had no id, which is why `cancelledCount` can exceed it.
+public struct ApprovalCancelledEvent: Sendable, Equatable {
+    /// The runtime id, the namespace every other event and server request uses.
+    public let sessionID: String
+    public let storedSessionID: String
+    /// `interrupt` | `ws_orphan_reap` | `idle_timeout` | `lru_evict` | `tui_close` | … — open.
+    public let reason: String
+    public let cancelledCount: Int
+    public let requestIDs: [String]
+
+    public init(payload: JSONValue) {
+        sessionID = payload["session_id"]?.coercedString ?? ""
+        storedSessionID = payload["stored_session_id"]?.coercedString ?? ""
+        reason = payload["reason"]?.coercedString ?? ""
+        let named = (payload["request_ids"]?.arrayValue ?? []).compactMap(\.coercedString).filter { !$0.isEmpty }
+        requestIDs = named
+        cancelledCount = max(payload["cancelled_count"]?.coercedInt ?? 0, named.count)
+    }
 }
 
 /// `tool.output_risk` — a safety signal about a tool's output, relayed verbatim.
@@ -452,6 +538,8 @@ public struct SubagentEvent: Sendable, Equatable {
     /// The delegating agent, and the edge the detail sheet builds its tree from.
     public let parentID: String
     public let childSessionID: String
+    /// The fan-out batch; with `taskIndex` it matches a failed async task `subagent.list` reports.
+    public let delegationID: String
     public let goal: String
     public let taskIndex: Int?
     public let taskCount: Int?
@@ -474,6 +562,7 @@ public struct SubagentEvent: Sendable, Equatable {
         subagentID = payload["subagent_id"]?.coercedString ?? ""
         parentID = payload["parent_id"]?.coercedString ?? ""
         childSessionID = payload["child_session_id"]?.coercedString ?? ""
+        delegationID = payload["delegation_id"]?.coercedString ?? ""
         goal = payload["goal"]?.text ?? ""
         taskIndex = payload["task_index"]?.coercedInt
         taskCount = payload["task_count"]?.coercedInt
@@ -551,6 +640,8 @@ public enum HermesEvent: Sendable {
     case subagentComplete(SubagentEvent)
 
     case approvalRequest(ApprovalRequestEvent)
+    /// The backend withdrew approvals itself; routed by the PAYLOAD's session id.
+    case approvalCancelled(ApprovalCancelledEvent)
     case clarifyRequest(ClarifyRequestEvent)
     case clarifyExpire(sessionID: String, requestID: String)
     case sudoRequest(SudoRequestEvent)
@@ -559,6 +650,12 @@ public enum HermesEvent: Sendable {
     case secretExpire(sessionID: String, requestID: String)
     case terminalReadRequest(TerminalReadRequestEvent)
     case terminalReadExpire(sessionID: String, requestID: String)
+    /// A `manage_connections` operation opened on this session.
+    case connectionRequest(ConnectionRequest)
+    /// A session operation's transition or settlement; an account operation never projects here.
+    case connectionUpdate(ConnectionUpdateEvent)
+    /// Persisted goal, loop or heartbeat state changed; the payload is the whole snapshot, never a delta.
+    case sessionControlUpdate(SessionControlUpdateEvent)
 
     case sessionInfo(SessionInfoEvent)
     case sessionTitle(SessionTitleEvent)
@@ -567,6 +664,7 @@ public enum HermesEvent: Sendable {
     case notificationClear(sessionID: String, key: String)
     case reviewSummary(sessionID: String, text: String)
     case backgroundComplete(BackgroundCompleteEvent)
+    case sideQuestionAnswer(SideQuestionAnswerEvent)
     case toolOutputRisk(ToolOutputRiskEvent)
     /// Agent init failure, context-injection refusal, host crash — distinct from a failed TURN,
     /// which ends at `message.complete {status: "error"}`.
@@ -658,7 +756,8 @@ public enum HermesEvent: Sendable {
                 inlineDiff: payload["inline_diff"]?.text ?? "",
                 // Gated on an EXACT name match so a tool like `todoist_add_task` cannot hijack the
                 // checklist; the plan tool answers to two whole names, never a prefix (BUG-145).
-                todos: TodoList.isPlanTool(toolName) ? TodoList.parse(payload: payload) : nil
+                todos: TodoList.isPlanTool(toolName) ? TodoList.parse(payload: payload) : nil,
+                todoRevision: TodoList.isPlanTool(toolName) ? payload["revision"]?.coercedInt : nil
             ))
 
         case "tool.generating":
@@ -681,6 +780,9 @@ public enum HermesEvent: Sendable {
 
         case "approval.request":
             return .approvalRequest(ApprovalRequestEvent(sessionID: sid, payload: payload))
+
+        case "approval.cancelled":
+            return .approvalCancelled(ApprovalCancelledEvent(payload: payload))
 
         case "clarify.request":
             return .clarifyRequest(ClarifyRequestEvent(sessionID: sid, payload: payload))
@@ -759,6 +861,29 @@ public enum HermesEvent: Sendable {
                 text: payload["text"]?.text ?? ""
             ))
 
+        case "btw.complete":
+            return .sideQuestionAnswer(SideQuestionAnswerEvent(
+                sessionID: sid,
+                taskID: payload["task_id"]?.coercedString ?? "",
+                question: payload["question"]?.text ?? "",
+                text: payload["text"]?.text ?? ""
+            ))
+
+        case "connection.request":
+            // Session-scoped: `_emit("connection.request", sid, …)` (`tui_gateway/agent_callbacks.py:176`).
+            guard let request = ConnectionRequest(sessionID: sid, payload: payload) else { return .other(event) }
+            return .connectionRequest(request)
+
+        case "connection.update":
+            guard let update = ConnectionUpdateEvent(sessionID: sid, payload: payload) else { return .other(event) }
+            return .connectionUpdate(update)
+
+        case "session.control.update":
+            return .sessionControlUpdate(SessionControlUpdateEvent(
+                sessionID: sid,
+                control: SessionControlSnapshot(json: payload["control"] ?? .null)
+            ))
+
         case "tool.output_risk":
             return .toolOutputRisk(ToolOutputRiskEvent(
                 sessionID: sid,
@@ -830,7 +955,7 @@ extension HermesEvent {
     public var isUserVisibleInterrupt: Bool {
         switch self {
         case .approvalRequest, .clarifyRequest, .sudoRequest, .secretRequest,
-             .terminalReadRequest, .messageComplete, .errorEvent:
+             .terminalReadRequest, .connectionRequest, .messageComplete, .errorEvent:
             return true
         default:
             return false

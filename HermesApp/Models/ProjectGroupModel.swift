@@ -26,11 +26,50 @@ final class ProjectGroupModel {
     /// At most one in-flight hydrate per project id; entries are removed by the task itself, so the de-dupe guard holds across a cancel that has not unwound yet.
     private var hydrateTasks: [String: Task<Void, Never>] = [:]
     private var expanded: Set<String>
+    /// The backend whose projects and expansion set these are (BUG-143); captured at init because the hub builds this model with no arguments, and re-read on every `load` so a model that outlives a backend switch does not open the previous machine's groups.
+    private var backendID: UUID?
+    private let defaults: UserDefaults
 
+    /// The pre-BUG-143 key: one set of project paths shared by every backend. The first backend to load adopts it and it is removed, so no second backend inherits it.
     static let expansionKey = "hermes.hub.projects.expanded"
 
-    init() {
-        expanded = Set(UserDefaults.standard.stringArray(forKey: Self.expansionKey) ?? [])
+    /// One set per backend profile, like `LastProjectStore`: a project id is a path, and two machines can share one.
+    static func backendExpansionKey(_ backendID: UUID?) -> String {
+        Self.expansionKey + "." + (backendID?.uuidString ?? "none")
+    }
+
+    init(backendID: UUID? = BackendProfileStore.loadActiveID(), defaults: UserDefaults = .standard) {
+        self.backendID = backendID
+        self.defaults = defaults
+        expanded = Self.loadExpansion(backendID: backendID, defaults: defaults)
+    }
+
+    private static func loadExpansion(backendID: UUID?, defaults: UserDefaults) -> Set<String> {
+        let key = backendExpansionKey(backendID)
+        if let own = defaults.stringArray(forKey: key) { return Set(own) }
+        guard let shared = defaults.stringArray(forKey: Self.expansionKey) else { return [] }
+        defaults.set(shared, forKey: key)
+        defaults.removeObject(forKey: Self.expansionKey)
+        return Set(shared)
+    }
+
+    /// Drop a deleted backend's expansion set.
+    static func forgetExpansion(backendID: UUID, defaults: UserDefaults = .standard) {
+        defaults.removeObject(forKey: backendExpansionKey(backendID))
+    }
+
+    /// The active backend changed under a live model: start over as if built for it, dropping every cached tree, hydrate and error from the previous machine.
+    private func rebindIfBackendChanged(to current: UUID?) {
+        guard current != backendID else { return }
+        backendID = current
+        expanded = Self.loadExpansion(backendID: current, defaults: defaults)
+        for task in hydrateTasks.values { task.cancel() }
+        hydrateTasks = [:]
+        hydrated = [:]
+        hydrationErrors = [:]
+        projects = []
+        loading = false
+        loadError = nil
     }
 
     // MARK: Render inputs
@@ -64,10 +103,12 @@ final class ProjectGroupModel {
             expanded.insert(projectID)
             ensureHydrated(projectID, api: api)
         }
-        UserDefaults.standard.set(Array(expanded), forKey: Self.expansionKey)
+        defaults.set(Array(expanded), forKey: Self.backendExpansionKey(backendID))
     }
 
-    func load(api: ProjectsAPI?, force: Bool) async {
+    func load(api: ProjectsAPI?, force: Bool, activeBackendID: UUID? = BackendProfileStore.loadActiveID()) async {
+        rebindIfBackendChanged(to: activeBackendID)
+        let owner = backendID
         guard force || projects.isEmpty, !loading else {
             // `.task` re-fired on a warm model: heal any expanded section whose hydrate was cancelled on disappear.
             hydrateExpanded(api: api)
@@ -78,13 +119,17 @@ final class ProjectGroupModel {
             return
         }
         loading = true
-        defer { loading = false }
+        defer { if owner == backendID { loading = false } }
         loadError = nil
         do {
-            projects = try await api.tree()
+            let tree = try await api.tree()
+            // A tree that set out before a backend switch is the previous machine's.
+            guard owner == backendID else { return }
+            projects = tree
             // BUG-005: projects persisted as expanded hydrate now, not after a collapse and re-expand on the next hub open.
             hydrateExpanded(api: api)
         } catch {
+            guard owner == backendID else { return }
             loadError = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
         }
     }
@@ -112,9 +157,13 @@ final class ProjectGroupModel {
     }
 
     private func hydrate(_ projectID: String, api: ProjectsAPI) async {
-        defer { hydrateTasks[projectID] = nil }
+        let owner = backendID
+        // After a backend switch the task table was rebuilt, and this entry is no longer ours to clear.
+        defer { if owner == backendID { hydrateTasks[projectID] = nil } }
         do {
-            if let full = try await api.projectSessions(projectID: projectID) {
+            let full = try await api.projectSessions(projectID: projectID)
+            guard owner == backendID else { return }
+            if let full {
                 hydrated[projectID] = full
             } else {
                 // The backend answered but knows no such project, and BUG-005 says that is surfaced, never blank.

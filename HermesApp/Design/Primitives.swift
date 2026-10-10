@@ -3,7 +3,7 @@ import UIKit
 
 // MARK: - Buttons
 
-/// Primary: action fill, 48 pt for a committing action and 44 pt otherwise, with the pressed scale painted in the current frame rather than animated.
+/// Primary: action fill, 48 pt for a committing action and 44 pt otherwise, with the pressed scale painted in the current frame rather than animated. Disabled, it is `controlDisabledInk` on `controlDisabledFill`, like every other disabled control.
 public struct PrimaryButtonStyle: ButtonStyle {
     @Environment(\.hermes) private var t
     @Environment(\.isEnabled) private var isEnabled
@@ -14,10 +14,10 @@ public struct PrimaryButtonStyle: ButtonStyle {
     public func makeBody(configuration: Configuration) -> some View {
         configuration.label
             .font(HermesFont.calloutStrong)
-            .foregroundStyle(isEnabled ? t.actionInk : t.actionInk.opacity(0.45))
+            .foregroundStyle(isEnabled ? t.actionInk : t.controlDisabledInk)
             .frame(maxWidth: .infinity, minHeight: height)
             .background(
-                isEnabled ? t.action : t.action.opacity(0.18),
+                isEnabled ? t.action : t.controlDisabledFill,
                 in: RoundedRectangle(cornerRadius: Radius.control, style: .continuous)
             )
             .scaleEffect(configuration.isPressed ? 0.985 : 1)
@@ -36,10 +36,10 @@ public struct SecondaryButtonStyle: ButtonStyle {
     public func makeBody(configuration: Configuration) -> some View {
         configuration.label
             .font(HermesFont.callout)
-            .foregroundStyle(isEnabled ? t.text1 : t.text1.opacity(0.4))
+            .foregroundStyle(isEnabled ? t.text1 : t.controlDisabledInk)
             .frame(maxWidth: .infinity, minHeight: height)
             .background(
-                configuration.isPressed ? t.fill3 : t.fill2,
+                !isEnabled ? t.controlDisabledFill : configuration.isPressed ? t.fill3 : t.fill2,
                 in: RoundedRectangle(cornerRadius: Radius.control, style: .continuous)
             )
             .contentShape(Rectangle())
@@ -57,10 +57,10 @@ public struct DangerButtonStyle: ButtonStyle {
     public func makeBody(configuration: Configuration) -> some View {
         configuration.label
             .font(HermesFont.calloutStrong)
-            .foregroundStyle(isEnabled ? t.danger : t.danger.opacity(0.45))
+            .foregroundStyle(isEnabled ? t.danger : t.controlDisabledInk)
             .frame(maxWidth: .infinity, minHeight: height)
             .background(
-                t.dangerFill.opacity(configuration.isPressed ? 1.4 : 1),
+                isEnabled ? t.dangerFill.opacity(configuration.isPressed ? 1.4 : 1) : t.controlDisabledFill,
                 in: RoundedRectangle(cornerRadius: Radius.control, style: .continuous)
             )
             .contentShape(Rectangle())
@@ -82,6 +82,118 @@ public struct IconButtonStyle: ButtonStyle {
                 in: RoundedRectangle(cornerRadius: Radius.control, style: .continuous)
             )
             .contentShape(Rectangle())
+    }
+}
+
+// MARK: - Top bar
+
+extension View {
+    /// The one top bar: every pushed screen and every sheet with a navigation bar wears the conversation's own (`chatGlassNavigationBar()` and `chatGlassTopPlane()` in `ChatChrome.swift`), so a change to the conversation's bar is a change to every bar.
+    ///
+    /// On iOS 26 the bar paints nothing and the screen's scroll view draws the system's soft scroll-edge effect under the glass Back button; below 26 the app's frosted top plane does that job, exactly as on the conversation. It replaces an opaque `t.canvas` bar that eighteen screens painted under the iOS 26 glass Back button, which threw a grey halo on it and made a second bar system beside the conversation's. The screen's own content stays opaque: only the bar is chrome, and words under it are words already scrolled out of reading position, the same contract as the conversation's.
+    ///
+    /// Apply it to the screen's outermost content, outside any top `safeAreaInset`, so the plane below iOS 26 ends where the bar ends.
+    func hermesTopBar() -> some View {
+        chatGlassNavigationBar()
+            .chatGlassTopPlane()
+    }
+}
+
+// MARK: - Empty and load-failure states
+
+/// Whether a load failure offers "Try again".
+///
+/// Only when there is a backend the retry could reach: with none configured it is an action that cannot succeed, and offering it made the screen read as broken rather than as waiting for a connection.
+public enum LoadFailureRecovery {
+    public static func offersRetry(hasBackend: Bool) -> Bool {
+        hasBackend
+    }
+
+    /// What a panel says in place of the transport's error when there is no backend to ask.
+    public static let noBackendMessage = "Connect a backend to load this."
+}
+
+/// The one empty or load-failure state: a glyph, a title, a line of explanation and at most one action, centred in whatever space the screen gives it and standing on the screen's own canvas from edge to edge.
+///
+/// It replaces a block the backend-backed screens each drew for themselves: a heading, a grey line and a half-width "Try again" pinned to the top-left corner with the rest of the screen empty, and on Capabilities centred in a frame that stopped short of the screen's edges, so dark mode showed black above and below it. Content, not chrome: opaque, never glass.
+///
+/// It takes all the space it is offered, so mount it where the screen has a height to give (beside a `ScrollView`, not inside one, or under `containerRelativeFrame(.vertical)`).
+public struct StatePanel: View {
+    @Environment(\.hermes) private var t
+
+    let symbol: String
+    let title: String
+    let message: String?
+    let actionTitle: String?
+    let action: (() -> Void)?
+
+    public init(
+        symbol: String,
+        title: String,
+        message: String? = nil,
+        actionTitle: String? = nil,
+        action: (() -> Void)? = nil
+    ) {
+        self.symbol = symbol
+        self.title = title
+        self.message = message
+        self.actionTitle = actionTitle
+        self.action = action
+    }
+
+    /// The disc the glyph sits in: one hit target across, so the panel's mark is the same size as every other round control in the app.
+    static let glyphDisc: CGFloat = Hit.min
+
+    /// The panel's text column: wide enough for a two-line explanation, narrow enough that it reads as a note rather than as a page.
+    static let columnWidth: CGFloat = 320
+
+    public var body: some View {
+        VStack(spacing: Space.s4) {
+            Image(systemName: symbol)
+                .font(HermesFont.heading)
+                .foregroundStyle(t.text3)
+                .frame(width: Self.glyphDisc, height: Self.glyphDisc)
+                .background(t.fill1, in: Circle())
+                .padding(.bottom, Space.s2)
+                .accessibilityHidden(true)
+            Text(title)
+                .font(HermesFont.heading)
+                .foregroundStyle(t.text1)
+                .multilineTextAlignment(.center)
+                .fixedSize(horizontal: false, vertical: true)
+            if let message, !message.isEmpty {
+                Text(message)
+                    .font(HermesFont.subhead)
+                    .foregroundStyle(t.text3)
+                    .multilineTextAlignment(.center)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            if let actionTitle, let action {
+                Button(actionTitle, action: action)
+                    .buttonStyle(SecondaryButtonStyle())
+                    .frame(maxWidth: 220)
+                    .padding(.top, Space.s4)
+            }
+        }
+        .frame(maxWidth: Self.columnWidth)
+        .padding(.horizontal, Space.s8)
+        .padding(.vertical, Space.s10)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(t.canvas)
+        .accessibilityElement(children: .contain)
+    }
+}
+
+extension StatePanel {
+    /// A screen's failed load: the reason and Try again while there is a backend to ask, and with none a line saying to connect one, with no retry that could only fail again.
+    static func loadFailure(title: String, error: String, hasBackend: Bool, retry: @escaping () -> Void) -> StatePanel {
+        StatePanel(
+            symbol: "exclamationmark.triangle",
+            title: title,
+            message: hasBackend ? error : LoadFailureRecovery.noBackendMessage,
+            actionTitle: "Try again",
+            action: LoadFailureRecovery.offersRetry(hasBackend: hasBackend) ? retry : nil
+        )
     }
 }
 
@@ -187,17 +299,19 @@ public struct HoldToConfirmButton: View {
 
 // MARK: - Rows
 
-/// Plain row, 48 pt minimum: flush left, no per-row background, one bottom hairline, never a card or a rounded group.
+/// Plain row, 48 pt minimum: flush left, no per-row background, never a card or a rounded group, and no rule of its own.
+///
+/// The design system draws one hairline per group boundary and never one between every settings row (`hairline()` in `HermesType.swift`), so a row is unruled unless its caller asks; a rule under every row by default made every list read as a ruled form.
 public struct FlatRow<Leading: View, Trailing: View>: View {
     @Environment(\.hermes) private var t
 
-    var showsHairline: Bool = true
+    var showsHairline: Bool = false
     var isPressed: Bool = false
     @ViewBuilder let leading: () -> Leading
     @ViewBuilder let trailing: () -> Trailing
 
     public init(
-        showsHairline: Bool = true,
+        showsHairline: Bool = false,
         isPressed: Bool = false,
         @ViewBuilder leading: @escaping () -> Leading,
         @ViewBuilder trailing: @escaping () -> Trailing

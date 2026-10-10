@@ -126,14 +126,14 @@ struct SettingsView: View {
         .background(t.canvas)
         .navigationTitle("Settings")
         .navigationBarTitleDisplayMode(.inline)
-        .toolbarBackground(t.canvas, for: .navigationBar)
+        .hermesTopBar()
         .task { await store.loadIfNeeded() }
     }
 
     @ViewBuilder
     private func sectionView(_ section: SettingsRootSection, isFirst: Bool) -> some View {
         SectionHeader(section.title, note: section.note)
-            .padding(.top, isFirst ? 0 : Space.s8)
+            .padding(.top, isFirst ? Space.settingsTop : Space.s8)
 
         ForEach(section.rows) { row in
             valueRow(row, isEnabled: section.isEnabled)
@@ -173,7 +173,8 @@ struct SettingsView: View {
             case .voice: return voiceValue
             case .notifications: return notificationsValue
             case .about: return aboutValue
-            default: return ""
+            // Reached from the Chat screen, never from this root. Named rather than defaulted (BUG-146), so a new settings screen is a compile error here instead of a row with a blank value.
+            case .transcript, .composerActions: return ""
             }
         // Command Center and Diagnostics are screens, not settings: neither has one value worth naming on the way in.
         default:
@@ -267,33 +268,45 @@ struct SettingsView: View {
         return "v\(version)"
     }
 
-    /// The Value row kind: label · value · chevron, a disabled one keeping both and dropping to the opacity a disabled `PrimaryButtonStyle` label takes.
     private func valueRow(_ row: SettingsRootRow, isEnabled: Bool) -> some View {
         let value = summary(for: row.destination)
         return Button {
             path.append(row.destination)
         } label: {
-            FlatRow {
-                Text(row.label)
-                    .font(HermesFont.callout)
-                    .foregroundStyle(t.text1)
-            } trailing: {
-                HStack(spacing: Space.s3) {
-                    Text(value)
-                        .font(HermesFont.subhead)
-                        .foregroundStyle(t.text3)
-                        .lineLimit(1)
-                        .truncationMode(.middle)
-                    Image(systemName: "chevron.right")
-                        .font(.system(size: 12, weight: .semibold))
-                        .foregroundStyle(t.text4)
-                }
-                .frame(maxWidth: 190, alignment: .trailing)
-            }
+            SettingsValueRowLabel(label: row.label, value: value, isEnabled: isEnabled)
         }
         .buttonStyle(.plain)
         .disabled(!isEnabled)
-        .opacity(isEnabled ? 1 : 0.45)
         .accessibilityLabel("\(row.label): \(value)")
+    }
+}
+
+/// The Value row kind on the Settings root: label · value · chevron. Drawn apart from the button that carries it so a test can render one without an `AppModel`.
+struct SettingsValueRowLabel: View {
+    @Environment(\.hermes) private var t
+
+    let label: String
+    let value: String
+    /// A disabled row keeps both texts and drops its label to `controlDisabledInk`, the rung every disabled control's words take. It used to fade the whole row to 45 %, which put the label at 2.6:1 in light and the `text3` value under 2:1; the row names a screen the reader is being taught exists, so it stays readable.
+    let isEnabled: Bool
+
+    var body: some View {
+        FlatRow {
+            Text(label)
+                .font(HermesFont.callout)
+                .foregroundStyle(isEnabled ? t.text1 : t.controlDisabledInk)
+        } trailing: {
+            HStack(spacing: Space.s3) {
+                Text(value)
+                    .font(HermesFont.subhead)
+                    .foregroundStyle(t.text3)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                Image(systemName: "chevron.right")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(t.text4)
+            }
+            .frame(maxWidth: 190, alignment: .trailing)
+        }
     }
 }

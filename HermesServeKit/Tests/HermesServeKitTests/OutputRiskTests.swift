@@ -48,20 +48,22 @@ final class OutputRiskTests: XCTestCase {
         XCTAssertTrue(readFile.hasOutputRisk, "an empty findings list must not drop the whole event")
     }
 
-    /// That same `read_file` card proves the correlation fix: it was opened by
-    /// a `tool.start` with **no** `tool_id`, so it holds a synthetic
-    /// `live-tool:` id that the risk event's real `call_9` can never match.
-    /// Exact-id-only correlation dropped this silently.
+    /// An ID-less start must accept the first real ID from its risk signal,
+    /// without replacing the visible card or losing the warning.
     func testRiskCorrelatesByNameWhenTheCardHasASyntheticID() throws {
-        let state = try runFixture()
-        let readFile = try tool(state, named: "read_file")
-
-        XCTAssertTrue(
-            readFile.id.hasPrefix("live-tool:"),
-            "precondition: a tool.start with no id gets a synthetic one"
-        )
-        XCTAssertNotEqual(readFile.id, "call_9")
-        XCTAssertEqual(readFile.outputRisk, "medium", "the band still found its card by name")
+        let engine = TurnEngine()
+        let events = try Fixtures.events("tool-output-risk")
+        let startIndex = try XCTUnwrap(events.firstIndex {
+            $0.type == "tool.start" && $0.payload["name"]?.stringValue == "read_file"
+        })
+        engine.apply(events[startIndex])
+        let before = try XCTUnwrap(engine.state(for: session).entries.first)
+        XCTAssertTrue(before.tool?.id.hasPrefix("live-tool:") == true)
+        engine.apply(events[startIndex + 1])
+        let after = try XCTUnwrap(engine.state(for: session).entries.first)
+        XCTAssertEqual(after.id, before.id, "the visible card identity stays stable")
+        XCTAssertEqual(after.tool?.id, "call_9", "later signals can now correlate exactly")
+        XCTAssertEqual(after.tool?.outputRisk, "medium", "the band still found its card by name")
     }
 
     /// With tool progress off there is no `tool.start`, so the risk event

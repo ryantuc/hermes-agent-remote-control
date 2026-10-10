@@ -101,6 +101,31 @@ final class BotsModel {
         }
     }
 
+    // MARK: - Backend switch
+
+    /// Forget everything the backend being left said, so the roster shows its pre-first-load state rather than one machine's bots under another machine's name (BUG-143); called by `AppModel.teardown` when the conversations go too.
+    ///
+    /// The durable pins and watermarks stay: they are keyed by the backend row already.
+    func reset() {
+        backendGeneration &+= 1
+        // Detached rather than awaited: its answer is dropped by the generation check, and the next refresh must not join it.
+        refreshTask = nil
+        bots = []
+        isLoading = false
+        error = nil
+        hasLoadedOnce = false
+        botModeProtocol = nil
+        hasDesktopGroups = false
+        serverPinHints = [:]
+        avatarCache = [:]
+        titleLookupMisses = []
+        rosterMembership = []
+        watchedCompletions = [:]
+    }
+
+    /// Bumped by `reset()`; a roster load, pin seed or avatar fetch that crosses a reset drops its result.
+    @ObservationIgnored private var backendGeneration = 0
+
     // MARK: - Roster load
 
     /// Reload the roster, single-flighted because the poll, the post-open refresh and a foreground return routinely overlap.
@@ -112,7 +137,8 @@ final class BotsModel {
         let task = Task { await self.performRefresh() }
         refreshTask = task
         await task.value
-        refreshTask = nil
+        // Only our own: a backend switch detaches the task it superseded, and the refresh started after it must stay single-flighted.
+        if refreshTask == task { refreshTask = nil }
     }
 
     private func performRefresh() async {
@@ -121,20 +147,27 @@ final class BotsModel {
             hasLoadedOnce = true
             return
         }
+        let generation = backendGeneration
         // The spinner is for a roster with nothing to show; a poll over a populated list must not flash one every five seconds.
         isLoading = bots.isEmpty
-        defer { isLoading = false }
+        defer { if generation == backendGeneration { isLoading = false } }
 
         let backend = app.activeProfileID
+        // Phone time, compared only with other phone times: it decides whether this answer can already include a turn the user watched finish.
+        let startedAt = Date()
         let result: ProfilesListResult
         do {
-            // On an older backend the pins are what make hidden Bot Chats visible at all, because `last_session` is built from a listing that excludes hidden rows; a newer one resolves by title and discards them (BUG-113).
-            result = try await profilesAPI.list(preferredSessionIDs: store.pins(backend: backend))
+            // The pins stay on the device: every supported backend resolves the Bot Chat by title into `canonical_session` (BUG-113) and rejects `preferred_session_ids` with 4000.
+            result = try await profilesAPI.list()
         } catch {
+            // A failure from the backend that was left is not the next backend's error line.
+            guard generation == backendGeneration else { return }
             self.error = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
             hasLoadedOnce = true
             return
         }
+        // A roster that set out before a backend switch is the previous machine's roster (BUG-143).
+        guard generation == backendGeneration else { return }
         error = nil
         botModeProtocol = result.botModeProtocol
 
@@ -142,6 +175,15 @@ final class BotsModel {
         var rows: [Bot] = []
         var hints: [String: String] = [:]
         var unpinned: [String] = []
+        let previousHasAvatar = Dictionary(bots.map { ($0.profile, $0.hasAvatar) }, uniquingKeysWith: { first, _ in first })
+        // BUG-146: derived from this answer alone, so a roster that stops carrying the default profile stops claiming its groups.
+        hasDesktopGroups = result.profiles.first(where: \.isDefault).map { Self.hasGroups(uiMeta: $0.uiMeta) } ?? false
+        // A profile that left and came back may be a different bot under the same name, so a membership change forgets every remembered miss (BUG-082).
+        let membership = Set(result.profiles.map(\.name))
+        if membership != rosterMembership {
+            rosterMembership = membership
+            titleLookupMisses = []
+        }
 
         for profile in result.profiles {
             let name = profile.name
@@ -158,7 +200,17 @@ final class BotsModel {
             let lastActive = max(preferred?.lastActive ?? 0, last?.lastActive ?? 0)
             let preview = firstNonEmpty(preferred?.preview, last?.preview, profile.description)
 
-            if store.pin(backend: backend, profile: name) == nil { unpinned.append(name) }
+            // BUG-082: `.gone` is the backend's own title lookup saying there is no Bot Chat, so asking again could only repeat it; a miss the phone already heard is not re-asked every poll either.
+            if store.pin(backend: backend, profile: name) == nil,
+               !profile.preferredSession.isResolvedMissing,
+               !titleLookupMisses.contains(name) {
+                unpinned.append(name)
+            }
+
+            // BUG-083: `has_avatar` changing is the roster's only news of an avatar added, removed or replaced on another client.
+            if let had = previousHasAvatar[name], had != profile.hasAvatar {
+                avatarCache.removeValue(forKey: BotChatPins.key(backend: backend, profile: name))
+            }
 
             rows.append(Bot(
                 profile: name,
@@ -176,20 +228,16 @@ final class BotsModel {
                 ),
                 isUnread: false
             ))
-
-            if profile.isDefault {
-                hasDesktopGroups = Self.hasGroups(uiMeta: profile.uiMeta)
-            }
         }
 
         serverPinHints = hints
         bots = rows
-            .map { applyUnread($0, backend: backend) }
+            .map { applyUnread($0, backend: backend, pollStartedAt: startedAt) }
             .sorted { $0.lastActive > $1.lastActive }
         hasLoadedOnce = true
 
-        // One title lookup per unpinned profile seeds the pin so the next poll carries a `preferred_session`; best-effort, and it must never become the roster's error line.
-        await seedPins(for: unpinned, backend: backend)
+        // One title lookup per unpinned profile whose Bot Chat the backend did not resolve itself; the pin it seeds is device-side only, and best-effort, so it must never become the roster's error line.
+        await seedPins(for: unpinned, backend: backend, generation: generation)
     }
 
     /// Three signals, because no event names a session for a client that is not attached to it; only the first is exact, and the two recency windows are generous on purpose.
@@ -210,14 +258,17 @@ final class BotsModel {
     static let workerActivityWindow: Double = 150
 
     /// Unread is `lastActive > watermark`; watermarks are seeded on the first sighting, which keeps a backend full of months-old bot chats from opening as a wall of unread dots.
-    private func applyUnread(_ bot: Bot, backend: UUID?) -> Bot {
+    ///
+    /// Every value written here is a server `lastActive`, never the phone's clock (BUG-094), so the comparison stays in one clock domain whatever the skew between the two machines.
+    private func applyUnread(_ bot: Bot, backend: UUID?, pollStartedAt: Date) -> Bot {
         var bot = bot
         guard let watermark = store.watermark(backend: backend, profile: bot.profile) else {
             store.setWatermark(bot.lastActive, backend: backend, profile: bot.profile)
+            watchedCompletions[bot.profile] = nil
             bot.isUnread = false
             return bot
         }
-        if onScreenProfiles.contains(bot.profile) {
+        if onScreenProfiles.contains(bot.profile) || consumeWatchedCompletion(bot.profile, pollStartedAt: pollStartedAt) {
             if bot.lastActive > watermark {
                 store.setWatermark(bot.lastActive, backend: backend, profile: bot.profile)
             }
@@ -228,19 +279,29 @@ final class BotsModel {
         return bot
     }
 
-    private func seedPins(for profiles: [String], backend: UUID?) async {
+    private func seedPins(for profiles: [String], backend: UUID?, generation: Int) async {
         guard let sessionAPI = app.sessionAPI, !profiles.isEmpty else { return }
         for profile in profiles {
-            guard !Task.isCancelled else { return }
+            guard !Task.isCancelled, generation == backendGeneration else { return }
             guard store.pin(backend: backend, profile: profile) == nil else { continue }
             let match = try? await sessionAPI.lookupByTitle(
                 Self.canonicalChatTitle,
                 profile: Self.wireProfile(for: profile)
             )
-            guard let match, match.title == Self.canonicalChatTitle, !match.id.isEmpty else { continue }
+            guard generation == backendGeneration else { return }
+            guard let match, match.title == Self.canonicalChatTitle, !match.id.isEmpty else {
+                // Remembered, failures included, until the roster's membership changes or the backend does: a missing pin costs nothing the resolver cannot recover on open, and an unbounded retry costs a round trip per bot per poll (BUG-082).
+                titleLookupMisses.insert(profile)
+                continue
+            }
             store.setPin(match.id, backend: backend, profile: profile)
         }
     }
+
+    /// Profiles whose seeding lookup was answered with no Bot Chat; not asked again until the roster's membership changes or the backend is switched (BUG-082).
+    private var titleLookupMisses: Set<String> = []
+    /// The profile names of the last roster that loaded, so a membership change can clear `titleLookupMisses`.
+    private var rosterMembership: Set<String> = []
 
     private func firstNonEmpty(_ candidates: String?...) -> String {
         for candidate in candidates {
@@ -264,9 +325,12 @@ final class BotsModel {
         let key = BotChatPins.key(backend: app.activeProfileID, profile: profile)
         if let cached = avatarCache[key] { return cached.data }
         guard let profilesAPI = app.profilesAPI else { return nil }
+        let generation = backendGeneration
         do {
-            // `{found: false}` decodes to nil and is a real answer, so it is cached; a thrown failure is not, and `try?` would flatten the two into the same nil.
+            // `{found: false}` decodes to nil and is a real answer, so it is cached until the roster's `has_avatar` changes (BUG-083); a thrown failure is not, and `try?` would flatten the two into the same nil.
             let asset = try await profilesAPI.getAsset(profile: profile)
+            // An asset fetched before a backend switch is the previous machine's face.
+            guard generation == backendGeneration else { return nil }
             avatarCache[key] = CachedAvatar(data: asset?.data)
             return asset?.data
         } catch {
@@ -283,18 +347,45 @@ final class BotsModel {
     private(set) var onScreenProfiles: Set<String> = []
 
     func setOnScreenRouteKeys(_ keys: Set<String>) {
-        onScreenProfiles = Set(keys.compactMap { key in
+        let next = Set(keys.compactMap { key in
             key.hasPrefix("bot:") ? String(key.dropFirst(4)) : nil
         })
+        let now = Date()
+        for profile in onScreenProfiles.subtracting(next) where watchedCompletions[profile] != nil {
+            watchedCompletions[profile]?.leftAt = now
+        }
+        onScreenProfiles = next
     }
 
-    /// A turn finished on a bot chat this phone holds; if its thread is on screen the user is watching it arrive, so the watermark moves with it.
+    /// A turn finished on a bot chat this phone holds; if its thread is on screen the user is watching it arrive, so it is read.
+    ///
+    /// BUG-094: nothing on `message.complete` says when the server finished it, and stamping the phone's clock compared it against server times — a phone running ahead hid the next real message, one running behind lit a dot on the reply just read. So the watermark is not written here at all: the first roster poll after this moment carries the turn's server `lastActive`, and `applyUnread` adopts that.
     func noteBotTurnCompleted(profile: String) {
         guard onScreenProfiles.contains(profile) else { return }
-        store.setWatermark(Date().timeIntervalSince1970, backend: app.activeProfileID, profile: profile)
+        watchedCompletions[profile] = WatchedCompletion(completedAt: Date(), leftAt: nil)
         if let index = bots.firstIndex(where: { $0.profile == profile }) {
             bots[index].isUnread = false
         }
+    }
+
+    /// A turn the user watched finish, waiting for a poll that can carry its server time. Both dates are the phone's and are compared only with each other.
+    private struct WatchedCompletion {
+        let completedAt: Date
+        /// When the thread left the screen; nil while it is still up.
+        var leftAt: Date?
+    }
+
+    private var watchedCompletions: [String: WatchedCompletion] = [:]
+
+    /// How long after leaving a thread the next poll still counts as having been watched. Leaving a bot thread lands on the roster, whose poll starts at once, so this only matters when that first poll is late — a roster shown while the socket is still reconnecting — and a reply the user watched lighting up as unread is the worse error there.
+    static let watchedCompletionGrace: TimeInterval = 60
+
+    /// Whether this poll's answer for `profile` is a turn the user watched finish, consuming the record when it is. A poll that set out before the turn finished cannot carry it, so the record waits for the next one.
+    private func consumeWatchedCompletion(_ profile: String, pollStartedAt: Date) -> Bool {
+        guard let watched = watchedCompletions[profile], watched.completedAt <= pollStartedAt else { return false }
+        watchedCompletions[profile] = nil
+        guard let leftAt = watched.leftAt else { return true }
+        return pollStartedAt.timeIntervalSince(leftAt) <= Self.watchedCompletionGrace
     }
 
     // MARK: - Unread

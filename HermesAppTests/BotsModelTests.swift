@@ -203,26 +203,33 @@ final class BotsModelTests: XCTestCase {
         await harness.tearDown()
     }
 
-    func testPreferredSessionIDsCarryEveryPinForThisBackend() async throws {
+    /// Current backends declare
+    /// `profiles.list` params as `include_sessions` + `profile` only and answers any other key with
+    /// JSON-RPC 4000 before the handler runs, so a roster refresh that carries the pins never loads.
+    /// Pins stay on the device; they must not reach this call.
+    func testRosterRefreshWithPinsSendsOnlyTheDeclaredParams() async throws {
         let harness = await AppHarness.make()
         try await harness.openSocket()
         harness.app.bots.store.setPin("pin-a", backend: harness.profileID, profile: "scout")
         harness.app.bots.store.setPin("pin-b", backend: harness.profileID, profile: "archivist")
-        // Another machine's pin for the same bot name. It must never ride this
-        // backend's call — a session id only means something on the state.db
-        // that minted it.
         harness.app.bots.store.setPin("pin-elsewhere", backend: UUID(), profile: "scout")
 
         await stubRoster(harness, [])
         await harness.app.bots.refresh()
 
-        // `.last`, not `.first`: opening the socket already ran one roster
-        // refresh, and that one legitimately carried no pins.
+        // `.last`, not `.first`: opening the socket already ran one roster refresh, before any pin existed.
         let call = await harness.backend.calls(to: "profiles.list").last
-        let sent = call?.params["preferred_session_ids"]?.objectValue ?? [:]
-        XCTAssertEqual(sent["scout"]?.coercedString, "pin-a")
-        XCTAssertEqual(sent["archivist"]?.coercedString, "pin-b")
-        XCTAssertEqual(sent.count, 2, "pins are per backend connection and must not leak across one")
+        let keys = Set((call?.params.objectValue ?? [:]).keys)
+        XCTAssertNil(
+            call?.params["preferred_session_ids"],
+            "the backend rejects preferred_session_ids with 4000 and the Bots roster never loads"
+        )
+        XCTAssertTrue(
+            keys.isSubset(of: ["include_sessions", "profile"]),
+            "profiles.list may carry only its declared params; sent \(keys.sorted())"
+        )
+        XCTAssertEqual(call?.params["include_sessions"]?.coercedBool, true)
+        XCTAssertNotNil(harness.app.bots.store.pin(backend: harness.profileID, profile: "scout"), "the pins themselves are kept")
 
         await harness.tearDown()
     }

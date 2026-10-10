@@ -92,6 +92,19 @@ struct ToolCardView: View {
             }
         }
 
+        /// The SF Symbol a card draws for the family. Typed characters came out at mixed optical sizes and weights, and the todo tool's emoji drew as a missing-glyph box in the monospaced header font.
+        var symbol: String {
+            switch self {
+            case .terminal: return "terminal"
+            case .file: return "doc.text"
+            case .edit: return "pencil"
+            case .search: return "magnifyingglass"
+            case .browser: return "globe"
+            case .todo: return "checklist"
+            case .other: return "hammer"
+            }
+        }
+
         init(toolName: String) {
             let name = toolName.lowercased()
             // BUG-145: whole-name match, tested before every substring bucket
@@ -106,11 +119,35 @@ struct ToolCardView: View {
                 self = .file
             } else if ["search", "grep", "find", "query"].contains(where: name.contains) {
                 self = .search
-            } else if ["browser", "browse", "navigate", "screenshot", "web"].contains(where: name.contains) {
+            } else if ["browser", "browse", "navigate", "screenshot"].contains(where: name.contains)
+                        || Self.words(in: toolName).contains("web") {
+                // BUG-146: `web` is a word, not a substring, so `webhook_send` is not a browser tool.
                 self = .browser
             } else {
                 self = .other
             }
+        }
+
+        /// A tool name's words, lowercased: split on anything that is not a letter or digit and where a lowercase letter or digit meets an uppercase one, so `web_extract`, `web-fetch` and `fetchWebPage` each contain `web`.
+        static func words(in toolName: String) -> [String] {
+            var words: [String] = []
+            var current = ""
+            var previous: Character?
+            for character in toolName {
+                if !(character.isLetter || character.isNumber) {
+                    if !current.isEmpty { words.append(current.lowercased()) }
+                    current = ""
+                } else {
+                    if character.isUppercase, let previous, previous.isLowercase || previous.isNumber, !current.isEmpty {
+                        words.append(current.lowercased())
+                        current = ""
+                    }
+                    current.append(character)
+                }
+                previous = character
+            }
+            if !current.isEmpty { words.append(current.lowercased()) }
+            return words
         }
     }
 
@@ -127,11 +164,7 @@ struct ToolCardView: View {
             HapticFeedback.selection()
         } label: {
             HStack(spacing: Space.s4) {
-                Text(verbatim: family.glyph)
-                    .font(HermesFont.codeStrong)
-                    .foregroundStyle(t.text3)
-                    .frame(width: 16)
-                    .accessibilityHidden(true)
+                ToolFamilyIcon(family: family)
 
                 Text(activity.name.isEmpty ? "Preparing…" : activity.name)
                     .font(HermesFont.codeStrong)
@@ -302,7 +335,7 @@ struct ToolCardView: View {
             }
         }
         if !activity.resultText.isEmpty {
-            zone(activity.isError ? "Output" : "Output") {
+            zone("Output") {
                 CodeScroller(text: Self.strippingANSI(DisplayRedaction.toolOutput(activity.resultText)))
             }
         }
@@ -482,6 +515,11 @@ struct ToolGroupCard: View {
         activities.contains { !$0.resultText.isEmpty }
     }
 
+    /// The danger stroke waits until the group has settled: a group whose header still reads "running" is not a failure yet, even when a finished member failed.
+    static func tone(anyRunning: Bool, anyFailed: Bool) -> EnclosureModifier.Tone {
+        anyFailed && !anyRunning ? .danger : .neutral
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: Space.s3) {
             Button {
@@ -491,11 +529,7 @@ struct ToolGroupCard: View {
                 HapticFeedback.selection()
             } label: {
                 HStack(spacing: Space.s4) {
-                    Text(verbatim: ToolCardView.Family(toolName: name).glyph)
-                        .font(HermesFont.codeStrong)
-                        .foregroundStyle(t.text3)
-                        .frame(width: 16)
-                        .accessibilityHidden(true)
+                    ToolFamilyIcon(family: ToolCardView.Family(toolName: name))
                     Text(name)
                         .font(HermesFont.codeStrong)
                         .foregroundStyle(t.text1)
@@ -531,7 +565,7 @@ struct ToolGroupCard: View {
                 .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
-            .enclosure(anyFailed ? .danger : .neutral)
+            .enclosure(Self.tone(anyRunning: anyRunning, anyFailed: anyFailed))
             .accessibilityLabel("\(activities.count) \(name) calls")
             .accessibilityHint(isExpanded ? "Collapse the group" : "Expand the group")
             .contextMenu {
@@ -648,5 +682,22 @@ struct PulsingDot: View {
                 withAnimation(Motion.loop) { isUp = true }
             }
             .accessibilityLabel("Running")
+    }
+}
+
+/// A tool family's mark in a card header's leading slot. The symbol and its slot grow with the header's text size, so the mark never clips at larger sizes the way a fixed 16 pt box did.
+struct ToolFamilyIcon: View {
+    @Environment(\.hermes) private var t
+    @ScaledMetric(relativeTo: .footnote) private var size: CGFloat = 12
+    @ScaledMetric(relativeTo: .footnote) private var slot: CGFloat = 16
+
+    let family: ToolCardView.Family
+
+    var body: some View {
+        Image(systemName: family.symbol)
+            .font(.system(size: size, weight: .semibold))
+            .foregroundStyle(t.text3)
+            .frame(width: slot)
+            .accessibilityHidden(true)
     }
 }

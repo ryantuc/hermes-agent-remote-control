@@ -15,8 +15,8 @@ actor DemoBackend {
     /// The runtime session id every canned answer mints; the demo never has two sessions in flight.
     static let runtimeSessionID = "demo-runtime-1"
     static let storedSessionID = "demo-session-1"
-    /// The version the demo claims, labelled rather than a plausible number so the Backend screen cannot read as a real server.
-    static let serverVersion = "demo"
+    /// No version: the demo is not a release of anything, and every surface that prints a version puts a "v" in front of it. The surfaces that check for an empty version print none; About names the demo instead.
+    static let serverVersion = ""
 
     /// Divides every pause in the script: always 1 in the app, raised by a test so the replay finishes in milliseconds.
     private let playbackSpeed: Double
@@ -40,8 +40,6 @@ actor DemoBackend {
 
     // MARK: Replay bookkeeping
 
-    /// How many prompts the demo has been given; BUG-103: it selects nothing, because the script is keyed off the prompt that arrived.
-    private(set) var submissionCount = 0
     /// How many scripted turns have finished replaying.
     private(set) var completedTurns = 0
     /// Every prompt whose replay has finished, so a waiter can ask about its own turn rather than a total anyone can move.
@@ -139,7 +137,6 @@ actor DemoBackend {
         }
         // The reply goes out first and the turn replays on its own task, because the ack arrives in milliseconds and the turn takes seconds.
         if method == "prompt.submit" {
-            submissionCount += 1
             // BUG-103: the prompt that arrived selects the turn, so an unscripted message gets the canned answer without consuming a scripted slot.
             let text = promptText(from: params ?? .null)
             startReplay(of: DemoScript.turn(forPrompt: text), key: text)
@@ -185,7 +182,8 @@ actor DemoBackend {
         for queued in dropped { markTurnComplete(prompt: queued.key) }
     }
 
-    private func answer(method: String, params: JSONValue) -> JSONValue {
+    /// The canned reply to one request; internal rather than private so a test can read a reply without standing up a socket.
+    func answer(method: String, params: JSONValue) -> JSONValue {
         switch method {
         case "session.create", "session.activate":
             return .object([
@@ -223,11 +221,56 @@ actor DemoBackend {
             return .object(["sessions": .array([])])
         case "profiles.list":
             return .object(["profiles": .array([])])
+        case "commands.catalog":
+            // FEAT-020: the slash list is one of the surfaces the demo is there to show. The real catalog's `pairs` shape, and only commands HARC runs on its own (`SlashCommandSupport.localCommands`), so nothing typed in the demo reaches a method the demo cannot answer.
+            return .object([
+                "pairs": .array(Self.slashCommands.map { .array([.string($0.name), .string($0.description)]) }),
+            ])
+        case "complete.slash":
+            return Self.slashCompletion(for: params["text"]?.stringValue ?? "")
+        case "session.status":
+            // What `/status` prints: the real reply's `output` shape, with the demo saying what it is.
+            return .object(["output": .string(Self.statusOutput)])
         default:
             // A non-answer, which is what a gateway without the method looks like.
             return .object([:])
         }
     }
+
+    // MARK: Slash commands
+
+    /// The commands the demo advertises: the ones HARC runs itself, each with the one line the completion list shows beside it.
+    static let slashCommands: [(name: String, description: String)] = [
+        ("/help", "List the commands this backend offers"),
+        ("/commands", "Same list as /help"),
+        ("/status", "Session, model and workspace"),
+        ("/stop", "Stop the reply that is running"),
+    ]
+
+    /// `complete.slash`: a prefix match over the demo's commands, in the real reply's shape; text that is not a command gets no list, as on a gateway.
+    static func slashCompletion(for text: String) -> JSONValue {
+        guard text.hasPrefix("/"), !text.contains(" ") else {
+            return .object(["items": .array([])])
+        }
+        let typed = text.lowercased()
+        let items: [JSONValue] = slashCommands
+            .filter { $0.name.hasPrefix(typed) }
+            .map { .object([
+                "text": .string($0.name),
+                "display": .string($0.name),
+                "meta": .string($0.description),
+                "kind": .string("command"),
+            ]) }
+        return .object(["items": .array(items), "replace_from": .number(1)])
+    }
+
+    /// `/status` in the demo.
+    static let statusOutput = """
+        Demo status
+        Model: \(DemoScript.modelName)
+        Workspace: \(DemoScript.workingDirectory)
+        Nothing here reaches a backend: connect your own to see its real status.
+        """
 
     // MARK: Replay
 

@@ -71,14 +71,20 @@ enum SubagentTree {
 @MainActor
 struct SubagentStripGroup: View {
     @Environment(\.hermes) private var t
+    /// Optional because the strip is also measured on its own, with no app around it.
+    @Environment(AppModel.self) private var app: AppModel?
 
     let rows: [SubagentRow]
     var hasBlockingPrompt = false
     @State private var showingSheet = false
 
+    /// How often the roster is re-read while agents are working; Desktop's composer uses the same interval.
+    static let refreshInterval: UInt64 = 5_000_000_000
+
     private var running: [SubagentRow] { rows.filter { !$0.isTerminal } }
     /// Every agent has finished; the header lingers until the next `message.start` retires it, as a finished checklist does.
     private var isFinished: Bool { !rows.isEmpty && running.isEmpty }
+    private var sessionID: String { rows.first { !$0.sessionID.isEmpty }?.sessionID ?? "" }
 
     var body: some View {
         header
@@ -86,6 +92,20 @@ struct SubagentStripGroup: View {
             .onChange(of: hasBlockingPrompt) { _, pending in
                 if pending { showingSheet = false }
             }
+            // While agents are drawn as working and the strip is on screen, re-read the roster, so one whose `subagent.complete` never reached this phone settles instead of reading "running" for good.
+            .task(id: running.isEmpty ? "" : sessionID) {
+                await refreshWhileWorking()
+            }
+    }
+
+    private func refreshWhileWorking() async {
+        let sessionID = self.sessionID
+        guard !running.isEmpty, !sessionID.isEmpty, let app else { return }
+        while !Task.isCancelled {
+            try? await Task.sleep(nanoseconds: Self.refreshInterval)
+            guard !Task.isCancelled, let chat = app.chat(runtimeSessionID: sessionID) else { return }
+            guard await chat.subagentRoster.refresh(app: app, sessionID: sessionID) else { return }
+        }
     }
 
     // MARK: Header
@@ -120,7 +140,7 @@ struct SubagentStripGroup: View {
 
 /// The status mark, in the pinned semantic colours and never a derived one.
 @MainActor
-private struct SubagentStateMark: View {
+struct SubagentStateMark: View {
     @Environment(\.hermes) private var t
 
     let state: SubagentRow.State
@@ -141,6 +161,11 @@ private struct SubagentStateMark: View {
             Text(verbatim: "⊘")
                 .font(HermesFont.code)
                 .foregroundStyle(t.text4)
+        case .ended:
+            // Finished, outcome unknown: a quiet check, never the green one that claims success.
+            Image(systemName: "checkmark")
+                .font(.system(size: 11, weight: .bold))
+                .foregroundStyle(t.text4)
         }
     }
 
@@ -150,6 +175,7 @@ private struct SubagentStateMark: View {
         case .completed: return "Done"
         case .failed: return "Failed"
         case .interrupted: return "Interrupted"
+        case .ended: return "Finished"
         }
     }
 }
@@ -157,8 +183,7 @@ private struct SubagentStateMark: View {
 // MARK: - The tree sheet
 
 /// The full delegation tree, showing what the parent session knows about each child: goal, status, elapsed, model, tool count, and the agent's own progress lines.
-/// It cannot show child reply bodies: `subagent.text` is never relayed on the parent session, so the frame does not exist on this wire.
-/// No per-agent steer or interrupt controls either; those RPCs are destructive per-agent actions and belong behind hold-to-confirm rather than on a row inside a strip.
+/// `subagent.text` is never relayed on the parent session, so reply bodies are not here; tapping an agent opens its own page, which reads the end of its live transcript and holds its steer and stop controls, one agent at a time rather than on a row inside the strip.
 @MainActor
 struct SubagentSheet: View {
     @Environment(\.hermes) private var t
@@ -172,6 +197,20 @@ struct SubagentSheet: View {
     private var runningCount: Int { rows.filter { !$0.isTerminal }.count }
 
     var body: some View {
+        NavigationStack {
+            tree
+                .toolbar(.hidden, for: .navigationBar)
+                .navigationDestination(for: String.self) { id in
+                    SubagentDetailView(id: id, rows: rows)
+                }
+        }
+        .presentationDetents([.medium, .large])
+        .presentationDragIndicator(.visible)
+        .presentationCornerRadius(Radius.sheet)
+        .presentationBackground(t.surface)
+    }
+
+    private var tree: some View {
         VStack(alignment: .leading, spacing: Space.s5) {
             VStack(alignment: .leading, spacing: Space.s2) {
                 Text("Agents")
@@ -189,22 +228,22 @@ struct SubagentSheet: View {
                 // Lazy, because 32 agents by 24 stream lines is a real ceiling and rows below the fold cost nothing until they are reached.
                 LazyVStack(alignment: .leading, spacing: 0) {
                     ForEach(flattened, id: \.node.id) { entry in
-                        SubagentDetailRow(row: entry.node.row, level: entry.level)
+                        NavigationLink(value: entry.node.row.id) {
+                            SubagentDetailRow(row: entry.node.row, level: entry.level)
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityHint("Opens what this agent is doing")
                     }
                 }
             }
         }
-        .frame(maxWidth: .infinity, alignment: .leading)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .background(t.surface)
-        .presentationDetents([.medium, .large])
-        .presentationDragIndicator(.visible)
-        .presentationCornerRadius(Radius.sheet)
-        .presentationBackground(t.surface)
     }
 }
 
 @MainActor
-private struct SubagentDetailRow: View {
+struct SubagentDetailRow: View {
     @Environment(\.hermes) private var t
 
     let row: SubagentRow

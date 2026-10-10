@@ -23,6 +23,13 @@ public enum ConfigDocument {
         return result
     }
 
+    /// One partial that sets several paths at once, for sibling keys the backend should receive in the same write (a provider and its model).
+    public static func partial(paths: [(path: String, value: JSONValue)]) -> JSONValue {
+        paths.reduce(.object([:])) { partial, entry in
+            setting(partial, path: entry.path, to: entry.value)
+        }
+    }
+
     /// A copy of `document` with `path` set to `value`, creating intermediate objects as needed and replacing non-object intermediates exactly as the backend's deep-merge would resolve it.
     public static func setting(_ document: JSONValue, path: String, to value: JSONValue) -> JSONValue {
         let components = path.split(separator: ".").map(String.init)

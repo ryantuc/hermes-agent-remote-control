@@ -100,7 +100,7 @@ final class AppModel {
     let log = ConnectionLog()
     let engine = TurnEngine()
 
-    /// The Lock Screen / Dynamic Island roster; `@ObservationIgnored` because no view reads it through this reference, and a `var` because the app test target substitutes a fake.
+    /// The Lock Screen / Dynamic Island roster, and a `var` because the app test target substitutes a fake. `@ObservationIgnored` because the reference itself never changes in the app; Home does read through it (`liveActivities.waiting`, via `waitingKind(for:)`), and that still repaints because `WaitingSessions` is `@Observable` on its own.
     @ObservationIgnored var liveActivities: LiveActivityController = .shared
 
     private(set) var auth: AuthenticationClient?
@@ -169,21 +169,30 @@ final class AppModel {
         !liveActiveIDs.isEmpty
     }
 
-    /// Home's Continue strip: live working sessions first, including ones the REST list has not persisted yet, then the most recent thread.
+    /// Home's Continue strip: one running row, then the most recent thread. The running row is a session waiting on the person holding the phone when there is one (BUG-166), else the most recently active live session, including ones the REST list has not persisted yet.
     func continueRows() -> [SessionSummary] {
         var rows: [SessionSummary] = []
+        // Sorted, because `liveStatuses` is a dictionary and its first value was an arbitrary pick among several live sessions.
         let liveOnly = liveStatuses.values
             .filter(\.isWorking)
+            .sorted { $0.lastActive != $1.lastActive ? $0.lastActive > $1.lastActive : $0.id < $1.id }
             .map(SessionSummary.init(fromLive:))
             .filter { live in !threads.contains(where: { $0.id == live.id }) }
             .filter { !isBotPlumbing($0) }
-        if let running = liveOnly.first ?? threads.first(where: { isLiveWorking($0.id) }) {
+        // The registry decides waiting, not `session.active_list`, which reports an approval-blocked session as `working`; so the waiting row is looked for among every row the strip could show.
+        let waiting = (liveOnly + threads).first { waitingKind(for: $0) != nil }
+        if let running = waiting ?? liveOnly.first ?? threads.first(where: { isLiveWorking($0.id) }) {
             rows.append(running)
         }
         if let recent = threads.first(where: { thread in !rows.contains(where: { $0.id == thread.id }) }) {
             rows.append(recent)
         }
         return rows
+    }
+
+    /// What a Home row's session is waiting on, from the current-request registry (BUG-062 C); the `session.active_list` join is read at call time because that list moves on its own poll.
+    func waitingKind(for session: SessionSummary) -> ApprovalNotifications.PromptKind? {
+        liveActivities.waiting.kind(storedID: session.id, runtimeID: liveStatus(forStoredID: session.id)?.id)
     }
 
     /// The hub drawer list: persisted threads plus working sessions the REST `minMessages: 1` query has not persisted yet.
@@ -222,7 +231,20 @@ final class AppModel {
 
     // MARK: Private
 
-    private var chats: [String: ChatModel] = [:]
+    /// Storage behind `chats`. Every write goes through `chats`' setter, which is what keeps `chatByRuntimeID` from ever answering with a chat that has left the registry.
+    private var storedChats: [String: ChatModel] = [:]
+
+    private var chats: [String: ChatModel] {
+        get { storedChats }
+        set {
+            storedChats = newValue
+            chatByRuntimeID.removeAll(keepingCapacity: true)
+        }
+    }
+
+    /// The flush loop's lookup, so a publish is not a scan of every open chat (BUG-074 leg B). A cache, not a source of truth: a chat's runtime id can change without the registry changing, so every hit is re-checked against the chat itself, and every registry write empties it.
+    @ObservationIgnored private var chatByRuntimeID: [String: ChatModel] = [:]
+
     private var eventPump: Task<Void, Never>?
     private var statePump: Task<Void, Never>?
     private var flushLoop: Task<Void, Never>?
@@ -305,6 +327,17 @@ final class AppModel {
         return new != (try? previous.makeConfiguration())
     }
 
+    /// What names a `state.db`: the machine, as the normalized address the connection is built from, and the Hermes profile scoped on it; nil for an address that does not parse (BUG-142).
+    ///
+    /// Two addresses can reach one machine (LAN and Tailscale), and this key calls them different — the safe direction, since it discards conversations that could have been kept rather than resuming one machine's ids on another.
+    static func sessionNamespace(of profile: BackendProfile) -> String? {
+        guard let configuration = try? profile.makeConfiguration() else { return nil }
+        return configuration.baseURL.absoluteString + "|" + profile.hermesProfile
+    }
+
+    /// The namespace the live connection was built for, so `activate` can refuse to preserve conversations across an edit that moved the active row (BUG-142); `update(_:)` has already overwritten the row by then.
+    @ObservationIgnored private var activeSessionNamespace: String?
+
     func update(_ profile: BackendProfile, credentialsChanged: Bool = false) {
         guard let index = profiles.firstIndex(where: { $0.id == profile.id }) else { return }
         let previous = profiles[index]
@@ -314,7 +347,9 @@ final class AppModel {
         guard Self.requiresReconnect(from: previous, to: profile, credentialsChanged: credentialsChanged)
         else { return }
         // Computed here because `profiles[index]` has already been overwritten above, so `activate` can no longer see the old value.
-        let sameSessionNamespace = previous.hermesProfile == profile.hermesProfile
+        // BUG-142: the address is half of what names a `state.db`; comparing the Hermes profile alone kept a repointed row's conversations and re-resumed them on the new machine.
+        let namespace = Self.sessionNamespace(of: profile)
+        let sameSessionNamespace = namespace != nil && namespace == Self.sessionNamespace(of: previous)
         Task {
             await activate(
                 profileID: profile.id,
@@ -325,8 +360,12 @@ final class AppModel {
     }
 
     func deleteProfile(id: UUID) {
+        let deletedAt = Date()
+        Task { await LiveTranscriptStore.shared.removeBackend(id, at: deletedAt) }
         let removed = profiles.first { $0.id == id }
         profiles.removeAll { $0.id == id }
+        // The hub's expansion set is kept per backend (BUG-143), so it goes with the backend.
+        ProjectGroupModel.forgetExpansion(backendID: id)
         // Keychain slots are namespaced by profile id, so dropping the row alone would orphan them past any reach.
         AuthenticationClient.clearSecrets(profileID: id.uuidString)
         // Cookies are per-host, so this also signs out any other profile on the same host — the safe default when deleting that host's credentials.
@@ -362,10 +401,17 @@ final class AppModel {
             connectionError = "That backend's address is not usable."
             return
         }
-        // Preserving across a switch to a different profile row would resume this backend's session ids against another machine's state.db.
-        let keep = preservingConversations && profileID == activeProfileID
+        // Preserving across a switch to a different profile row would resume this backend's session ids against another machine's state.db, and so would preserving across an edit that moved this row to another machine or scope (BUG-142).
+        let namespace = Self.sessionNamespace(of: profile)
+        let keep = preservingConversations
+            && profileID == activeProfileID
+            && namespace != nil
+            && namespace == activeSessionNamespace
         await teardown(discardingConversations: !keep)
         activeProfileID = profileID
+        activeSessionNamespace = namespace
+        // Before the client exists, so its first line is already attributed to this backend (BUG-143).
+        await log.enterBackend(key: namespace ?? profileID.uuidString, label: profile.displayName)
 
         let auth = AuthenticationClient(
             configuration: configuration,
@@ -457,6 +503,9 @@ final class AppModel {
                 engine.forget(sessionID: sessionID)
                 liveActivities.sessionEvicted(sessionID: sessionID)
             }
+            // BUG-143: the settings document and the Bots roster are this backend's answers too, and would otherwise sit under the next backend's name until it answers — or for good if it never does.
+            settings.reset()
+            bots.reset()
         }
         // BUG-069: cleared on every teardown, rebuild included, or the next backend inherits the previous one's "working" ids until its first successful `active_list`.
         liveActiveIDs = []
@@ -478,6 +527,7 @@ final class AppModel {
         await auth?.logout()
         await teardown()
         // A 401 can provoke a silent re-login between the wipe and the teardown, so wipe again now that nothing holds a writer for this namespace.
+        await LiveTranscriptStore.shared.removeBackend(profileID)
         AuthenticationClient.clearSecrets(profileID: profileID.uuidString)
         if let index = profiles.firstIndex(where: { $0.id == profileID }) {
             var profile = profiles[index]
@@ -534,6 +584,8 @@ final class AppModel {
         await teardown(discardingConversations: false)
         // In memory only, and clearing it is what makes the two states exclusive: while the demo runs there is no active profile for any surface to draw.
         storedActiveProfileID = nil
+        // The demo writes through the same log, and its scripted lines must not read as the real backend's.
+        await log.enterBackend(key: "demo", label: "Demo")
         let speed = max(1, playbackSpeed)
         demoPlaybackSpeed = speed
         let backend = DemoBackend(playbackSpeed: speed)
@@ -800,6 +852,8 @@ final class AppModel {
             sessionMirroring = ready.sessionMirroring
             // The engine compares this against each mirrored frame's `origin` to tell its own turns from another client's.
             engine.setLocalOrigin(ready.origin)
+            engine.setReplayEpoch(event.payload["replay_epoch"]?.coercedString ?? "")
+            engine.setSharedSession(event.payload["shared_session"])
             applyBackendSkin(name: ready.skinName, raw: ready.skin)
 
         case .skinChanged(let name, let skin):
@@ -880,7 +934,7 @@ final class AppModel {
     /// End-of-turn usage carried on `message.complete`, stored on the session's chat so the context ring can read it — end of turn, never on a timer.
     private func applyUsage(_ raw: JSONValue, sessionID: String) {
         guard case .object = raw else { return }
-        chats.values.first { $0.runtimeSessionID == sessionID }?.usage = SessionUsage(json: raw)
+        chat(runtimeSessionID: sessionID)?.usage = SessionUsage(json: raw)
     }
 
     // BUG-017 (C): `thinking_mode` is deliberately never read here — it is a terminal-UI preference the desktop ignores too, the phone owns its own reasoning presentation, and no phone UI could escape the value a backend happened to hold.
@@ -896,10 +950,21 @@ final class AppModel {
         defaultEffort = (try? await configAPI.getValue("reasoning")) ?? ""
     }
 
+    /// A delayed chat task must not save after its backend's conversation registry was retired.
+    func containsChat(_ chat: ChatModel) -> Bool {
+        chats.values.contains { $0 === chat }
+    }
+
+    #if DEBUG
+    /// How many times a runtime-id lookup walked every open chat; a test seam for BUG-074 leg B, ignored by observation because it moves on the flush loop's hot path.
+    @ObservationIgnored private(set) var runtimeChatLookupScans = 0
+    #endif
+
     /// The one funnel between engine state and everything that renders it; a bare `chat.live = engine.state(for:)` tells the Live Activity roster nothing, so its card outlives the turn it was drawn for (BUG-003).
     func publish(sessionID: String) {
-        if let chat = chats.values.first(where: { $0.runtimeSessionID == sessionID }) {
+        if let chat = chat(runtimeSessionID: sessionID) {
             chat.live = engine.state(for: sessionID)
+            chat.saveLiveCheckpoint()
         }
         // Deliberately outside the guard: a cron run has no open chat on this phone but its events still arrive on this socket.
         liveActivities.sessionDidUpdate(sessionID: sessionID)
@@ -1197,8 +1262,21 @@ final class AppModel {
     }
 
     /// The chat holding a given runtime session id; nil for a cron or desktop-started session whose events this device is only watching.
+    ///
+    /// O(1) for a chat found before (BUG-074 leg B); a miss still scans, and is not remembered, because a chat that binds this id next calls `publish` with it straight away and must be found.
     func chat(runtimeSessionID: String) -> ChatModel? {
-        chats.values.first { $0.runtimeSessionID == runtimeSessionID }
+        if let cached = chatByRuntimeID[runtimeSessionID], cached.runtimeSessionID == runtimeSessionID {
+            return cached
+        }
+        #if DEBUG
+        runtimeChatLookupScans += 1
+        #endif
+        guard let found = storedChats.values.first(where: { $0.runtimeSessionID == runtimeSessionID }) else {
+            chatByRuntimeID.removeValue(forKey: runtimeSessionID)
+            return nil
+        }
+        chatByRuntimeID[runtimeSessionID] = found
+        return found
     }
 
     /// Release every cached chat whose route has left the navigation stack, returning how many models went so a caller can log it.
@@ -1317,31 +1395,34 @@ final class AppModel {
 
     /// Called by a chat once it owns a runtime session id, so the event pump can find it.
     func chatDidBind(_ chat: ChatModel, storedSessionID: String?) {
+        // Desktop reads goal, loop, heartbeat and process state when a session opens (`status-stack/index.tsx:173-177`); a new runtime id is that edge here, and a send's ack, which also passes through, is not.
+        chat.sessionControls.noteSessionBound()
+        chat.backgroundProcesses.noteSessionBound()
         guard let storedSessionID, !storedSessionID.isEmpty else { return }
         let key = ThreadRoute.Key.existing(storedSessionID).rawValue
         if chats[key] == nil { chats[key] = chat }
         Task { await refreshThreads(force: true) }
     }
 
-    private func resumeOpenThreads() async {
+    private func resumeOpenThreads(force: Bool = false) async {
         // Join an in-flight pass rather than start a second one: the three callers overlap across the `resumeAfterReconnect` await, and the guard they check is only stamped after it.
         if let task = resumeOpenThreadsTask {
             await task.value
             return
         }
-        let task = Task { await self.performResumeOpenThreads() }
+        let task = Task { await self.performResumeOpenThreads(force: force) }
         resumeOpenThreadsTask = task
         await task.value
         resumeOpenThreadsTask = nil
     }
 
-    private func performResumeOpenThreads() async {
+    private func performResumeOpenThreads(force: Bool) async {
         // One model can be registered under two keys, so resume it only once; and a chat that bound during THIS connection is already live, where a re-resume would rebuild the agent and discard the create's model override.
         var seen = Set<ObjectIdentifier>()
         for chat in chats.values where chat.storedSessionID != nil {
             guard seen.insert(ObjectIdentifier(chat)).inserted else { continue }
-            guard chat.runtimeBoundAt < socketOpenedAt else { continue }
-            await chat.resumeAfterReconnect()
+            guard force || chat.runtimeBoundAt < socketOpenedAt else { continue }
+            await chat.resumeAfterReconnect(force: force)
         }
         publishAll()
     }
@@ -1358,7 +1439,7 @@ final class AppModel {
         await client.wake()
         await refreshThreads(force: true)
         await bots.refresh()
-        await resumeOpenThreads()
+        await resumeOpenThreads(force: true)
     }
 
     func handleBackground() {

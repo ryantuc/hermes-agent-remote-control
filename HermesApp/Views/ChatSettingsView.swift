@@ -8,8 +8,12 @@ struct ChatSettingsView: View {
     var body: some View {
         ScrollView {
             LazyVStack(alignment: .leading, spacing: 0) {
+                SectionHeader("Starting")
+                    .padding(.top, Space.settingsTop)
                 openInRow
                 projectStickinessRow
+                SectionHeader("In a conversation")
+                    .padding(.top, Space.s8)
                 linkRow(
                     label: "Composer actions",
                     value: composerActionsValue,
@@ -21,13 +25,12 @@ struct ChatSettingsView: View {
                     destination: .settingsScreen(.transcript)
                 )
             }
-            .padding(.top, Space.s4)
             .padding(.bottom, Space.s10)
         }
         .background(t.canvas)
         .navigationTitle("Chat")
         .navigationBarTitleDisplayMode(.inline)
-        .toolbarBackground(t.canvas, for: .navigationBar)
+        .hermesTopBar()
     }
 
     // MARK: Open in — the launch mode

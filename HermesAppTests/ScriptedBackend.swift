@@ -32,6 +32,7 @@ actor ScriptedBackend {
     }
 
     private(set) var receivedCalls: [Call] = []
+    private(set) var receivedResponses: [JSONRPCResponse] = []
     /// Runtime session ids this backend has handed out, oldest first. One
     /// `session.create` or `session.resume` mints exactly one.
     private(set) var issuedRuntimeIDs: [String] = []
@@ -233,9 +234,10 @@ actor ScriptedBackend {
             }
             await answer(call, on: transport)
             return .accepted
-        case .response, .event, .unknown:
-            // The client answering a server→client request. Nothing here
-            // issues one; record nothing.
+        case .response(let response):
+            receivedResponses.append(response)
+            return .accepted
+        case .event, .unknown:
             return .accepted
         }
     }
@@ -338,6 +340,15 @@ actor ScriptedBackend {
             "desktop_contract": .number(5),
             "running": .bool(false),
         ])
+    }
+
+    func emitServerRequest(id: String, method: String, sessionID: String, params: [String: JSONValue] = [:]) async {
+        guard let transport = activeTransport else { return }
+        let payload = params.merging(["session_id": .string(sessionID)]) { _, new in new }
+        let frame = JSONValue.object(["jsonrpc": .string("2.0"), "id": .string(id),
+                                      "method": .string(method), "params": .object(payload)])
+        guard let line = try? JSONRPCCodec.encodeLine(frame) else { return }
+        await transport.deliver(line: line)
     }
 
     // MARK: Outbound events

@@ -191,7 +191,6 @@ public struct FullScreenCodeReader: View {
             .background(t.canvas)
             .navigationTitle("Output")
             .navigationBarTitleDisplayMode(.inline)
-            .toolbarBackground(t.canvas, for: .navigationBar)
             .toolbar {
                 ToolbarItem(placement: .topBarLeading) {
                     Button("Done") { dismiss() }.foregroundStyle(t.action)
@@ -219,6 +218,8 @@ public struct FullScreenCodeReader: View {
                 .background(t.canvas)
                 .hairline()
             }
+            // Outside the filter row's inset, so the plane below iOS 26 ends where the bar ends.
+            .hermesTopBar()
         }
     }
 

@@ -1,6 +1,6 @@
 # Third-party notices
 
-HARC bundles no third-party code at run time — it has no package dependencies and links nothing but Apple's own frameworks. What it does carry is material *derived* from another project, and that material comes with an obligation this file discharges.
+HARC bundles no third-party code at run time. It has no package dependencies and links nothing but Apple's own frameworks. What it does carry is material derived from another project, and that material comes with an obligation this file discharges.
 
 ## Hermes Agent
 
@@ -8,11 +8,15 @@ Portions of this project are derived from Hermes Agent (https://github.com/NousR
 
 The derived material is:
 
-- **`HermesApp/Design/DesktopThemePalette.swift`** — the ten built-in theme palettes of the Hermes desktop app, extracted whole from `apps/desktop/src/themes/presets.ts` at revision `de25a6971d8ec8c5f3d0739433f9c6212fc884e0`, together with a Swift port of the `synthLightColors` algorithm from `apps/desktop/src/themes/context.tsx`. The file's own header records the revision and the source files it came from.
-- **`scripts/desktop-themes.json`** — the raw extraction that file is generated from, carrying the same `sourceRevision` and `sourceFiles` record.
-- **`docs/PROTOCOL.md`** — the condensed client contract, written from Hermes Agent's gateway source at v0.19.1 and quoting method names, event names, payload shapes and field semantics from it.
+- `HermesApp/Design/DesktopThemePalette.swift`: the ten built-in theme palettes of the Hermes desktop app, extracted whole from `apps/desktop/src/themes/presets.ts` at revision `de25a6971d8ec8c5f3d0739433f9c6212fc884e0`, together with a Swift port of the `synthLightColors` algorithm from `apps/desktop/src/themes/context.tsx`. The file's own header records the revision and the source files it came from.
+- `scripts/desktop-themes.json`: the raw extraction that file is generated from, carrying the same `sourceRevision` and `sourceFiles` record.
+- `HermesServeKit/Sources/HermesServeKit/SessionGrouping.swift`: the desktop app's session-source labels and source id sets, ported from `apps/desktop/src/lib/session-source.ts`.
+- `HermesApp/Support/ComposerPlaceholders.swift`: the composer placeholder strings, copied from the desktop app's English strings in `apps/desktop/src/i18n/en.ts`.
+- `HermesApp/Support/MediaDirective.swift`: the file-extension-to-media-kind table, copied from `apps/desktop/src/lib/media.ts`.
+- `docs/PROTOCOL.md`: the condensed client contract, written from Hermes Agent's gateway source at v0.19.1 and quoting method names, event names, payload shapes and field semantics from it.
+- `HermesServeKit/`: a Swift client for that gateway protocol, written against the contract above with upstream's TypeScript client, `apps/shared/src/json-rpc-gateway.ts`, as its specification.
 
-Nothing else in this repository is derived from Hermes Agent. `HermesServeKit` is an independent Swift implementation of the client half of that protocol, written against the contract above rather than translated from upstream code.
+Nothing else in this repository is copied from Hermes Agent.
 
 ### The MIT License, as it applies to that material
 

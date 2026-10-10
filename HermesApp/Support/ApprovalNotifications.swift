@@ -24,12 +24,21 @@ enum ApprovalNotifications {
     /// What each session is actually blocked on right now, which is not the same as "has a notification up": the foreground sweep clears every banner while the prompts behind them are still pending.
     private static var pending: [String: PromptKind] = [:]
 
+    /// Sessions whose turn waits on a connector sign-in card (`connection.request`). The card is not a blocking prompt (it is a dock row with the backend's own 300 s deadline, not the approval sheet), but it stops the turn on the person all the same. It shares the session's identifier, so a blocking prompt in the same session takes the banner over.
+    private static var pendingSignIns: Set<String> = []
+
+    static let signInTitle = "Hermes needs you to sign in"
+    static let signInBody = "An app is waiting for you to connect it."
+
     /// What kind of answer a turn is stopped on; the body names the kind and nothing else — never the command, never the question, never the value.
     enum PromptKind: String, Sendable {
         case approval
         case clarify
         case sudo
         case secret
+        case desktop
+        /// A connector sign-in card. Never a blocking prompt and never notified through this kind (sign-ins have their own notice); it marks the chat as waiting on Home and in the other-chat banner.
+        case signIn
 
         var title: String {
             switch self {
@@ -37,6 +46,8 @@ enum ApprovalNotifications {
             case .clarify: return "Hermes has a question"
             case .sudo: return "Hermes needs a password"
             case .secret: return "Hermes needs a value"
+            case .desktop: return "Continue in Desktop"
+            case .signIn: return "Hermes needs you to sign in"
             }
         }
 
@@ -46,6 +57,8 @@ enum ApprovalNotifications {
             case .clarify: return "A question is waiting for your answer."
             case .sudo: return "An administrator password is waiting to be entered."
             case .secret: return "A value is waiting to be entered."
+            case .desktop: return "A request needs a Desktop feature. Open the session in Desktop to complete it."
+            case .signIn: return "An app is waiting for you to connect it."
             }
         }
     }
@@ -97,6 +110,9 @@ enum ApprovalNotifications {
             // `willResignActive` and `didEnterBackground` both fire on the way out of the foreground, and re-posting the same identifier would buzz the phone twice for one prompt.
             guard scheduledGeneration[sessionID] == nil else { continue }
             schedule(sessionID: sessionID, kind: kind)
+        }
+        for sessionID in pendingSignIns where scheduledGeneration[sessionID] == nil {
+            scheduleSignIn(sessionID: sessionID)
         }
     }
 
@@ -165,10 +181,21 @@ enum ApprovalNotifications {
 
     /// Reconcile the armed notifications against what every session is actually blocked on, called on every engine flush from `LiveActivityController.reconcile`.
     /// A prompt whose session drops off the roster has been answered, expired or completed, and its banner goes with it.
-    static func sync(prompts: [String: PromptKind]) {
+    static func sync(prompts: [String: PromptKind], signIns: Set<String> = []) {
+        // A blocking prompt outranks a sign-in card in the same session.
+        let signInsOnly = signIns.subtracting(prompts.keys)
         // `Array` and not `pending.keys`: `clear` mutates the dictionary these keys are a live view of.
         for sessionID in Array(pending.keys) where prompts[sessionID] == nil {
             clear(sessionID: sessionID)
+        }
+        for sessionID in Array(pendingSignIns) where !signInsOnly.contains(sessionID) {
+            if prompts[sessionID] == nil {
+                clear(sessionID: sessionID)
+            } else {
+                // A prompt took the session over: let its `schedule` replace the banner rather than see a live generation and stand down.
+                pendingSignIns.remove(sessionID)
+                scheduledGeneration[sessionID] = nil
+            }
         }
         for (sessionID, kind) in prompts {
             // Recorded whatever the app state is, because a prompt the user is currently looking at still has to follow them when they put the phone down.
@@ -176,6 +203,11 @@ enum ApprovalNotifications {
             // Nothing to post while the user is looking at the app.
             guard !appIsActive else { continue }
             schedule(sessionID: sessionID, kind: kind)
+        }
+        for sessionID in signInsOnly {
+            pendingSignIns.insert(sessionID)
+            guard !appIsActive else { continue }
+            scheduleSignIn(sessionID: sessionID)
         }
     }
 
@@ -185,11 +217,28 @@ enum ApprovalNotifications {
         // A different kind for the same session is news, and so is the same kind with no live generation, which is the state the foreground sweep leaves behind.
         if pending[sessionID] == kind, scheduledGeneration[sessionID] != nil { return }
         pending[sessionID] = kind
+        pendingSignIns.remove(sessionID)
         // A new question supersedes any "that request is no longer waiting" notice still sitting in the tray for this chat.
         clearRefusal(sessionID: sessionID)
         #if DEBUG
         armedForTesting.append(Armed(sessionID: sessionID, kind: kind))
         #endif
+        post(sessionID: sessionID, title: kind.title, body: kind.body)
+    }
+
+    /// Post the sign-in notification for a session whose turn waits on a connector card; idempotent like `schedule`.
+    static func scheduleSignIn(sessionID: String) {
+        // A live generation with no prompt on the roster is this session's sign-in banner.
+        if pending[sessionID] == nil, pendingSignIns.contains(sessionID), scheduledGeneration[sessionID] != nil { return }
+        pendingSignIns.insert(sessionID)
+        clearRefusal(sessionID: sessionID)
+        #if DEBUG
+        armedForTesting.append(Armed(sessionID: sessionID, kind: nil))
+        #endif
+        post(sessionID: sessionID, title: signInTitle, body: signInBody)
+    }
+
+    private static func post(sessionID: String, title: String, body: String) {
         generationCounter += 1
         let generation = generationCounter
         scheduledGeneration[sessionID] = generation
@@ -203,8 +252,8 @@ enum ApprovalNotifications {
             guard scheduledGeneration[sessionID] == generation else { return }
 
             let content = UNMutableNotificationContent()
-            content.title = kind.title
-            content.body = kind.body
+            content.title = title
+            content.body = body
             content.sound = .default
             // BUG-070 C. The whole payload: which chat is blocked, and no command, question text or value.
             content.userInfo = [sessionUserInfoKey: sessionID]
@@ -280,6 +329,7 @@ enum ApprovalNotifications {
     static func clear(sessionID: String) {
         scheduledGeneration[sessionID] = nil
         pending[sessionID] = nil
+        pendingSignIns.remove(sessionID)
         let center = UNUserNotificationCenter.current()
         let ids = [pendingPrefix + sessionID]
         center.removePendingNotificationRequests(withIdentifiers: ids)
@@ -313,7 +363,8 @@ enum ApprovalNotifications {
     #if DEBUG
     struct Armed: Equatable {
         let sessionID: String
-        let kind: PromptKind
+        /// Nil for a connector sign-in.
+        let kind: PromptKind?
     }
 
     struct Refused: Equatable {
@@ -333,6 +384,8 @@ enum ApprovalNotifications {
     /// What the roster believes is blocked, for a test that cannot read `UNUserNotificationCenter`.
     static var pendingPromptsForTesting: [String: PromptKind] { pending }
 
+    static var pendingSignInsForTesting: Set<String> { pendingSignIns }
+
     /// Drive the delegate's tap path without a real `UNNotificationResponse`, which cannot be constructed outside the system.
     static func simulateTapForTesting(sessionID: String) {
         requestRoute(sessionID: sessionID)
@@ -344,6 +397,7 @@ enum ApprovalNotifications {
         refusalsForTesting.removeAll()
         isActiveOverrideForTesting = nil
         pending.removeAll()
+        pendingSignIns.removeAll()
         scheduledGeneration.removeAll()
         queuedRoute = nil
     }

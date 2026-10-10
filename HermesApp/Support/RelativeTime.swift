@@ -24,11 +24,10 @@ enum RelativeTime {
     }()
 
     /// "just now" / "5m ago" / "3d ago" — for a dense list row.
+    /// BUG-095: the stamp comes from the server's clock, which nothing synchronises with the phone's, so it can be in the future. Within 45 s either way is "just now"; past that the formatter's own "in …" says the stamp is ahead rather than pretending it is fresh.
     static func short(_ date: Date, now: Date = Date()) -> String {
-        let interval = now.timeIntervalSince(date)
         if date.timeIntervalSince1970 <= 0 { return "" }
-        if interval < 45 { return "just now" }
-        if interval < 0 { return relative.localizedString(for: date, relativeTo: now) }
+        if abs(now.timeIntervalSince(date)) < 45 { return "just now" }
         return relative.localizedString(for: date, relativeTo: now)
     }
 

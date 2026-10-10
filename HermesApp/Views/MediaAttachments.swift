@@ -22,9 +22,9 @@ struct MediaAttachmentRow: View {
                 case .image:
                     AssistantMediaImage(ref: ref)
                 case .video:
-                    // A video the phone can reach itself plays inline, but one on the gateway's disk keeps the chip and goes to Quick Look, because authenticating `AVPlayer` would mean putting a token in a URL — Desktop plays it instead through a custom Electron protocol the phone has no equivalent of.
-                    if case .fetchRemote(let url) = MediaDirective.fetchPlan(for: ref.path) {
-                        AssistantMediaVideo(ref: ref, url: url)
+                    // A container iOS plays is fetched to the cache and drawn as a poster the tap plays; the rest of Desktop's video set (avi, mkv, webm) keeps the chip and Quick Look.
+                    if VideoMedia.isPlayable(ref.path) {
+                        VideoPosterView(ref: ref)
                     } else {
                         fileChip(ref)
                     }
@@ -165,58 +165,41 @@ private struct AssistantMediaImage: View {
         }
     }
 
-    /// Three sources, one decision, made by ``MediaDirective/fetchPlan(for:)``.
+    /// Three sources, one decision, made by ``MediaDirective/fetchPlan(for:)``; bytes already held by ``MediaByteCache`` are used before any of them, and the downsample runs off the main actor so a row appearing mid-scroll costs the transcript nothing.
     private func load() async {
-        let bytes: Data?
-        switch MediaDirective.fetchPlan(for: ref.path) {
-        case .decodeDataURL:
-            bytes = DownsampledImage.data(fromDataURL: ref.path)
-        case .fetchRemote(let url):
-            bytes = try? await RemoteMedia.data(from: url)
-        case .askGateway:
-            if let rest = app.rest, let dataURL = try? await rest.mediaDataURL(path: ref.path) {
-                bytes = DownsampledImage.data(fromDataURL: dataURL)
-            } else {
-                bytes = nil
-            }
-        }
-
+        let path = ref.path
+        let rest = app.rest
         defer { retrying = false }
-        guard let bytes, let loaded = DownsampledImage.thumbnail(data: bytes) else {
+        let result = await Task.detached(priority: .userInitiated) { () async -> InlineThumbnail.Decoded? in
+            let bytes: Data?
+            if let held = MediaByteCache.shared.data(for: path) {
+                bytes = held
+            } else {
+                switch MediaDirective.fetchPlan(for: path) {
+                case .decodeDataURL:
+                    bytes = DownsampledImage.data(fromDataURL: path)
+                case .fetchRemote(let url):
+                    bytes = try? await RemoteMedia.data(from: url)
+                case .askGateway:
+                    if let rest, let dataURL = try? await rest.mediaDataURL(path: path) {
+                        bytes = DownsampledImage.data(fromDataURL: dataURL)
+                    } else {
+                        bytes = nil
+                    }
+                }
+            }
+            guard let bytes, let loaded = DownsampledImage.thumbnail(data: bytes) else { return nil }
+            MediaByteCache.shared.remember(bytes, keys: [path])
+            return InlineThumbnail.Decoded(image: loaded, data: bytes)
+        }.value
+        guard !Task.isCancelled else { return }
+        guard let result else {
             failed = true
             return
         }
-        encoded = bytes
-        thumbnail = loaded
+        encoded = result.data
+        thumbnail = result.image
         failed = false
-    }
-}
-
-// MARK: - Video
-
-/// An agent-generated video, played where it was announced.
-/// Nothing is downloaded: `AVPlayer` streams the URL and handles its own ranges, which is why this does not go through ``RemoteMedia``.
-/// The 16:9 box is a default, not a measurement, because `AVPlayer` reports the real ratio only after the asset loads.
-@MainActor
-private struct AssistantMediaVideo: View {
-    let ref: MediaDirective.Ref
-    let url: URL
-
-    @State private var player: AVPlayer?
-
-    var body: some View {
-        VideoPlayer(player: player)
-            .aspectRatio(16.0 / 9.0, contentMode: .fit)
-            .frame(maxWidth: 320)
-            .clipShape(RoundedRectangle(cornerRadius: Radius.enclosure, style: .continuous))
-            .onAppear {
-                if player == nil { player = AVPlayer(url: url) }
-            }
-            .onDisappear {
-                player?.pause()
-                player = nil
-            }
-            .accessibilityLabel("Video: \(ref.name)")
     }
 }
 
@@ -255,7 +238,7 @@ struct MediaPreviewSheet: View {
                         Button("Done") { dismiss() }.foregroundStyle(t.action)
                     }
                 }
-                .toolbarBackground(t.canvas, for: .navigationBar)
+                .hermesTopBar()
         }
         .task { await load() }
     }
@@ -297,17 +280,7 @@ struct MediaPreviewSheet: View {
         }
         do {
             // BUG-133: a markdown document can be a link as easily as a gateway path, and a link is not the gateway's to serve.
-            let data: Data
-            switch MediaDirective.fetchPlan(for: ref.path) {
-            case .fetchRemote(let url):
-                data = try await RemoteMedia.data(from: url)
-            case .decodeDataURL, .askGateway:
-                guard let rest = app.rest else {
-                    state = .failed("Not connected to a backend.")
-                    return
-                }
-                data = try await rest.downloadFileData(path: ref.path)
-            }
+            let data = try await MediaFileFetch.data(for: ref.path, gateway: MediaFileFetch.gateway(app.rest))
             // A file that will not decode as UTF-8 is not a markdown document whatever its extension claims, so it falls through to Quick Look rather than rendering mojibake.
             if let text = String(data: data, encoding: .utf8) {
                 state = .markdown(text)

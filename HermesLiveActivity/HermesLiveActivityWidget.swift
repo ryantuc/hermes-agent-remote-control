@@ -60,7 +60,7 @@ struct HermesLiveActivityWidget: Widget {
             } compactLeading: {
                 if showsIsland {
                     HStack(spacing: Space.s2) {
-                        PulseDot(isBusy: state.isBusy, needsInput: state.hasApproval, isStale: stale)
+                        PulseDot(isBusy: state.isBusy, needsInput: state.isWaitingOnPerson, isStale: stale)
                         ProgressCount(state: state)
                             .font(HermesFont.footnote)
                             // `text1`, not the `text2` this would take elsewhere: the island is always drawn on black, and the ramp's lower rungs are alphas mixed for the app's own canvas.
@@ -73,7 +73,7 @@ struct HermesLiveActivityWidget: Widget {
                 EmptyView()
             } minimal: {
                 if showsIsland {
-                    PulseDot(isBusy: state.isBusy, needsInput: state.hasApproval, isStale: stale)
+                    PulseDot(isBusy: state.isBusy, needsInput: state.isWaitingOnPerson, isStale: stale)
                         .environment(\.hermes, t)
                 }
             }
@@ -119,7 +119,7 @@ private struct LockScreenCard: View {
     var body: some View {
         VStack(alignment: .leading, spacing: Space.s4) {
             HStack(alignment: .firstTextBaseline, spacing: Space.s4) {
-                PulseDot(isBusy: state.isBusy, needsInput: state.hasApproval, isStale: isStale)
+                PulseDot(isBusy: state.isBusy, needsInput: state.isWaitingOnPerson, isStale: isStale)
                     .alignmentGuide(.firstTextBaseline) { $0[.bottom] - 1 }
 
                 VStack(alignment: .leading, spacing: 1) {
@@ -161,6 +161,19 @@ private struct LockScreenCard: View {
                             .background(t.fill3, in: Capsule())
                     }
                 }
+            } else if let parked = state.parkedQuestion, !isStale {
+                // BUG-062 B. The kind of wait and nothing else, and a link rather than an answer: a question is answered in the app. A stale card makes no claim that the question is still open.
+                Text(parked.line)
+                    .font(HermesFont.subhead)
+                    .foregroundStyle(t.warn)
+                    .lineLimit(1)
+                Link(destination: HermesActivityLink.chat(sessionKey: attributes.sessionKey)) {
+                    Text(parked.linkTitle)
+                        .font(HermesFont.footnote)
+                        .foregroundStyle(t.text1)
+                        .frame(maxWidth: .infinity, minHeight: 28)
+                        .background(t.fill3, in: Capsule())
+                }
             } else {
                 ProgressBar(completed: state.toolsCompleted, total: state.toolsTotal)
             }
@@ -171,7 +184,7 @@ private struct LockScreenCard: View {
 
 /// The Lock Screen card with its Lock Screen switch off.
 ///
-/// It reaches no session content by construction: the only text it can produce is `LiveActivityDerivation.reducedLine`, which returns one of four constants and has no path from the snapshot's strings.
+/// It reaches no session content by construction: the only text it can produce is `ParkedQuestion.reducedLine`, which returns a constant for a parked question and otherwise `LiveActivityDerivation.reducedLine`, one of four constants with no path from the snapshot's strings.
 ///
 /// It exists because ActivityKit will not let a live activity drop one of its two presentations.
 private struct ReducedLockScreenCard: View {
@@ -194,7 +207,7 @@ private struct ReducedLockScreenCard: View {
 
     var body: some View {
         HStack(alignment: .firstTextBaseline, spacing: Space.s4) {
-            PulseDot(isBusy: state.isBusy, needsInput: state.hasApproval, isStale: isStale)
+            PulseDot(isBusy: state.isBusy, needsInput: state.isWaitingOnPerson, isStale: isStale)
                 .alignmentGuide(.firstTextBaseline) { $0[.bottom] - 1 }
 
             Text("Hermes")
@@ -204,7 +217,7 @@ private struct ReducedLockScreenCard: View {
 
             Spacer(minLength: Space.s4)
 
-            Text(LiveActivityDerivation.reducedLine(for: state, isStale: isStale))
+            Text(ParkedQuestion.reducedLine(for: state, isStale: isStale))
                 .font(HermesFont.subhead)
                 .foregroundStyle(t.text3)
                 .lineLimit(1)
@@ -224,6 +237,8 @@ private struct ExpandedBottom: View {
     var body: some View {
         if state.hasApproval {
             approval
+        } else if let parked = state.parkedQuestion, !isStale {
+            parkedQuestion(parked)
         } else {
             // One rung brighter than the same label on the Lock Screen card, because the island is black.
             VStack(alignment: .leading, spacing: Space.s4) {
@@ -285,6 +300,24 @@ private struct ExpandedBottom: View {
                             .background(t.fill3, in: Capsule())
                     }
                 }
+            }
+        }
+    }
+
+    /// BUG-062 B. The wait, named by kind, and the one way to answer it: open the chat. No intent buttons, because the island's only answers are an approval's.
+    private func parkedQuestion(_ parked: ParkedQuestion) -> some View {
+        VStack(alignment: .leading, spacing: Space.s4) {
+            Text(parked.line)
+                .font(HermesFont.subhead)
+                .foregroundStyle(t.warn)
+                .lineLimit(1)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            Link(destination: HermesActivityLink.chat(sessionKey: attributes.sessionKey)) {
+                Text(parked.linkTitle)
+                    .font(HermesFont.calloutStrong)
+                    .foregroundStyle(t.text1)
+                    .frame(maxWidth: .infinity, minHeight: 32)
+                    .background(t.fill3, in: Capsule())
             }
         }
     }

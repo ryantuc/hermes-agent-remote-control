@@ -6,8 +6,10 @@ import XCTest
 /// The ladder, pinned.
 ///
 /// FEAT-017 §5 asked for the four conversation rungs to move up one step to the
-/// iOS semantic sizes. That was done, measured, and reverted: it hangs the
-/// composer, deterministically, and `HermesType.swift` carries the mechanism.
+/// iOS semantic sizes. That was done, measured, and reverted: it
+/// hung the composer (BUG-056). Later the same sizes passed
+/// `ComposerReachabilityUITests` against a real keyboard, so the change is now a
+/// design decision rather than a blocked one (`HermesType.swift`).
 /// These tests pin what actually ships, so the next attempt starts from a red
 /// test rather than from a guess about what the sizes used to be.
 ///
@@ -18,8 +20,8 @@ import XCTest
 /// is what says so.
 final class TypeLadderTests: XCTestCase {
 
-    /// One step under the system's 17. Raising it is what hung the composer;
-    /// see `HermesType.swift`.
+    /// One step under the system's 17; see `HermesType.swift` for why it has not
+    /// moved.
     func testBodyIsSixteen() {
         XCTAssertEqual(HermesFont.body.size, 16)
         XCTAssertEqual(HermesFont.bodyStrong.size, 16, "emphasis inside a message must not change its size")

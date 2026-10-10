@@ -169,7 +169,7 @@ enum DemoScript {
 
         - the agent does the work locally
         - clients render the transcript, the plan and the tool calls
-        - anything dangerous asks first
+        - your approval policy decides what asks first
         """
 
     static let searchResult = """
@@ -220,10 +220,9 @@ enum DemoScript {
         This is a canned demo, so the answer to that one is not really mine to give — nothing here \
         is connected to a running agent.
 
-        What the demo does show is real: the transcript, the thinking, the plan, the tool cards and \
-        the approval prompts are the same views a live session draws. Connect your own \
-        `hermes serve` from Settings → Backend and every one of them fills with your machine's work \
-        instead of this script's.
+        What the demo does show is real: the transcript, the thinking, the plan and the tool cards \
+        are the same views a live session draws. Connect your own `hermes serve` from Settings → \
+        Backend and every one of them fills with your machine's work instead of this script's.
         """
 
     static let freeformTurn = Turn(prompt: "", beats: freeformBeats())
@@ -236,9 +235,9 @@ enum DemoScript {
         beats += streaming([
             "This is a canned demo, so the answer to that one is not really mine to give — ",
             "nothing here is connected to a running agent.\n\n",
-            "What the demo does show is real: the transcript, the thinking, the plan, the tool ",
-            "cards and the approval prompts are the same views a live session draws. Connect ",
-            "your own `hermes serve` from Settings → Backend and every one of them fills with ",
+            "What the demo does show is real: the transcript, the thinking, the plan and the ",
+            "tool cards are the same views a live session draws. Connect your own ",
+            "`hermes serve` from Settings → Backend and every one of them fills with ",
             "your machine's work instead of this script's.",
         ])
         beats.append(.pause(0.3))

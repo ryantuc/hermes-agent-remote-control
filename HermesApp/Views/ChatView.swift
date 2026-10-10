@@ -26,14 +26,20 @@ struct ChatView: View {
     @State private var showingSessionSheet = false
     // The popover dismisses first and the sheet or alert is raised afterwards, because a presentation started while another is still dismissing is dropped.
     @State private var showingOverflow = false
+    @State private var showingRecoveryInfo = false
     @State private var queuedOverflowAction: ChatOverflowAction?
     @State private var showingRename = false
     @State private var renameText = ""
     @State private var showingProjectPicker = false
+    @State private var showingTimeline = false
+    /// A prompt the person chose in the timeline sheet; the transcript's own modifiers carry it out, because the scroll proxy lives there.
+    @State private var jumpTarget: TranscriptJump?
     /// The header's second line: one `projects.for_cwd` per working directory.
     @State private var projectSubtitle = ChatProjectSubtitleModel()
-    /// Whether the bottom sentinel is on screen; auto-scroll follows the stream only while it is.
+    /// Whether the bottom sentinel is on screen, within `TranscriptScroll.Geometry.slack`; the scroll-to-latest disc shows while it is not. The follow decision reads `isFollowing`, which also keeps a reader the content carried past the slack.
     @State private var isNearBottom = true
+    /// The trailing scroll a burst of content growth earns.
+    @State private var followSettle = TranscriptScroll.FollowSettle()
     /// The sentinel's bottom edge in the scroll view's own coordinate space; zero until it has reported once.
     @State private var sentinel = TranscriptScroll.SentinelReading()
     /// Starts `true` so a body built before `onAppear` ever runs paints normally.
@@ -98,29 +104,31 @@ struct ChatView: View {
         }
         // One writer, one read: everything below reads this key and nothing else ever sets it.
         .environment(\.transcriptStyle, resolvedStyle)
+        .environment(\.mediaProfile, model.mediaProfile)
         // BUG-120: paint the home-indicator well and only that well; a bare `.ignoresSafeArea()` would put this surface into the keyboard's inset negotiation.
+        // The top edge too, so the frost under the bar blurs the theme's canvas and not the system background behind the hosting view. A background, so it moves no layout.
         .background {
             t.canvas
-            .ignoresSafeArea(ChatChrome.homeIndicatorEscape, edges: .bottom)
+            .ignoresSafeArea(ChatChrome.homeIndicatorEscape, edges: [.top, .bottom])
         }
         .navigationBarTitleDisplayMode(.inline)
         .chatGlassNavigationBar()
         .toolbar {
             ToolbarItem(placement: .principal) { conversationHeader }
+            ToolbarItem(placement: .topBarTrailing) {
+                if let notice = model.historyRecoveryNotice {
+                    recoveryInfoButton(notice: notice)
+                }
+            }
             ToolbarItem(placement: .topBarTrailing) { overflowButton }
         }
         // iOS 26 treats a `.topBarLeading` title as an action and wraps it in Liquid Glass; the editor role gives principal titles the native leading alignment without converting this label into a button.
         .toolbarRole(.editor)
         .safeAreaInset(edge: .top, spacing: 0) {
-            if !app.connectionState.isOpen {
-                ConnectionBannerView(
-                    state: app.connectionState,
-                    detail: app.connectionError,
-                    onRetry: { Task { await app.connect() } },
-                    onOpenSettings: nil
-                )
-            }
+            topBanners
         }
+        // After the banner's inset, so the frost fills the bar and ends where the bar ends.
+        .chatGlassTopPlane()
         // BUG-121: sample whether there is anything to draw at the instant the push starts, once per view identity, because `onAppear` fires again when a sheet is dismissed.
         .onAppear {
             guard !hasArmedPushGate else { return }
@@ -136,6 +144,7 @@ struct ChatView: View {
         }
         // Keyed on the chat because SwiftUI re-binds this struct to a different `ChatModel` while keeping the view's identity; a bare `.task` would never open the second chat.
         .task(id: ObjectIdentifier(model)) {
+            showingRecoveryInfo = false
             ColdOpenTrace.mark("chatview.task")
             await model.openIfNeeded()
             ColdOpenTrace.mark("chatview.task.returned")
@@ -155,6 +164,9 @@ struct ChatView: View {
                 isConnected: app.connectionState.isOpen,
                 forCwd: projectResolver
             )
+        }
+        .onChange(of: model.historyRecoveryNotice) { _, notice in
+            if notice == nil { showingRecoveryInfo = false }
         }
         .sheet(isPresented: $showingSessionSheet) {
             SessionSheetView(model: model)
@@ -176,6 +188,9 @@ struct ChatView: View {
             ProjectPickerSheet(currentPath: subtitleCwd) { path in
                 await model.applyCwd(path)
             }
+        }
+        .sheet(isPresented: $showingTimeline) {
+            PromptTimelineSheet(model: model) { target in jumpTarget = target }
         }
         .sheet(item: $branchTarget) { entry in
             branchSheet(entry)
@@ -205,12 +220,33 @@ struct ChatView: View {
 
     // MARK: Chrome (FEAT-024)
 
+    /// The rows under the bar: the connection banner while the socket is not open, then a question waiting in another conversation.
+    private var topBanners: some View {
+        VStack(spacing: 0) {
+            if !app.connectionState.isOpen {
+                ConnectionBannerView(
+                    state: app.connectionState,
+                    detail: app.connectionError,
+                    onRetry: { Task { await app.connect() } },
+                    onOpenSettings: nil
+                )
+            }
+            // BUG-062 C: read from the same registry as Home's "Needs your answer".
+            if let elsewhere = elsewherePrompt {
+                ElsewherePromptBanner(prompt: elsewhere) { openElsewhere(elsewhere) }
+                    .disabled(model.hasBlockingPrompt)
+            }
+        }
+    }
+
     /// Everything between the transcript and the bottom of the screen, on one glass plane; a frost per row would stack blurs the moment a notice or a blocking prompt appeared.
     @ViewBuilder
     private func bottomChromeStack(viewport: CGFloat) -> some View {
         VStack(spacing: 0) {
             SessionActivityStrip(
                 activity: model.live.activity,
+                controls: model.sessionControls,
+                processes: model.backgroundProcesses,
                 hasBlockingPrompt: model.hasBlockingPrompt
             )
 
@@ -218,12 +254,27 @@ struct ChatView: View {
                 NoticeSlot(notice: notice)
             }
 
+
             if let error = model.errorMessage {
-                SessionErrorRow(message: error)
+                // FEAT-040: a command refused with the draft kept (`/tmp is unavailable…`) offers the way out right where the refusal is read.
+                SessionErrorRow(
+                    message: error,
+                    sendAsText: ComposerSendAsText.isOffered(for: model) ? { ComposerSendAsText.send(model) } : nil
+                )
+            }
+
+            // Desktop parity: the connection the agent is blocked on.
+            if let connection = model.pendingConnection {
+                ConnectionRequestCard(model: model, request: connection)
             }
 
             if model.hasBlockingPrompt {
                 blockingPromptBar
+            }
+
+            // Desktop parity: the composer is replacing an earlier message.
+            if model.editingEntryID != nil {
+                EditingMessageBanner(model: model)
             }
 
             ComposerView(model: model, viewportHeight: viewport, chrome: .glass)
@@ -250,15 +301,41 @@ struct ChatView: View {
                     .lineLimit(1)
                     .truncationMode(.tail)
             }
-            // Never blank and never a spinner: an unresolved project is an em dash, so the bar cannot change height when the answer lands.
-            Text(projectSubtitle.subtitle.text)
+            // Laid out in every state and never a spinner, so the bar cannot change height when the answer lands.
+            Text(projectSubtitle.subtitle.headerText ?? projectSubtitle.subtitle.text)
                 .font(HermesFont.caption)
                 .foregroundStyle(t.text3)
                 .lineLimit(1)
                 .truncationMode(.tail)
+                .opacity(projectSubtitle.subtitle.headerText == nil ? 0 : 1)
+                .accessibilityHidden(projectSubtitle.subtitle.headerText == nil)
         }
         .accessibilityElement(children: .combine)
         .accessibilityAddTraits(.isHeader)
+    }
+
+    /// Recovery details stay available without taking space from the composer.
+    private func recoveryInfoButton(notice: String) -> some View {
+        Button {
+            showingRecoveryInfo = true
+        } label: {
+            Image(systemName: "info.circle")
+                .foregroundStyle(t.text3)
+        }
+        .accessibilityLabel("Earlier activity may be incomplete")
+        .accessibilityHint("Shows conversation recovery details")
+        .popover(isPresented: $showingRecoveryInfo) {
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Conversation history")
+                    .font(.headline)
+                Text(notice)
+                    .font(.callout)
+            }
+            .padding(16)
+            .frame(idealWidth: 300, maxWidth: 340, alignment: .leading)
+            .presentationCompactAdaptation(.popover)
+        }
+        .disabled(model.hasBlockingPrompt)
     }
 
     /// The `⋯`, as a popover of icons rather than a `Menu`, because a SwiftUI `Menu` always renders a labelled list.
@@ -286,7 +363,8 @@ struct ChatView: View {
     private var overflowEntries: [ChatOverflowEntry] {
         ChatChrome.overflowEntries(
             isBotThread: botIdentity.profile != nil,
-            isDraft: model.isDraft
+            isDraft: model.isDraft,
+            offersTimeline: model.offersPromptTimeline
         )
     }
 
@@ -301,11 +379,14 @@ struct ChatView: View {
             showingRename = true
         case .project:
             showingProjectPicker = true
+        case .timeline:
+            showingTimeline = true
         }
     }
 
     /// Chat-owned presentations; composer and activity-strip presentations dismiss themselves from the same prompt edge.
     private func dismissSiblingPresentationsForBlockingPrompt() {
+        showingRecoveryInfo = false
         showingSessionSheet = false
         showingProjectPicker = false
         showingRename = false
@@ -320,6 +401,29 @@ struct ChatView: View {
         guard let stored = model.storedSessionID, !stored.isEmpty else { return nil }
         if let known = app.hubSessions.first(where: { $0.id == stored }) { return known }
         return SessionSummary(json: .object(["id": .string(stored)]))
+    }
+
+    /// BUG-062 C. Another conversation this phone is attached to that is waiting on the person, from the current-request registry (`LiveActivityController.waiting`).
+    private var elsewherePrompt: ElsewherePrompt? {
+        ElsewherePrompt.pick(
+            waiting: app.liveActivities.waiting.byRuntimeID,
+            currentRuntimeID: model.runtimeSessionID,
+            currentStoredID: model.storedSessionID,
+            storedID: { runtimeID in
+                if let stored = app.chat(runtimeSessionID: runtimeID)?.storedSessionID, !stored.isEmpty { return stored }
+                return app.liveStatuses.first { $0.value.id == runtimeID }?.key
+            },
+            title: { storedID in
+                app.hubSessions.first(where: { $0.id == storedID })?.displayTitle ?? ""
+            }
+        )
+    }
+
+    /// Opens the waiting chat in place of this one; Back from it returns to Home, as from a branch.
+    private func openElsewhere(_ prompt: ElsewherePrompt) {
+        let summary = app.hubSessions.first { $0.id == prompt.storedID }
+            ?? SessionSummary(json: .object(["id": .string(prompt.storedID)]))
+        app.requestRoute([.thread(.existing(summary))])
     }
 
     /// The working directory the subtitle describes and the project picker writes to: the live session's, or the draft's seed.
@@ -342,7 +446,14 @@ struct ChatView: View {
 
     private func transcript(width: CGFloat) -> some View {
         ColdOpenTrace.markOnce("transcript.body")
+        // Three functions rather than one chain: the modifier chain outgrew the type checker's budget once the follow had its triggers.
         return ScrollViewReader { proxy in
+            transcriptGeometry(transcriptTriggers(transcriptScroller(width: width, proxy: proxy), proxy), proxy)
+        }
+    }
+
+    /// The scroll view, its content, and the modifiers that must sit directly on it.
+    private func transcriptScroller(width: CGFloat, proxy: ScrollViewProxy) -> some View {
             ScrollView {
                 // BUG-016: a plain `VStack` and not a `LazyVStack`, because a lazy stack lays out from an estimated content height and every anchor resolves against that estimate. The cost is bounded by `TranscriptScroll.Window`.
                 VStack(alignment: .leading, spacing: Space.s7) {
@@ -406,8 +517,9 @@ struct ChatView: View {
                     }
 
                     // Bottom sentinel: auto-scroll follows the stream only while the reader is at the tail. It reports its own bottom edge in the scroll view's coordinate space rather than through `onAppear`, which in a plain stack would mean "exists" and never "visible".
+                    // It is the stack's bottom padding as well as its last row, so its bottom edge is the content's: a scroll that lands the sentinel at the viewport's bottom lands the conversation at its true end, not a padding short of it.
                     Color.clear
-                        .frame(height: 1)
+                        .frame(height: 1 + Space.s5)
                         .id(bottomAnchor)
                         .background {
                             GeometryReader { geometry in
@@ -419,7 +531,7 @@ struct ChatView: View {
                         }
                 }
                 .padding(.horizontal, Space.s6)
-                .padding(.vertical, Space.s5)
+                .padding(.top, Space.s5)
                 // BUG-016: pinned to the viewport, never to the content, because a plain stack reports the width of its widest child and `.frame(maxWidth:)` does not clamp a child that is already wider.
                 .frame(width: TranscriptScroll.Geometry.contentWidth(viewport: width))
                 .frame(maxWidth: .infinity)
@@ -437,17 +549,49 @@ struct ChatView: View {
                         .frame(width: 0, height: 0)
                         .allowsHitTesting(false)
                 }
+                // `scrollClipDisabled` travels through the environment, so every scroller inside a row (the reasoning trace, diffs, code, tables) is handed clipping back here.
+                .scrollClipDisabled(false)
             }
             // The space the sentinel measures against, directly on the scroll view, before anything that could wrap its frame.
             .coordinateSpace(name: Self.transcriptSpace)
             .background(t.canvas)
             .defaultScrollAnchor(.bottom)
             .scrollDismissesKeyboard(.interactively)
+            // Glass: rows past the scroll view's edges are drawn rather than clipped, so the conversation passes behind the top plane and the dock. Drawing only: the frame, content offset, safe area and anchor are exactly what they were, which is why this is safe where an overlay or an inset was not (BUG-016, FEAT-024 §4). Rows behind the chrome are not touchable; the chrome is on top.
+            .scrollClipDisabled()
+    }
+
+    /// Everything that moves the transcript on a model or view change.
+    private func transcriptTriggers(_ content: some View, _ proxy: ScrollViewProxy) -> some View {
+        content
             .onChange(of: model.entries.count) { _, _ in
                 applyScrollDecision(proxy)
             }
             .onChange(of: model.entries.last?.text) { _, _ in
                 applyScrollDecision(proxy)
+            }
+            // The end-of-turn reload replaces the live rows with the persisted ones under the same count and text; the ids are what change.
+            .onChange(of: model.entries.last?.id) { _, _ in
+                applyScrollDecision(proxy)
+            }
+            // The status row is scroll content, not chrome: it comes and goes under the last reply and moves the content's end without touching any entry.
+            .onChange(of: model.statusLineText) { _, _ in
+                applyScrollDecision(proxy)
+            }
+            // The turn ending is what adds the footer row and takes the streaming indicator away, with no entry count or text changing.
+            .onChange(of: model.live.isBusy) { was, busy in
+                guard was, !busy else { return }
+                applyScrollDecision(proxy)
+            }
+            // The person's own send, a steer included, always goes to the bottom: it is the one thing a reader in scrollback does that means "take me back".
+            .onChange(of: model.sendPhase) { _, phase in
+                guard phase == .sending else { return }
+                recoverToTail(proxy)
+            }
+            .onChange(of: jumpTarget) { _, target in
+                guard let target else { return }
+                jumpTarget = nil
+                jump(to: target, proxy)
             }
             // Also on appear, because a chat already cached with a populated transcript never fires either `onChange`.
             .onAppear { applyScrollDecision(proxy) }
@@ -463,6 +607,11 @@ struct ChatView: View {
             .onChange(of: isNearBottom) { _, near in
                 tailLatch.record(isNearBottom: near, reading: momentum.reading)
             }
+    }
+
+    /// The measurements the transcript takes of itself, and the disc drawn from them.
+    private func transcriptGeometry(_ content: some View, _ proxy: ScrollViewProxy) -> some View {
+        content
             // `.onGeometryChange` would be the spelling, but it is iOS 18 and this app targets 17.0, so the scroll view's own frame is reported from a `GeometryReader` in its background.
             .background {
                 GeometryReader { geometry in
@@ -483,8 +632,11 @@ struct ChatView: View {
                 ColdOpenTrace.markOnce("sentinel.first", "bottom=\(Int(bottom))")
                 // BUG-122: a reading on the far side of a reveal describes a viewport that was never drawn, so nothing is stored and `isNearBottom` is not recomputed against it.
                 if momentum.absorbReveal(sentinelBottom: bottom) { return }
+                // Content grew under a reader who was following: a row that got taller after its text did, a tool card filling in, the footer arriving. One trailing scroll lands it, debounced so a stream in motion earns none until it pauses.
+                let grew = sentinel.bottom != 0 && bottom > sentinel.bottom + TranscriptScroll.ContainerHeight.epsilon
                 sentinel.bottom = bottom
                 updateNearBottom()
+                if grew, isFollowing { settleFollow(proxy) }
             }
             .overlay(alignment: .bottomTrailing) {
                 if !isNearBottom {
@@ -499,7 +651,6 @@ struct ChatView: View {
                     .padding(.bottom, Space.s4)
                 }
             }
-        }
     }
 
     // MARK: Transcript rows
@@ -651,9 +802,9 @@ struct ChatView: View {
         return items
     }
 
-    /// The action row appears only on completed assistant messages.
+    /// The action row appears on completed assistant messages and on failed ones, so a turn that failed (a 429 included) can be retried or edited, as on Desktop.
     private func messageActions(for entry: ChatEntry) -> MessageActions? {
-        guard entry.kind == .assistant, entry.status == "complete", !entry.isStreaming else { return nil }
+        guard entry.kind == .assistant, entry.status == "complete" || entry.isError, !entry.isStreaming else { return nil }
         let hasPrecedingUser = model.entries.prefix(while: { $0.id != entry.id }).contains { $0.kind == .user }
         return MessageActions(
             canBranch: model.branchCount(forEntryID: entry.id) != nil,
@@ -668,7 +819,14 @@ struct ChatView: View {
                 } else {
                     model.resendPrecedingUserTurn(before: entry.id)
                 }
-            } : nil
+            } : nil,
+            // Desktop parity: Edit beside Retry on the reply, never a long press on the user bubble, which BUG-044 rules out.
+            onEdit: model.precedingUserEntry(before: entry.id).flatMap { user in
+                model.canEdit(entryID: user.id) ? {
+                    guard !model.hasBlockingPrompt else { return }
+                    model.beginEditing(entryID: user.id)
+                } : nil
+            }
         )
     }
 
@@ -710,10 +868,14 @@ struct ChatView: View {
         _ proxy: ScrollViewProxy,
         afterLayout: Bool = false
     ) -> TranscriptScroll.Action {
+        let reading = momentum.reading
+        tailLatch.observe(reading: reading)
+        tailLatch.noteDeparture(isNearBottom: isNearBottom, reading: reading)
         let action = placement.decide(
             chat: ObjectIdentifier(model),
             isNonEmpty: model.hasEntries,
             isNearBottom: isNearBottom,
+            isFollowing: tailLatch.wasAtTail(isNearBottom: isNearBottom, reading: reading),
             afterLayout: afterLayout
         )
         // BUG-016: read before the switch and acted on regardless of which way the ladder closed, because one momentary sentinel reading can latch the ladder closed while the next layout pass takes the sentinel away again.
@@ -730,8 +892,26 @@ struct ChatView: View {
             // BUG-009: discrete, never animated. This runs on every entry-count and last-text change, so an animated scroll would keep one layout drive in flight while deltas started the next.
             TranscriptScrollLog.scroll(.followTail, isNearBottom: isNearBottom)
             scrollToBottom(proxy, animated: false)
+            // The scroll above is issued against the layout before this change; the trailing one lands whatever the change added.
+            settleFollow(proxy)
         }
         return action
+    }
+
+    /// Whether the transcript should still move with the stream: the reader is at or near the tail, or the content carried them past the slack and their own finger did not. A finger on the transcript is a hard no.
+    private var isFollowing: Bool {
+        tailLatch.wasAtTail(isNearBottom: isNearBottom, reading: momentum.reading)
+    }
+
+    /// One trailing scroll after a burst of content growth: the last delta of a reply, the footer that arrives with its completion, a row that grew after its text did. Debounced, so a stream that keeps moving earns none until it pauses, and re-checked when it fires, so a reader who has since left the tail by hand is not moved.
+    private func settleFollow(_ proxy: ScrollViewProxy) {
+        let token = followSettle.arm()
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: TranscriptScroll.FollowSettle.settleNanoseconds)
+            guard followSettle.fire(token: token), isFollowing else { return }
+            TranscriptScrollLog.scroll(.followSettle, isNearBottom: isNearBottom)
+            scrollToBottom(proxy, animated: false)
+        }
     }
 
     /// BUG-016: what a finger drag does, once at the end of every initial placement and never during one. Skipped while the reader is touching the transcript, because an offset write into a live drag loses anyway.
@@ -748,7 +928,16 @@ struct ChatView: View {
     }
 
     /// The ↓ button, which forces the ladder open rather than deferring to one in flight the way `replaceTail` does: a tap outranks a layout-driven repair, and deferring made the tap do nothing for the ~400 ms after every open and every debounced resize.
-    private func recoverToTail(_ proxy: ScrollViewProxy) {
+    private func recoverToTail(_ proxy: ScrollViewProxy, afterReload: Bool = false) {
+        // After a jump the history is a page from the middle of the conversation; the live end is the latest page, so that is loaded first while the chat is quiet. A send while windowed places at the window's end and the end-of-turn reconciliation brings the latest page back.
+        if !afterReload, model.historyWindowRowID != nil, !model.live.isBusy, !model.isSending, model.sendPhase == .idle {
+            Task { @MainActor in
+                await model.reloadLatestHistory()
+                recoverToTail(proxy, afterReload: true)
+            }
+            return
+        }
+        tailLatch.rejoin()
         placement.forceRestart(chat: ObjectIdentifier(model))
         guard applyScrollDecision(proxy) == TranscriptScroll.Action.none else { return }
         // Belt and braces: `forceRestart` guarantees `.initialPlacement` for a non-empty transcript, so this is unreachable while the button is on screen.
@@ -799,7 +988,9 @@ struct ChatView: View {
             hasAgents: !model.live.activity.subagents.isEmpty,
             hasNotice: model.live.notice != nil,
             hasError: model.errorMessage != nil,
-            hasBlockingPrompt: model.hasBlockingPrompt
+            hasBlockingPrompt: model.hasBlockingPrompt,
+            hasConnection: model.pendingConnection != nil,
+            isEditing: model.editingEntryID != nil
         )
     }
 
@@ -880,6 +1071,41 @@ struct ChatView: View {
     /// The entries the plain stack renders: `model.entries` less the window's hidden head.
     private var visibleEntries: [ChatEntry] {
         TranscriptScroll.Window.visible(model.entries, revealed: revealedEarlierCount)
+    }
+
+    /// Bring one of the conversation's prompts into view. A loaded prompt is scrolled to, the window's hidden head revealed first if it is in it; one outside the loaded history has its page loaded first. Either way the reader has left the tail on purpose, so the follow stands down until the scroll-to-latest disc or a send.
+    private func jump(to target: TranscriptJump, _ proxy: ScrollViewProxy) {
+        momentum.halt()
+        tailLatch.leave()
+        if let entry = loadedEntry(for: target) {
+            if hiddenEarlierCount > 0 {
+                revealedEarlier = model.entries.count
+                revealedEarlierFor = ObjectIdentifier(model)
+            }
+            scrollToRow(entry.id, proxy)
+            return
+        }
+        guard let rowID = target.rowID else { return }
+        Task { @MainActor in
+            guard await model.loadHistoryAround(rowID: rowID), let entry = model.loadedPrompt(rowID: rowID) else { return }
+            tailLatch.leave()
+            scrollToRow(entry.id, proxy)
+        }
+    }
+
+    private func loadedEntry(for target: TranscriptJump) -> ChatEntry? {
+        if let id = target.entryID, let entry = model.entries.first(where: { $0.id == id }) { return entry }
+        if let rowID = target.rowID { return model.loadedPrompt(rowID: rowID) }
+        return nil
+    }
+
+    /// The row's top at the viewport's top, now and once more after the layout the request may have caused. Discrete, like every scroll in this transcript.
+    private func scrollToRow(_ id: String, _ proxy: ScrollViewProxy) {
+        proxy.scrollTo(id, anchor: .top)
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 80_000_000)
+            proxy.scrollTo(id, anchor: .top)
+        }
     }
 
     /// BUG-122: reveal a window and keep the reader's place across it. `.defaultScrollAnchor(.bottom)` does not absorb rows inserted above the viewport — the content offset does not move — so the offset is moved by the measured height of the inserted block.
@@ -964,8 +1190,8 @@ struct ChatView: View {
             .padding(.horizontal, Space.s6)
             .padding(.vertical, Space.s5)
             .frame(minHeight: Hit.min)
-            .background(t.surface)
-            .hairline(.top)
+            // No ground of its own: it sits on the dock's one frosted plate. The separator is below it, so the plate's top edge is drawn once, by the plate.
+            .hairline(.bottom)
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
@@ -977,6 +1203,7 @@ struct ChatView: View {
         // Approvals do expire: the gateway wait fails closed after `approvals.timeout`, with no frame sent to say so.
         case .approval(let request): return model.approvalBudget(for: request)
         case .clarify(let request):
+            guard request.serverRequest == nil else { return nil }
             // Same resolution order as ApprovalSheetView.budget.
             let seconds: TimeInterval = {
                 if let wire = request.wireTimeoutSeconds { return wire }
@@ -986,8 +1213,8 @@ struct ChatView: View {
             // `<= 0` means wait forever; no deadline to show.
             guard seconds > 0 else { return nil }
             return (request.receivedAt, seconds)
-        case .sudo(let request): return (request.receivedAt, request.timeoutSeconds)
-        case .secret(let request): return (request.receivedAt, request.timeoutSeconds)
+        case .sudo(let request): return request.serverRequest == nil ? (request.receivedAt, request.timeoutSeconds) : nil
+        case .secret(let request): return request.serverRequest == nil ? (request.receivedAt, request.timeoutSeconds) : nil
         case nil: return nil
         }
     }
@@ -995,14 +1222,12 @@ struct ChatView: View {
     /// One ladder, on the model: the sheet decides whether to stay by comparing the prompt it is showing against this.
     private var currentPrompt: BlockingPrompt? { model.currentBlockingPrompt }
 
-    private var promptIdentity: String? { currentPrompt?.id }
-
     private var promptTitle: String {
         switch currentPrompt {
         case .approval: return "Hermes needs approval"
         case .clarify: return "Hermes has a question"
         case .sudo: return "Administrator password needed"
-        case .secret: return "Credential needed"
+        case .secret(let request): return request.requiresDesktop ? "Continue in Desktop" : "Credential needed"
         case nil: return ""
         }
     }
@@ -1012,7 +1237,7 @@ struct ChatView: View {
         case .approval(let request): return DisplayRedaction.preview(request.command, limit: 90)
         case .clarify(let request): return DisplayRedaction.preview(request.question, limit: 90)
         case .sudo: return "Tap to enter it securely"
-        case .secret(let request): return request.envVar.isEmpty ? "Tap to provide it" : request.envVar
+        case .secret(let request): return request.requiresDesktop ? "View the pending request" : (request.envVar.isEmpty ? "Tap to provide it" : request.envVar)
         case nil: return ""
         }
     }
@@ -1258,10 +1483,12 @@ enum TranscriptScroll {
         init() {}
 
         /// `afterLayout` is true only for the deferred re-entry a placement attempt schedules, which is the one call whose `isNearBottom` reads the layout the attempt was issued against and so the only call allowed to judge the outcome.
+        /// `isNearBottom` judges the ladder (the sentinel is back on screen); `isFollowing` decides a placed chat's follow, and may be true past the slack for a reader the content carried off the tail. Nil means the two are the same measurement.
         mutating func decide(
             chat: Key,
             isNonEmpty: Bool,
             isNearBottom: Bool,
+            isFollowing: Bool? = nil,
             afterLayout: Bool = false
         ) -> Action {
             guard isNonEmpty else { return .none }
@@ -1299,7 +1526,7 @@ enum TranscriptScroll {
                 placedChat: placedChat,
                 currentChat: chat,
                 isNonEmpty: isNonEmpty,
-                isNearBottom: isNearBottom
+                isNearBottom: isFollowing ?? isNearBottom
             )
         }
 
@@ -1358,6 +1585,22 @@ enum TranscriptScroll {
             if reading.isAvailable, reading.isAtBottom { leftByHand = false }
         }
 
+        /// The other direction, for a departure the sentinel's edge did not report: a reader found moving the offset while already off the tail (the content carried them past the slack first, then they dragged) left it on purpose.
+        mutating func noteDeparture(isNearBottom: Bool, reading: TranscriptScrollReading) {
+            guard !isNearBottom, reading.isAvailable, reading.movedOffset, !reading.isAtBottom else { return }
+            leftByHand = true
+        }
+
+        /// The reader asked to be back at the tail: the scroll-to-latest disc, or their own send.
+        mutating func rejoin() {
+            leftByHand = false
+        }
+
+        /// The reader asked to be somewhere else: a jump to an earlier prompt.
+        mutating func leave() {
+            leftByHand = true
+        }
+
         /// `isTouching` is a hard no regardless of the flag, because a re-placement issued into a live drag loses anyway (BUG-051), and a measured `isAtBottom` is a hard yes.
         func wasAtTail(isNearBottom: Bool, reading: TranscriptScrollReading) -> Bool {
             if reading.isTouching { return false }
@@ -1401,28 +1644,62 @@ enum TranscriptScroll {
         }
     }
 
+    // MARK: The trailing scroll after content growth
+
+    /// One scroll per burst of growth, issued once the content has stopped moving for a moment. A debounce and not a throttle: a reply streaming at thirty deltas a second earns none until it pauses, and the per-delta follow carries the reader meanwhile.
+    struct FollowSettle {
+        /// Long enough for the layout the growth caused to have happened, short enough that the reader never sees the gap.
+        static var settleNanoseconds: UInt64 { 80_000_000 }
+
+        private var counter = 0
+        private(set) var pending: Int?
+
+        init() {}
+
+        /// Arming supersedes whatever was pending.
+        mutating func arm() -> Int {
+            counter += 1
+            pending = counter
+            return counter
+        }
+
+        /// True only if this token is still the pending one.
+        mutating func fire(token: Int) -> Bool {
+            guard pending == token else { return false }
+            pending = nil
+            return true
+        }
+    }
+
     // MARK: Chrome-driven tail reassertion (BUG-050)
 
-    /// Everything stacked between the transcript and the composer, as a value. The five flags are the state and not the height — the activity strip is one 44 pt line per populated group — so `changesHeight(from:to:)` is the distinction, while `Equatable` stays the raw five-flag comparison for instrumentation.
+    /// Everything stacked between the transcript and the composer, as a value. The flags are the state and not the height — the activity strip is one 44 pt line per populated group — so `changesHeight(from:to:)` is the distinction, while `Equatable` stays the raw flag comparison for instrumentation.
     struct Chrome: Equatable {
         var hasTodos: Bool
         var hasAgents: Bool
         var hasNotice: Bool
         var hasError: Bool
         var hasBlockingPrompt: Bool
+        /// The connection card and the editing banner, dock rows like the notice and the error.
+        var hasConnection: Bool
+        var isEditing: Bool
 
         init(
             hasTodos: Bool = false,
             hasAgents: Bool = false,
             hasNotice: Bool = false,
             hasError: Bool = false,
-            hasBlockingPrompt: Bool = false
+            hasBlockingPrompt: Bool = false,
+            hasConnection: Bool = false,
+            isEditing: Bool = false
         ) {
             self.hasTodos = hasTodos
             self.hasAgents = hasAgents
             self.hasNotice = hasNotice
             self.hasError = hasError
             self.hasBlockingPrompt = hasBlockingPrompt
+            self.hasConnection = hasConnection
+            self.isEditing = isEditing
         }
 
         /// Populated strip groups: 0, 1 or 2, which is the strip's height in 44 pt lines and the only thing about the strip the transcript feels.
@@ -1436,6 +1713,8 @@ enum TranscriptScroll {
                 || old.hasNotice != new.hasNotice
                 || old.hasError != new.hasError
                 || old.hasBlockingPrompt != new.hasBlockingPrompt
+                || old.hasConnection != new.hasConnection
+                || old.isEditing != new.isEditing
         }
     }
 
@@ -1467,9 +1746,115 @@ enum TranscriptScroll {
     }
 }
 
+// MARK: - BUG-062 C: a question waiting in another conversation
+
+/// Another conversation this phone is attached to that is stopped on a question for the person, as the open chat announces it.
+struct ElsewherePrompt: Equatable {
+    /// The durable id the banner opens.
+    let storedID: String
+    let title: String
+    let kind: ApprovalNotifications.PromptKind
+    /// How many more conversations are waiting besides this one.
+    let others: Int
+
+    /// What is being asked, and that it is somewhere else. No question text: the banner is above another conversation, and the question is that chat's to show.
+    var headline: String {
+        switch kind {
+        case .approval: return "Hermes needs approval in another chat"
+        case .clarify: return "Hermes has a question in another chat"
+        case .sudo: return "Hermes needs a password in another chat"
+        case .secret: return "Hermes needs a value in another chat"
+        case .desktop: return "Another chat is waiting on Desktop"
+        case .signIn: return "Hermes needs you to sign in in another chat"
+        }
+    }
+
+    var detail: String {
+        let name = title.isEmpty ? "Untitled chat" : title
+        return others == 0 ? name : "\(name) · \(others) more waiting"
+    }
+
+    /// The conversation to announce, given the current-request registry's view keyed by runtime id (`WaitingSessions.byRuntimeID`); nil when nothing outside the open chat is waiting.
+    /// The open chat is excluded by either id, because it shows its own prompt. A session with no durable id cannot be opened from here and is not offered. An approval leads, because it fails closed on the shortest fuse; ties go by runtime id so the banner does not flip between equals.
+    static func pick(
+        waiting: [String: ApprovalNotifications.PromptKind],
+        currentRuntimeID: String?,
+        currentStoredID: String?,
+        storedID: (String) -> String?,
+        title: (String) -> String
+    ) -> ElsewherePrompt? {
+        var seen: Set<String> = []
+        var candidates: [(runtimeID: String, storedID: String, kind: ApprovalNotifications.PromptKind)] = []
+        for (runtimeID, kind) in waiting where runtimeID != currentRuntimeID {
+            guard let stored = storedID(runtimeID), !stored.isEmpty, stored != currentStoredID,
+                  seen.insert(stored).inserted
+            else { continue }
+            candidates.append((runtimeID, stored, kind))
+        }
+        candidates.sort { lhs, rhs in
+            let left = lhs.kind == .approval ? 0 : 1
+            let right = rhs.kind == .approval ? 0 : 1
+            return left != right ? left < right : lhs.runtimeID < rhs.runtimeID
+        }
+        guard let first = candidates.first else { return nil }
+        return ElsewherePrompt(
+            storedID: first.storedID,
+            title: title(first.storedID),
+            kind: first.kind,
+            others: candidates.count - 1
+        )
+    }
+}
+
+/// The banner under the bar: one warn dot, what is waiting, which chat, and Open. Opaque on the canvas with one hairline, like the connection banner it stacks under, because it is a notice and never glass.
+@MainActor
+private struct ElsewherePromptBanner: View {
+    @Environment(\.hermes) private var t
+    let prompt: ElsewherePrompt
+    let onOpen: () -> Void
+
+    var body: some View {
+        Button(action: onOpen) {
+            HStack(alignment: .top, spacing: Space.s4) {
+                Circle()
+                    .fill(t.warn)
+                    .frame(width: 8, height: 8)
+                    .padding(.top, 5)
+                    .frame(width: 16, height: 20)
+                    .accessibilityHidden(true)
+                VStack(alignment: .leading, spacing: Space.s1) {
+                    Text(prompt.headline)
+                        .font(HermesFont.calloutStrong)
+                        .foregroundStyle(t.text1)
+                    Text(prompt.detail)
+                        .font(HermesFont.footnote)
+                        .foregroundStyle(t.text3)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                }
+                Spacer(minLength: Space.s4)
+                Text("Open")
+                    .font(HermesFont.footnote)
+                    .foregroundStyle(t.action)
+                    .padding(.top, 2)
+            }
+            .padding(.horizontal, Space.s6)
+            .padding(.vertical, Space.s5)
+            .frame(maxWidth: .infinity, minHeight: Hit.min, alignment: .leading)
+            .background(t.canvas)
+            .hairline()
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityElement(children: .combine)
+        .accessibilityHint("Opens that chat")
+        .accessibilityIdentifier("hermes.chat.elsewherePrompt")
+    }
+}
+
 // MARK: - Scroll to latest
 
-/// The transcript's escape hatch, at a 44 pt target: the glyph is 30 pt and `IconButtonStyle` puts the house hit box around it.
+/// The transcript's escape hatch: a floating glass disc exactly the 44 pt house hit box, Liquid Glass on iOS 26 and a material disc below it, so it reads as a control over the conversation rather than a glyph colliding with it.
 @MainActor
 struct ScrollToLatestButton: View {
     @Environment(\.hermes) private var t
@@ -1480,13 +1865,15 @@ struct ScrollToLatestButton: View {
 
     var body: some View {
         Button(action: action) {
-            Image(systemName: "arrow.down.circle.fill")
-                .font(.system(size: 30))
-                .symbolRenderingMode(.hierarchical)
+            Image(systemName: "arrow.down")
+                .font(.system(size: 17, weight: .semibold))
                 .foregroundStyle(t.action)
+                // The disc is the hit box: one frame, the house 44, and the call site's paddings stay outside it.
+                .frame(width: Hit.min, height: Hit.min)
+                .glassFloating(in: Circle())
+                .contentShape(Rectangle())
         }
-        // Do not add a manual `frame(minWidth:minHeight:)` as well — two frames fight — and do not move the call site's paddings in here, or the 44 pt box grows and the glyph drifts off the corner.
-        .buttonStyle(IconButtonStyle())
+        .buttonStyle(.plain)
         .accessibilityLabel("Scroll to latest")
     }
 }
@@ -1510,8 +1897,8 @@ private struct NoticeSlot: View {
         .padding(.horizontal, Space.s6)
         .padding(.vertical, Space.s5)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(t.canvas)
-        .hairline(.top)
+        // On the dock's plate, with no ground of its own; separated from what follows it, not from the plate's edge.
+        .hairline(.bottom)
         .id(notice.key)
     }
 
@@ -1529,6 +1916,8 @@ private struct NoticeSlot: View {
 private struct SessionErrorRow: View {
     @Environment(\.hermes) private var t
     let message: String
+    /// FEAT-040: present while the kept draft would run as a command again.
+    var sendAsText: (() -> Void)?
 
     var body: some View {
         HStack(alignment: .top, spacing: Space.s4) {
@@ -1537,12 +1926,23 @@ private struct SessionErrorRow: View {
                 .font(HermesFont.subhead)
                 .foregroundStyle(t.text2)
                 .frame(maxWidth: .infinity, alignment: .leading)
+            if let sendAsText {
+                Button(action: sendAsText) {
+                    Text("Send as text")
+                        .font(HermesFont.footnote)
+                        .foregroundStyle(t.action)
+                        .padding(.top, Space.s1)
+                        .frame(minHeight: Hit.min, alignment: .top)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+            }
         }
         .padding(.horizontal, Space.s6)
         .padding(.vertical, Space.s5)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(t.canvas)
-        .hairline(.top)
+        // On the dock's plate, with no ground of its own; separated from what follows it, not from the plate's edge.
+        .hairline(.bottom)
     }
 }
 

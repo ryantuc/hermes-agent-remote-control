@@ -72,9 +72,12 @@ final class ComposerReachabilityUITests: XCTestCase {
     private func keyboardTop() throws -> CGFloat {
         let screen = app.windows.firstMatch.frame
         let keyboard = app.keyboards.firstMatch
-        guard keyboard.waitForExistence(timeout: 10), keyboard.frame.minY < screen.maxY else {
+        // The first keyboard after a simulator boots can take well over ten seconds to appear.
+        guard keyboard.waitForExistence(timeout: 20), keyboard.frame.minY < screen.maxY else {
+            // Reading the frame of a keyboard that does not exist fails the test instead of skipping it.
+            let seen = keyboard.exists ? "\(keyboard.frame)" : "no keyboard element"
             throw XCTSkip("""
-                no on-screen keyboard: `app.keyboards` is at \(app.keyboards.firstMatch.frame) against \
+                no on-screen keyboard: `app.keyboards` is at \(seen) against \
                 a \(screen) screen. The simulator has a hardware keyboard connected — turn it off \
                 (Simulator ▸ I/O ▸ Keyboard ▸ Connect Hardware Keyboard) and this test measures the \
                 real thing. Everything it would assert is trivially true without it

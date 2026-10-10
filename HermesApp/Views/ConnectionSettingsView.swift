@@ -30,7 +30,7 @@ struct ConnectionSettingsView: View {
         .background(t.canvas)
         .navigationTitle("Backend")
         .navigationBarTitleDisplayMode(.inline)
-        .toolbarBackground(t.canvas, for: .navigationBar)
+        .hermesTopBar()
         .sheet(item: $editing) { profile in
             ProfileEditorView(profile: profile)
         }
@@ -139,7 +139,7 @@ struct ConnectionSettingsView: View {
     private var diagnosticsGroup: some View {
         SettingsGroup(
             title: "Diagnostics",
-            footer: "Connection state, the negotiated gateway capabilities, and a redacted request log."
+            footer: "The connection's state, what the backend supports, and a log of recent requests with secrets removed."
         ) {
             NavigationLink(value: AppRoute.settingsDiagnostics) {
                 FlatRow(showsHairline: false) {
@@ -162,6 +162,7 @@ struct ConnectionSettingsView: View {
     }
 
     private var diagnosticsValue: String {
+        if app.isDemoActive { return "Demo" }
         if let status = app.serverStatus, !status.version.isEmpty { return "v\(status.version)" }
         return app.connectionState.isOpen ? "Connected" : "Not connected"
     }
@@ -170,10 +171,10 @@ struct ConnectionSettingsView: View {
 
     private func connectedGroup(_ status: ServerStatus) -> some View {
         SettingsGroup(title: "Connected backend") {
-            infoRow("Version", status.version)
+            infoRow("Version", app.isDemoActive ? "Demo" : status.version)
             infoRow("Gateway", status.gatewayState.isEmpty ? "unknown" : status.gatewayState)
             infoRow("Health", status.overall.isEmpty ? "unknown" : status.overall)
-            infoRow("Auth", status.authRequired ? "Required" : "Loopback (open)")
+            infoRow("Sign-in", status.authRequired ? "Required" : "Not required")
             infoRow("Active sessions", "\(status.activeSessions)")
             if let identity = app.identity {
                 infoRow("Signed in as", identity.bestName)
@@ -186,7 +187,7 @@ struct ConnectionSettingsView: View {
     /// The two departures, said in the words that distinguish them.
     private var actionsGroup: some View {
         SettingsGroup(
-            footer: "Credentials are stored only in the iOS Keychain. There is no bearer-revocation endpoint on the backend, so signing out discards the tokens locally and lets them expire."
+            footer: "Credentials are stored only in this iPhone's Keychain. Signing out deletes them here; a token already issued stops working when it expires, because the backend cannot cancel one early."
         ) {
             Button {
                 confirmingSignOut = true
@@ -469,7 +470,7 @@ struct ProfileEditorView: View {
             .scrollDismissesKeyboard(.interactively)
             .navigationTitle(isNew ? "Add backend" : "Edit backend")
             .navigationBarTitleDisplayMode(.inline)
-            .toolbarBackground(t.canvas, for: .navigationBar)
+            .hermesTopBar()
             .toolbar {
                 ToolbarItem(placement: .topBarLeading) {
                     Button("Cancel") { dismiss() }.foregroundStyle(t.text2)
@@ -508,12 +509,17 @@ struct ProfileEditorView: View {
     private var addressGroup: some View {
         SettingsGroup(title: "Backend address") {
             field {
-                TextField("https://host:9119", text: $profile.baseURLString)
-                    .textInputAutocapitalization(.never)
-                    .autocorrectionDisabled()
-                    .keyboardType(.URL)
-                    .accessibilityIdentifier("backend.address")
-                    .onSubmit { Task { await detect() } }
+                TextField(text: $profile.baseURLString, prompt: Text(verbatim: BackendEditorCopy.addressPlaceholder)) {
+                    Text("Address")
+                }
+                .textInputAutocapitalization(.never)
+                .autocorrectionDisabled()
+                .keyboardType(.URL)
+                .accessibilityIdentifier("backend.address")
+                .onSubmit { Task { await detect() } }
+            }
+            if probe.statusLine == nil {
+                helpText(BackendEditorCopy.addressHelp)
             }
             probeStatusLine
             field {
@@ -606,7 +612,7 @@ struct ProfileEditorView: View {
             if let credentialError {
                 errorText(credentialError)
             }
-            helpText("For a backend started on `--host 127.0.0.1`, use the session token it prints at startup. It is not exposed by any API, so copy it from that machine, and it changes on every restart unless HERMES_DASHBOARD_SESSION_TOKEN is set.")
+            helpText(BackendEditorCopy.sessionTokenHelp)
 
         case .bearer:
             field {
@@ -616,7 +622,7 @@ struct ProfileEditorView: View {
             if let credentialError {
                 errorText(credentialError)
             }
-            helpText("Sent as Authorization: Bearer on every request. The gateway accepts the same provider-minted access token its browser flow stores in a cookie.")
+            helpText(BackendEditorCopy.accessTokenHelp)
 
         case .password:
             field {
@@ -636,17 +642,17 @@ struct ProfileEditorView: View {
             if let credentialError {
                 errorText(credentialError)
             }
-            helpText("For a backend reachable over the network. Stored in the iOS Keychain and replayed only to re-establish the session cookie.")
+            helpText(BackendEditorCopy.passwordHelp)
 
         case .none:
-            helpText("No credential is sent. Only correct for a loopback backend reachable from this device.")
+            helpText(BackendEditorCopy.noneHelp)
         }
     }
 
     private var hermesProfileGroup: some View {
         SettingsGroup(
             title: "Hermes profile",
-            footer: "A Hermes *profile* is a separate HERMES_HOME and session database on the backend. Leave empty to use the default."
+            footer: BackendEditorCopy.profileFooter
         ) {
             field {
                 TextField("Hermes profile (optional)", text: $profile.hermesProfile)
@@ -682,7 +688,7 @@ struct ProfileEditorView: View {
 
     private var testGroup: some View {
         SettingsGroup(
-            footer: "A backend can answer HTTPS and still refuse the WebSocket — different host, origin and credential checks apply. The test opens a real gateway connection and waits for the server's gateway.ready frame."
+            footer: BackendEditorCopy.testFooter
         ) {
             VStack(alignment: .leading, spacing: Space.s3) {
                 Button {
@@ -842,7 +848,7 @@ struct ProfileEditorView: View {
             return
         }
 
-        // A credential was just written, so this backend is signed in again.
+        // Signed in again whether or not a secret was just written: `BackendSaveDecision` enables Save only with a typed credential, a stored one, or a method that needs none, and sign-out erases every stored secret, so a signed-out profile reaches this line only with a fresh credential or with no credential to need (BUG-146).
         profile.signedOut = false
 
         if app.profiles.contains(where: { $0.id == profile.id }) {
@@ -890,12 +896,12 @@ struct ProfileEditorView: View {
     ) async throws -> Bool {
         switch method {
         case .sessionToken:
-            guard !sessionToken.isEmpty else { return false }
-            try await auth.setSecret(sessionToken, kind: .sessionToken)
+            guard let token = BackendCredentialInput.secretToStore(sessionToken, for: .sessionToken) else { return false }
+            try await auth.setSecret(token, kind: .sessionToken)
             return true
         case .bearer:
-            guard !bearerToken.isEmpty else { return false }
-            try await auth.setSecret(bearerToken, kind: .bearerToken)
+            guard let token = BackendCredentialInput.secretToStore(bearerToken, for: .bearer) else { return false }
+            try await auth.setSecret(token, kind: .bearerToken)
             return true
         case .password:
             // `await` cannot appear inside `||`'s autoclosed right operand.

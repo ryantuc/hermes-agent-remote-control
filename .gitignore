@@ -35,9 +35,10 @@ screenshots/
 .hermes-tmp*/
 
 # Signing and secrets. None of this is tracked, and the first device archive is
-# where it arrives.
+# where it arrives. A .p8 is an App Store Connect or push-notification key.
 *.mobileprovision
 *.p12
+*.p8
 *.cer
 *.certSigningRequest
 *.xcconfig

@@ -54,12 +54,6 @@ enum LastProjectStore {
     /// The stamp's own prefix, deliberately not a suffix under `keyPrefix`, which would be one rename away from colliding with a profile's key.
     static let timestampPrefix = "hermes.project.lastAt."
 
-    /// What the default stickiness resolves to; nothing in the app reads this, since `remembered` consults the preference.
-    static var stickyWindow: TimeInterval {
-        guard case .within(let window) = ProjectStickiness.fallback.horizon else { return 10 * 60 }
-        return window
-    }
-
     /// One key per profile; `none` covers the window before a profile is active, as a real key rather than a silent no-op.
     static func key(profileID: UUID?) -> String {
         keyPrefix + (profileID?.uuidString ?? "none")

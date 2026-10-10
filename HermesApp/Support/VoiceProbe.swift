@@ -92,7 +92,7 @@ enum VoiceProbe {
         utterance.voice = AVSpeechSynthesisVoice(language: "en-US")
         utterance.rate = AVSpeechUtteranceDefaultSpeechRate
 
-        return await withCheckedContinuation { continuation in
+        let rendered: URL? = await withCheckedContinuation { continuation in
             var file: AVAudioFile?
             var resumed = false
             synthesizer.write(utterance) { buffer in
@@ -120,6 +120,9 @@ enum VoiceProbe {
                 try? file?.write(from: pcm)
             }
         }
+        // Only the zero-length buffer resumes the wait above, and nothing guaranteed the synthesiser lived to send it (BUG-146): the local's last use was `write`. This keeps it alive until the stream has ended.
+        withExtendedLifetime(synthesizer) {}
+        return rendered
     }
 
     // MARK: Recognise

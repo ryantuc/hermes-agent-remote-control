@@ -1,6 +1,7 @@
 import Foundation
 import HermesServeKit
 import Observation
+import os
 
 /// A file the user picked but has not sent yet.
 struct PendingAttachment: Identifiable, Equatable {
@@ -20,7 +21,7 @@ struct PendingAttachment: Identifiable, Equatable {
     var failure: String?
 
     var byteDescription: String {
-        ByteCountFormatter.string(fromByteCount: Int64(data.count), countStyle: .file)
+        AttachmentSize.text(data.count)
     }
 }
 
@@ -62,12 +63,19 @@ final class ChatModel {
                    lastAckStatus == "steered" || lastAckStatus == "redirected" {
                     sendPhase = .idle
                 }
+                // A turn ended: re-read the automation and process state, as Desktop does after every turn.
+                sessionControls.noteTurnEnded()
+                backgroundProcesses.noteTurnEnded()
+            }
+            if needsHistoryReconciliation, previous.isBusy, !newValue.isBusy {
+                Task { await self.refreshTranscriptIfQuiet() }
             }
             // `deferred: true` writes apply at end of turn, and end of turn is exactly when the next `session.info` lands.
             if newValue.info != previous.info, newValue.info != nil {
                 pendingModelWrite = false
                 pendingEffortWrite = false
             }
+            if let control = newValue.control, control != previous.control { sessionControls.adopt(control) }
             // Guarded rather than unconditional: reset leaves `live.info` nil and applyResume/performCreateSession assign `info` before `live`.
             if let fresh = newValue.info { info = fresh }
             // The approval-expiry timer follows the head of the FIFO (SEC-006), and every change to `pendingApprovals` funnels through this setter.
@@ -75,6 +83,62 @@ final class ChatModel {
         }
     }
     private var storedLive = SessionTurnState()
+    private var needsHistoryReconciliation = false
+    private(set) var historyRecoveryNotice: String?
+    // Suffix replay cannot certify a timeline whose earlier history was already missing.
+    private var checkpointHistoryIncomplete = false
+    private var checkpointSavedAt = Date.distantPast
+    private var checkpointSaveTask: Task<Void, Never>?
+    private(set) var checkpointRecoveryOutcome: String?
+    private static let recoveryLog = Logger(subsystem: "com.hermes.mobile", category: "transcript-recovery")
+
+    private func noteCheckpointRecovery(_ outcome: String) {
+        checkpointRecoveryOutcome = outcome
+        // Fixed outcome codes only: never log transcript bodies, credentials or session IDs.
+        Self.recoveryLog.info("Cold transcript recovery: \(outcome, privacy: .public)")
+    }
+    var transcriptStore = LiveTranscriptStore.shared
+
+    var checkpointKey: String? {
+        guard let profile = app.activeProfile, let storedSessionID else { return nil }
+        // A saved connection can be edited in place; its UUID alone is insufficient isolation.
+        return [profile.id.uuidString, profile.baseURLString, profile.username,
+                profileScope ?? "", storedSessionID].joined(separator: "\u{0}")
+    }
+
+    func saveLiveCheckpoint(force: Bool = false) {
+        guard app.containsChat(self), let key = checkpointKey, let runtimeSessionID, !isBinding, !isSending,
+              outbound.isEmpty else { return }
+        let acceptedCorrection = sendPhase == .queued && (lastAckStatus == "steered" || lastAckStatus == "redirected")
+        guard sendPhase == .idle || acceptedCorrection else { return }
+        guard !checkpointHistoryIncomplete else { return }
+        let now = Date()
+        let delay = 0.5 - now.timeIntervalSince(checkpointSavedAt)
+        if !force, live.isBusy, delay > 0 {
+            if checkpointSaveTask == nil {
+                checkpointSaveTask = Task { [weak self] in
+                    do { try await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000)) }
+                    catch { return }
+                    guard !Task.isCancelled, let self else { return }
+                    self.checkpointSaveTask = nil
+                    guard self.checkpointKey == key, self.runtimeSessionID == runtimeSessionID,
+                          self.app.containsChat(self) else { return }
+                    self.saveLiveCheckpoint(force: true)
+                }
+            }
+            return
+        }
+        checkpointSaveTask?.cancel()
+        checkpointSaveTask = nil
+        checkpointSavedAt = now
+        let record = app.engine.checkpoint(sessionID: runtimeSessionID).map {
+            LiveTranscriptStore.Record(savedAt: now, history: history, ordinals: historyOrdinals, turn: $0)
+        }
+        // An unmatched risk signal may make only the newest display unsafe to save.
+        // Keep the earlier valid cursor so replay can still bridge that interval.
+        guard record != nil || !live.isBusy || live.interrupted else { return }
+        Task { await transcriptStore.save(record, key: key, at: now) }
+    }
 
     // MARK: Send contract (spec §2)
 
@@ -102,6 +166,8 @@ final class ChatModel {
         let id = UUID()
         var text: String
         var attachments: [PendingAttachment]
+        /// Expanded skill input is model-facing only; the visible bubble keeps the invocation.
+        var promptText: String? = nil
         var failure: String?
         /// BUG-141: which typed active-session refusal produced `failure`, nil for every other failure.
         var refusal: HermesError.ActiveSessionRefusal?
@@ -113,6 +179,20 @@ final class ChatModel {
         var handedOffEntryID: String?
         /// The runtime session id `handedOffEntryID` was appended under — a rollback that crosses a rebind must not strip an entry from the current session.
         var handedOffSessionID: String?
+        /// Set for a Retry or an Edit & resend: the user turn this message replaces.
+        var replacing: Replacement? = nil
+
+        /// The turn a replacing send cuts before. `rowID` is the durable row when the chat knows it; when it does not, `performSend` looks it up by content before the submit and degrades to a plain send if that fails, as Desktop does (`rewind.ts:285-327`).
+        struct Replacement: Equatable {
+            let entryID: String
+            var rowID: Int?
+            let text: String
+            /// The target is the chat's latest user turn, which lets a content lookup with several matches take the last (`rewind.ts:213-257`).
+            let isLatestUserTurn: Bool
+            /// The user turns on screen after the target, and in all, when the person composed this replacement; the cut they agreed to is the target and those turns, so `retryOutbound` refuses a cut once there are more.
+            var userTurnsAfter = 0
+            var userTurnCount = 0
+        }
     }
 
     private(set) var outbound: [OutboundMessage] = []
@@ -140,6 +220,31 @@ final class ChatModel {
     var isDraft: Bool { runtimeSessionID == nil && storedSessionID == nil }
 
     var draft: String = ""
+    let slashCompletion = SlashCompletionModel()
+    /// The delegated-agent roster's reads and per-agent controls.
+    let subagentRoster = SubagentRosterModel()
+    private(set) var isExecutingSlash = false
+    private var slashTask: Task<Void, Never>?
+
+    /// A Send has started work whose outcome lands in this conversation's transcript or error row: an ordinary prompt, or a slash command whose output, notice or refusal is written there. Home shows neither, so it promotes its draft on this rather than on `isSending` alone.
+    var hasStartedSubmission: Bool { isSending || isExecutingSlash }
+
+    /// Discovery needs only an open connection. A session-less named-profile draft is scoped by the declared `profile` parameter, so typing a slash never creates a backend session.
+    var slashCommandAPI: SlashCommandsAPI? {
+        guard app.connectionState.isOpen, let client = app.client else { return nil }
+        return SlashCommandsAPI(client: client)
+    }
+
+    var slashCompletionScope: SlashCompletionScope {
+        let profile = app.activeProfile
+        return SlashCompletionScope(
+            backendID: [profile?.id.uuidString ?? "", profile?.baseURLString ?? "", profile?.username ?? ""].joined(separator: "|"),
+            profileID: profileScope ?? "default", sessionID: runtimeSessionID,
+            cwd: info?.cwd ?? draftCwd,
+            connectionID: "\(app.client.map { String(describing: ObjectIdentifier($0)) } ?? "offline")|\(app.socketOpenedAt.timeIntervalSince1970)|\(app.connectionState.isOpen)",
+            profile: profileScope
+        )
+    }
     var attachments: [PendingAttachment] = []
 
     /// The one place a picked working directory lands, shared by every surface that picks one; returns an error message to keep the picker up, nil to dismiss.
@@ -179,6 +284,10 @@ final class ChatModel {
     /// End-of-turn usage from `message.complete` / `session.usage`; nil until the first turn settles.
     var usage: SessionUsage?
 
+    /// What the agent does on its own in this chat (a goal, a loop, a heartbeat) and what it left running in the background. Both reach the wire through `sessionControlTransport`, so they are silent in demo mode and on a backend without the methods.
+    let sessionControls = SessionControlsModel()
+    let backgroundProcesses = BackgroundProcessesModel()
+
     /// The Hermes profile whose forever-chat this is, or nil for an ordinary session; it is the thread's identity, and the session id underneath it is allowed to move.
     private(set) var botProfile: String?
     /// The name the thread header prints, which survives `applyResume` overwriting `title` from `info.title`.
@@ -191,6 +300,9 @@ final class ChatModel {
         return scope.isEmpty ? nil : scope
     }
 
+    /// The profile the transcript's images are read under when `/api/media` refuses them.
+    var mediaProfile: String? { profileScope }
+
     init(app: AppModel, summary: SessionSummary?, bot: BotThreadRef? = nil) {
         self.app = app
         self.summary = summary
@@ -202,6 +314,9 @@ final class ChatModel {
         } else {
             title = summary?.displayTitle ?? "New conversation"
         }
+        sessionControls.transport = { [weak self] in self?.sessionControlTransport }
+        sessionControls.onSendDispatch = { [weak self] dispatch in self?.submitControlDispatch(dispatch) ?? false }
+        backgroundProcesses.transport = { [weak self] in self?.sessionControlTransport }
     }
 
     // MARK: - Derived state
@@ -256,11 +371,13 @@ final class ChatModel {
     var isBusy: Bool { live.isBusy }
 
     /// A turn is running on this session that this client did not start; only reachable on a gateway that mirrors session events, which is why no capability check is needed.
-    var isForeignTurn: Bool { live.isBusy && !live.turnStartedLocally }
+    var isForeignTurn: Bool {
+        live.isBusy && (live.executionID != nil ? live.turnOwnership == .other : !live.turnStartedLocally)
+    }
 
     /// Stop would end work this client did not start — wider than `isForeignTurn` because a settled parent turn with running agents has `live.isBusy` false.
     var isForeignStop: Bool {
-        if isForeignTurn { return true }
+        if isForeignTurn || (live.isBusy && live.executionID != nil && live.turnOwnership == .unknown) { return true }
         return live.activity.runningSubagents.contains { !$0.startedByThisClient }
     }
 
@@ -291,8 +408,8 @@ final class ChatModel {
         guard storedSessionID != nil else { return false }
         if live.isBusy || isSending || sendPhase != .idle { return false }
         if !outbound.isEmpty { return false }
-        // `terminalRead` is not part of `hasBlockingPrompt` and is checked on its own.
-        if hasBlockingPrompt || live.needsInput || live.terminalRead != nil { return false }
+        // `terminalRead` and the connection card are not part of `hasBlockingPrompt` and are checked on their own.
+        if hasBlockingPrompt || live.needsInput || live.terminalRead != nil || live.connection != nil { return false }
         // Unsent composer work is not in the transcript and no reload brings it back.
         if !draft.isEmpty || !attachments.isEmpty { return false }
         if isLoading || isBinding { return false }
@@ -311,7 +428,7 @@ final class ChatModel {
 
     var canSend: Bool {
         guard app.connectionState.isOpen else { return false }
-        if isSending { return false }
+        if isSending || isExecutingSlash { return false }
         return hasComposerPayload
     }
 
@@ -326,6 +443,10 @@ final class ChatModel {
     // MARK: - Opening
 
     func openIfNeeded() async {
+        if hasLoadedOnce, !isLoading, !isBinding, !isSending, runtimeSessionID != nil {
+            await resumeAfterReconnect(force: true)
+            return
+        }
         // A send from Home creates the session on demand, so the in-flight send is the guard — not just the runtime id it will eventually produce.
         guard !hasLoadedOnce, !isLoading, !isBinding, runtimeSessionID == nil, !isSending else { return }
         await open()
@@ -339,6 +460,9 @@ final class ChatModel {
         defer {
             isLoading = false
             isBinding = false
+            if needsHistoryReconciliation, !live.isBusy {
+                Task { await self.refreshTranscriptIfQuiet() }
+            }
         }
         errorMessage = nil
 
@@ -371,13 +495,58 @@ final class ChatModel {
     }
 
     /// Called after the socket comes back: the runtime id is stale, so re-resume and repaint from `inflight`.
-    func resumeAfterReconnect() async {
+    private var recoveryTask: Task<Void, Never>?
+
+    func resumeAfterReconnect(force: Bool = false) async {
+        if let recoveryTask { await recoveryTask.value; return }
+        let task = Task { await self.recoverConnection(force: force) }
+        recoveryTask = task
+        await task.value
+        recoveryTask = nil
+    }
+
+    private func recoverConnection(force: Bool) async {
         guard let storedSessionID = storedSessionID, app.connectionState.isOpen else { return }
+        guard !isBinding else { return }
+        guard force || runtimeBoundAt < app.socketOpenedAt else { return }
+        if let runtime = runtimeSessionID, let api = app.sessionAPI,
+           let seq = app.engine.beginEventRecovery(sessionID: runtime) {
+            isBinding = true
+            var replay: SessionEventReplay?
+            do {
+                let activated = try await api.activate(sessionID: runtime)
+                if activated.sessionID == runtime {
+                    replay = try await api.eventsSince(sessionID: runtime, lastSeen: seq)
+                }
+            } catch { /* Old server, retired runtime, or unavailable replay: reload below. */ }
+            let recovered = app.engine.finishEventRecovery(sessionID: runtime, replay: replay)
+            isBinding = false
+            if recovered {
+                runtimeBoundAt = Date()
+                app.publish(sessionID: runtime)
+                subagentRoster.hydrate(app: app, sessionID: runtime)
+                return
+            }
+        }
+        guard !isSending else { return } // Keep an unconfirmed optimistic send; never reset it away.
+        let beforeLoad = app.engine.eventRevision
         let page = await loadTranscript(storedSessionID: storedSessionID)
         // BUG-019: eligibility is re-read on this side of the await and ahead of the history write it governs, because a page loaded for a pass that will not run must not be installed.
-        guard runtimeBoundAt < app.socketOpenedAt else { return }
-        if let page { applyTranscript(page) }
-        await resumeAndBind(storedSessionID: storedSessionID)
+        guard force || runtimeBoundAt < app.socketOpenedAt else { return }
+        if runtimeBoundAt >= app.socketOpenedAt, let runtime = runtimeSessionID, let api = app.sessionAPI {
+            // Same-socket return is an attachment, not a request to recreate
+            // an agent. This also works on official servers without replay.
+            do {
+                let result = try await api.activate(sessionID: runtime)
+                guard result.sessionID == runtime else { return }
+                let preserve = beforeLoad != app.engine.eventRevision
+                if !preserve, let page { applyTranscript(page) }
+                applyResume(result, preserveLive: preserve)
+            } catch { errorMessage = describe(error) }
+            return
+        }
+        await resumeAndBind(storedSessionID: storedSessionID, transcript: page,
+                            preserveLive: beforeLoad != app.engine.eventRevision)
     }
 
     /// Another client changed this session while this device has it open and idle: repaint from the persisted transcript, deliberately not a `session.resume`, which would rebind the event transport away from whoever is driving.
@@ -394,9 +563,13 @@ final class ChatModel {
               !live.hasBlockingPrompt,
               live.terminalRead == nil
         else { return }
+        let beforeLoad = app.engine.eventRevision
         guard let page = await loadTranscript(storedSessionID: storedSessionID) else { return }
-        // The clear of the live entries this page duplicates lives inside `applyTranscript` (BUG-019); repeating it here would publish `live` a second time.
+        guard beforeLoad == app.engine.eventRevision, !isSending, !live.isBusy, !isBinding else { return }
         applyTranscript(page)
+        needsHistoryReconciliation = false
+        if errorMessage == historyRecoveryNotice { errorMessage = nil }
+        historyRecoveryNotice = nil
     }
 
     private func loadTranscript(storedSessionID: String) async -> TranscriptPage? {
@@ -408,6 +581,7 @@ final class ChatModel {
         } catch {
             // BUG-052: a conversation whose history did not arrive is not an empty conversation.
             transcriptLoadFailed = true
+            checkpointHistoryIncomplete = true
             errorMessage = describe(error)
             return nil
         }
@@ -451,8 +625,11 @@ final class ChatModel {
             storedSessionID = page.sessionID
             app.chatDidBind(self, storedSessionID: page.sessionID)
         }
+        checkpointHistoryIncomplete = false
         history = projected.entries
         historyOrdinals = projected.ordinals
+        // Every install is the latest page unless its caller says otherwise afterwards.
+        historyWindowRowID = nil
         ColdOpenTrace.mark("history.assigned", "entries=\(projected.entries.count)")
         // BUG-019: `entries` renders `history` then `live.entries` with no id-level dedup, so a page carrying turns the engine still holds must clear them here.
         guard let runtimeSessionID = runtimeSessionID else { return }
@@ -468,6 +645,68 @@ final class ChatModel {
         guard !entries.isEmpty, history.isEmpty, !hasLoadedOnce else { return }
         history = entries
         historyOrdinals = ordinals
+    }
+
+    // MARK: Prompt timeline
+
+    /// The prompt row the loaded history is a page around, nil while it is the latest page. While set, the history is a window cut from the middle of the conversation: Branch ordinals are unknown, and the scroll-to-latest disc reloads the latest page.
+    private(set) var historyWindowRowID: Int?
+    /// The backend answered the timeline route with a bare 404: it does not have the route, and the menu stops offering it.
+    private(set) var timelineUnavailable = false
+
+    /// Whether the ⋯ menu offers the prompt list: a conversation with prompts in it, outside the demo, on a backend that has not refused the route.
+    var offersPromptTimeline: Bool {
+        hasEntries && app.demo == nil && !timelineUnavailable
+    }
+
+    /// The prompts the sheet can list without the backend: every loaded user turn, oldest first.
+    var loadedPrompts: [ChatEntry] {
+        entries.filter { $0.kind == .user && !$0.isError }
+    }
+
+    /// One page of the backend's prompt timeline; nil when there is no REST, no durable session, or no route (which also sets `timelineUnavailable`).
+    func loadPromptTimeline(afterRowID: Int = 0) async throws -> PromptTimelinePage? {
+        guard let rest = app.rest, let storedSessionID else { return nil }
+        do {
+            return try await rest.getTimeline(sessionID: storedSessionID, profile: profileScope, afterRowID: afterRowID)
+        } catch where RestAPI.isRouteMissing(error) {
+            timelineUnavailable = true
+            return nil
+        }
+    }
+
+    /// The loaded user turn a timeline row points at.
+    func loadedPrompt(rowID: Int) -> ChatEntry? {
+        entries.first { $0.kind == .user && $0.rowID == rowID }
+    }
+
+    /// Replace the history with the page around `rowID`, so a prompt outside the loaded history can be shown. Refused while a turn runs or a send is in flight, because live rows would render under a page from the middle of the conversation. Returns whether the page was installed.
+    func loadHistoryAround(rowID: Int) async -> Bool {
+        guard let rest = app.rest, let storedSessionID else { return false }
+        guard !live.isBusy, !isSending, sendPhase == .idle, outbound.isEmpty else {
+            errorMessage = "Wait for the reply to finish before jumping to a prompt that is not loaded."
+            return false
+        }
+        do {
+            let result = try await rest.getMessagesAround(sessionID: storedSessionID, rowID: rowID, profile: profileScope)
+            guard !result.page.messages.isEmpty, !live.isBusy, !isSending else { return false }
+            install(page: result.page, projected: Self.projectTranscriptWithOrdinals(result.page))
+            // A page from the middle of the conversation carries no ordinal `session.branch` can count by, and it is reconciled back to the latest page when the next turn ends.
+            historyOrdinals = [:]
+            historyWindowRowID = result.window.rowID
+            needsHistoryReconciliation = true
+            return true
+        } catch {
+            errorMessage = describe(error)
+            return false
+        }
+    }
+
+    /// Back to the latest page after a jump: the scroll-to-latest disc's road home. Only while quiet, for the same reason `refreshTranscriptIfQuiet` is.
+    func reloadLatestHistory() async {
+        guard historyWindowRowID != nil, let storedSessionID, !live.isBusy, !isSending, sendPhase == .idle else { return }
+        guard let page = await loadTranscript(storedSessionID: storedSessionID) else { return }
+        applyTranscript(page)
     }
 
     private func resume(storedSessionID: String) async -> SessionResumeResult? {
@@ -491,13 +730,57 @@ final class ChatModel {
 
     /// Resume this chat's stored session and apply the result, joining an in-flight pass instead of dialing a rival.
     @discardableResult
-    private func resumeAndBind(storedSessionID: String) async -> SessionResumeResult? {
+    private func resumeAndBind(storedSessionID: String, transcript: TranscriptPage? = nil, preserveLive: Bool = false) async -> SessionResumeResult? {
         if let task = resumeTask {
             return await task.value
         }
         let task = Task { () -> SessionResumeResult? in
-            guard let result = await self.resume(storedSessionID: storedSessionID) else { return nil }
-            self.applyResume(result)
+            let saved = self.runtimeSessionID == nil ? await self.loadLiveCheckpoint() : nil
+            let recovering = saved.map { self.app.engine.beginCheckpointRecovery($0.turn) } ?? false
+            self.noteCheckpointRecovery(saved == nil ? "checkpoint-absent-or-invalid" :
+                (recovering ? "checkpoint-replay-started" : "checkpoint-ineligible"))
+            let beforeResume = self.app.engine.eventRevision
+            guard let result = await self.resume(storedSessionID: storedSessionID) else {
+                if recovering, let saved {
+                    self.app.engine.finishEventRecovery(sessionID: saved.turn.sessionID, replay: nil)
+                }
+                return nil
+            }
+            if recovering, let saved {
+                var replay: SessionEventReplay?
+                if result.sessionID == saved.turn.sessionID, result.sessionKey == storedSessionID,
+                   result.autoContinue == nil, let api = self.app.sessionAPI {
+                    replay = try? await api.eventsSince(sessionID: result.sessionID, lastSeen: saved.turn.sequence)
+                }
+                if self.app.engine.finishEventRecovery(sessionID: saved.turn.sessionID,
+                        replay: replay, checkpoint: saved.turn, resumeSnapshot: result) {
+                    self.checkpointHistoryIncomplete = false
+                    self.historyRecoveryNotice = nil
+                    self.noteCheckpointRecovery("checkpoint-restored")
+                    self.history = saved.history
+                    self.historyOrdinals = saved.ordinals
+                    self.applyResume(result, recoveredCheckpoint: true)
+                    // Also reconcile if completion happened while the phone was closed.
+                    self.needsHistoryReconciliation = true
+                    if !self.live.isBusy { Task { await self.refreshTranscriptIfQuiet() } }
+                    return result
+                }
+            }
+            if recovering, let saved {
+                let reason: String
+                if result.sessionID != saved.turn.sessionID { reason = "runtime-changed" }
+                else if result.sessionKey != storedSessionID { reason = "stored-session-changed" }
+                else if result.autoContinue != nil { reason = "auto-continue" }
+                else { reason = "replay-unavailable-or-incomplete" }
+                self.noteCheckpointRecovery(reason)
+            }
+            let receivedLive = !(self.app.engine.state(for: result.sessionID).entries.isEmpty)
+                && (preserveLive || beforeResume != self.app.engine.eventRevision)
+            // A snapshot has no atomic event cursor on older official servers.
+            // Newer received output wins over a stale REST/resume replacement.
+            // Reconcile durable rows when this live turn finishes.
+            if !receivedLive, let transcript { self.applyTranscript(transcript) }
+            self.applyResume(result, preserveLive: receivedLive)
             return result
         }
         resumeTask = task
@@ -506,33 +789,53 @@ final class ChatModel {
         return result
     }
 
-    private func applyResume(_ result: SessionResumeResult) {
+    private func loadLiveCheckpoint() async -> LiveTranscriptStore.Record? {
+        guard let key = checkpointKey else { return nil }
+        let record = await transcriptStore.load(key: key)
+        return key == checkpointKey ? record : nil
+    }
+
+    private func applyResume(_ result: SessionResumeResult, preserveLive: Bool = false, recoveredCheckpoint: Bool = false) {
         if let previousRuntimeID = runtimeSessionID, previousRuntimeID != result.sessionID {
             // Stale live state belongs to a runtime id that no longer exists.
             app.engine.forget(sessionID: previousRuntimeID)
         }
         // The resume payload is an authoritative re-seed, so whatever the previous connection left behind is cleared before the projection.
-        app.engine.reset(sessionID: result.sessionID)
+        if !preserveLive && !recoveredCheckpoint { app.engine.reset(sessionID: result.sessionID, preserveServerRequests: true) }
         runtimeSessionID = result.sessionID
         runtimeBoundAt = Date()
         if !result.sessionKey.isEmpty { storedSessionID = result.sessionKey }
-        info = result.info
+        let recoveredState = app.engine.state(for: result.sessionID)
+        let resolvedInfo = recoveredCheckpoint ? (recoveredState.info ?? result.info) : result.info
+        let resolvedTitle = recoveredCheckpoint ? (recoveredState.title ?? resolvedInfo.title) : resolvedInfo.title
+        info = resolvedInfo
         // `info.title` is "Bot Chat" for every bot, so letting the resume write it would rename every bot to the same thing.
         if let botDisplayName {
             title = botDisplayName
-        } else if !result.info.title.isEmpty {
-            title = result.info.title
+        } else if !resolvedTitle.isEmpty {
+            title = resolvedTitle
         }
 
         // De-duplicate the inflight projection against the persisted tail: a turn persists its user row before inference begins, so the resume returns both (reference §7.1).
         let trailingUserTexts = Self.trailingUserTexts(in: history)
-        app.engine.applyResumeProjection(
-            sessionID: result.sessionID,
-            result: result,
-            trailingUserTexts: trailingUserTexts
-        )
+        if preserveLive {
+            needsHistoryReconciliation = true
+            checkpointHistoryIncomplete = true
+            historyRecoveryNotice = "Connected. Some earlier activity may be missing until this turn finishes."
+        } else if !recoveredCheckpoint {
+            app.engine.applyResumeProjection(
+                sessionID: result.sessionID, result: result,
+                trailingUserTexts: trailingUserTexts, history: history, preserveTranscript: recoveredCheckpoint)
+            if result.running && !recoveredCheckpoint {
+                needsHistoryReconciliation = true
+                checkpointHistoryIncomplete = true
+                historyRecoveryNotice = "Connected. Some earlier activity may be missing until this turn finishes."
+            }
+        }
         app.publish(sessionID: result.sessionID)
         app.chatDidBind(self, storedSessionID: storedSessionID)
+        // Live frames only reach an attached client, so a reopen asks for the agents it missed.
+        subagentRoster.hydrate(app: app, sessionID: result.sessionID)
     }
 
     // MARK: - The Bot Chat resolver
@@ -694,6 +997,8 @@ final class ChatModel {
             errorMessage = "Not connected to a backend."
             return
         }
+        let scope = slashCompletionScope
+        let client = app.client
         do {
             // Model, provider and effort ride the create as per-session overrides; a session-less `config.set` would mutate the global default instead.
             let result = try await sessionAPI.create(
@@ -703,6 +1008,8 @@ final class ChatModel {
                 provider: draftProviderSlug,
                 reasoningEffort: draftEffort
             )
+            // A slash command's Send can bind a draft while the user switches backend. A late bind belongs only to its original backend.
+            guard slashContextMatches(scope), app.client === client else { return }
             runtimeSessionID = result.sessionID
             runtimeBoundAt = Date()
             storedSessionID = result.storedSessionID.isEmpty ? nil : result.storedSessionID
@@ -718,6 +1025,7 @@ final class ChatModel {
             draftEffort = nil
             draftCwd = nil
         } catch {
+            guard slashContextMatches(scope), app.client === client else { return }
             errorMessage = describe(error)
         }
     }
@@ -735,12 +1043,250 @@ final class ChatModel {
         return runtimeSessionID
     }
 
+    // MARK: - Slash command submission
+
+    /// Only an editor-originated command enters this path. Pasted prose remains ordinary input.
+    private func sendSlashCommand() {
+        guard !isSending, !isExecutingSlash, app.connectionState.isOpen,
+              let client = app.client else { return }
+        let api = SlashCommandsAPI(client: client)
+        let original = draft
+        let stagedAttachments = attachments
+        let scope = slashCompletionScope
+        let previouslyAdvertised = (try? Self.slashInvocation(original)).flatMap { slashCompletion.advertisedEntry(named: $0.name) }
+        if let reason = localSlashRefusal(original) {
+            errorMessage = reason
+            slashCompletion.dismiss()
+            return
+        }
+        isExecutingSlash = true
+        errorMessage = nil
+        slashCompletion.dismiss()
+        slashTask = Task {
+            defer { isExecutingSlash = false; slashTask = nil }
+            do {
+                let invocation = try Self.slashInvocation(original)
+                if let reason = SlashCommandSupport.unavailableReason(name: invocation.name, entry: nil) {
+                    throw HermesError.unsupported(reason)
+                }
+                if invocation.name == "stop" {
+                    guard invocation.argument.isEmpty else { throw HermesError.unsupported("Use /stop without arguments.") }
+                    guard !isForeignStop else {
+                        throw HermesError.unsupported("Use the Stop button to confirm stopping another client's work.")
+                    }
+                    stopTapped()
+                    if draft == original { draft = "" }
+                    return
+                }
+                if invocation.name == "btw" {
+                    // Desktop's own path (`slash.ts:555-600`): `prompt.btw` answers from a snapshot without steering or interrupting the running turn. Never the slash worker, which prints the answer past its capture window (#99065), and never a turn. The answer arrives as `btw.complete`, which the engine adds to the chat.
+                    let question = invocation.argument.trimmingCharacters(in: .whitespacesAndNewlines)
+                    guard !question.isEmpty else { throw HermesError.unsupported("Use /btw followed by your question.") }
+                    guard let promptAPI = app.promptAPI else { throw HermesError.notConnected }
+                    let sessionID = try await ensureSession()
+                    guard slashContextMatches(scope), app.client === client else { return }
+                    _ = try await promptAPI.btw(sessionID: sessionID, question: question)
+                    guard slashContextMatches(scope), runtimeSessionID == sessionID, app.client === client else { return }
+                    app.engine.appendNotice(sessionID: sessionID, text: "Asked on the side: “\(question)”. The answer will appear here.", kind: "btw-asked")
+                    app.publish(sessionID: sessionID)
+                    if draft == original { draft = "" }
+                    app.chatDidBind(self, storedSessionID: storedSessionID)
+                    return
+                }
+                let sessionID = try await ensureSession()
+                guard slashContextMatches(scope), app.client === client else { return }
+                // The bound session carries its own profile home and workspace; `cwd` is not a declared parameter.
+                let catalog = try? await api.catalog(sessionID: sessionID)
+                guard slashContextMatches(scope), runtimeSessionID == sessionID, app.client === client else { return }
+                if invocation.name == "help" || invocation.name == "commands" {
+                    guard invocation.argument.isEmpty else { throw HermesError.unsupported("Use /help without arguments.") }
+                    guard let catalog else {
+                        throw HermesError.unsupported("Command discovery is unavailable on this backend. Your draft is preserved.")
+                    }
+                    let help = catalog.entries.filter {
+                        SlashCommandSupport.unavailableReason(name: $0.name, entry: $0) == nil
+                    }.map { "\($0.name) — \($0.description)" }.joined(separator: "\n")
+                    appendSlashOutput(help.isEmpty ? "No supported commands were advertised." : help, sessionID: sessionID)
+                    if let warning = catalog.warning, !warning.isEmpty { appendSlashOutput(warning, sessionID: sessionID) }
+                    if draft == original { draft = "" }
+                    app.chatDidBind(self, storedSessionID: storedSessionID)
+                    return
+                }
+                let entry = catalog?.entry(named: invocation.name) ?? previouslyAdvertised
+                guard let entry else {
+                    throw HermesError.unsupported("/\(invocation.name) is unavailable or was not advertised by this backend. Your draft is preserved.")
+                }
+                let result = try await resolveSlash(invocation, entry: entry, catalog: catalog, api: api,
+                    client: client, sessionID: sessionID, scope: scope, depth: 0)
+                guard slashContextMatches(scope), runtimeSessionID == sessionID, app.client === client else { return }
+                if let warning = result.warning, !warning.isEmpty { appendSlashOutput(warning, sessionID: sessionID) }
+                if let notice = result.notice, !notice.isEmpty { appendSlashOutput(notice, sessionID: sessionID) }
+                switch result.type {
+                case "skill", "send":
+                    guard let message = result.message, !message.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                        throw HermesError.malformedResponse("The command did not return a prompt. Your draft is preserved.")
+                    }
+                    let display = result.display.flatMap { $0.isEmpty ? nil : $0 } ?? original
+                    guard enqueueSend(text: display, attachments: stagedAttachments, promptText: message) else { return }
+                    if draft == original { draft = "" }
+                    attachments.removeAll { attachment in stagedAttachments.contains { $0.id == attachment.id } }
+                case "prefill":
+                    guard let message = result.message else { throw HermesError.malformedResponse("Missing command draft.") }
+                    if draft == original { draft = message }
+                    else { appendSlashOutput("Command draft:\n\(message)", sessionID: sessionID) }
+                case nil, "exec", "plugin":
+                    guard let output = result.output ?? (result.type == nil ? nil : "(no output)") else { throw HermesError.malformedResponse("Missing command output. Your draft is preserved.") }
+                    appendSlashOutput(output.isEmpty ? "(no output)" : output, sessionID: sessionID)
+                    if draft == original { draft = "" }
+                default:
+                    throw HermesError.unsupported("This backend returned an unsupported command action. Your draft is preserved.")
+                }
+                app.chatDidBind(self, storedSessionID: storedSessionID)
+            } catch {
+                guard slashContextMatches(scope), app.client === client else { return }
+                errorMessage = describe(error)
+            }
+        }
+    }
+
+    /// A refusal the draft decides on its own, given in the tap frame before anything is created or sent; nil when only the backend can judge the command. Synchronous because Home promotes its draft on `hasStartedSubmission`, and a refusal that raised it would open an empty conversation and create a session for a command that never ran.
+    private func localSlashRefusal(_ text: String) -> String? {
+        let invocation: SlashInvocation
+        do { invocation = try Self.slashInvocation(text) } catch { return describe(error) }
+        if let reason = SlashCommandSupport.unavailableReason(name: invocation.name, entry: nil)
+            ?? slashCompletion.advertisedEntry(named: invocation.name).flatMap({ SlashCommandSupport.unavailableReason(name: invocation.name, entry: $0) }) {
+            return reason
+        }
+        let hasArgument = !invocation.argument.isEmpty
+        switch invocation.name {
+        case "stop" where hasArgument: return "Use /stop without arguments."
+        case "stop" where isForeignStop: return "Use the Stop button to confirm stopping another client's work."
+        case "btw" where invocation.argument.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty: return "Use /btw followed by your question."
+        case "help", "commands": return hasArgument ? "Use /help without arguments." : nil
+        case "status", "save": return hasArgument ? "Use /\(invocation.name) without arguments." : nil
+        default: return nil
+        }
+    }
+
+    private struct SlashInvocation {
+        let name: String
+        let argument: String
+        var line: String { name + (argument.isEmpty ? "" : " " + argument) }
+    }
+
+    private static func slashInvocation(_ text: String) throws -> SlashInvocation {
+        guard text.hasPrefix("/"), !text.hasPrefix("//") else { throw HermesError.unsupported("Invalid slash command.") }
+        let body = text.dropFirst()
+        let name = body.prefix { !$0.isWhitespace }
+        guard !name.isEmpty, !name.contains("/"), !name.contains("\\"), !name.contains(":") else {
+            throw HermesError.unsupported("This text is not a slash command.")
+        }
+        return SlashInvocation(name: String(name).lowercased(), argument: String(body.dropFirst(name.count).drop(while: { $0.isWhitespace })))
+    }
+
+    private func slashContextMatches(_ scope: SlashCompletionScope) -> Bool {
+        let current = slashCompletionScope
+        return current.backendID == scope.backendID && current.profileID == scope.profileID && current.connectionID == scope.connectionID
+    }
+
+    private func appendSlashOutput(_ text: String, sessionID: String) {
+        app.engine.appendNotice(sessionID: sessionID, text: text, kind: "slash", isSystem: true)
+        app.publish(sessionID: sessionID)
+    }
+
+    private func resolveSlash(_ invocation: SlashInvocation, entry: SlashCatalogEntry?, catalog: SlashCommandCatalog?,
+        api: SlashCommandsAPI, client: HermesClient, sessionID: String, scope: SlashCompletionScope, depth: Int) async throws -> SlashDispatchResult {
+        guard depth < 8 else { throw HermesError.unsupported("Command alias cycle detected. Your draft is preserved.") }
+        guard slashContextMatches(scope), runtimeSessionID == sessionID, app.client === client else { throw CancellationError() }
+        if let reason = SlashCommandSupport.unavailableReason(name: invocation.name, entry: entry) { throw HermesError.unsupported(reason) }
+        if ["help", "commands", "stop"].contains(invocation.name) {
+            guard invocation.argument.isEmpty else { throw HermesError.unsupported("Use /\(invocation.name) without arguments.") }
+            if invocation.name == "stop" {
+                guard !isForeignStop else { throw HermesError.unsupported("Use the Stop button to confirm stopping another client's work.") }
+                stopTapped()
+                return SlashDispatchResult(json: .object(["type": .string("exec"), "output": .string("Stop requested.")]))
+            }
+            guard let catalog else { throw HermesError.unsupported("Command discovery is unavailable. Your draft is preserved.") }
+            let help = catalog.entries.filter { SlashCommandSupport.supports($0) }
+                .map { "\($0.name) — \($0.description)" }.joined(separator: "\n")
+            return SlashDispatchResult(json: .object(["type": .string("exec"), "output": .string(help)]))
+        }
+        let result: SlashDispatchResult
+        if invocation.name == "status" || invocation.name == "save" {
+            guard invocation.argument.isEmpty else { throw HermesError.unsupported("Use /\(invocation.name) without arguments.") }
+            let raw = try await client.request("session.\(invocation.name)", params: .object(["session_id": .string(sessionID)]))
+            if invocation.name == "save", let file = raw["file"]?.coercedString {
+                result = SlashDispatchResult(json: .object(["output": .string("Saved on the backend: \(file)")]))
+            } else { result = SlashDispatchResult(json: raw) }
+        } else if entry?.kind == "quick" {
+            // The CLI worker consumes aliases locally and cannot return a resolved skill prompt.
+            result = try await api.dispatch(sessionID: sessionID, name: invocation.name, argument: invocation.argument)
+        } else {
+            do { result = try await api.execute(sessionID: sessionID, line: invocation.line) }
+            catch {
+                // A worker failure may follow side effects. Retry only an absent method or an explicit routing refusal.
+                guard case HermesError.rpc(let code, let message, _) = error,
+                      code == -32601 || (code == 4018 && message.hasPrefix("skill command: use command.dispatch for /"))
+                else { throw error }
+                let executionError = error
+                guard slashContextMatches(scope), runtimeSessionID == sessionID, app.client === client else { throw CancellationError() }
+                do { result = try await api.dispatch(sessionID: sessionID, name: invocation.name, argument: invocation.argument) }
+                catch {
+                    if case HermesError.rpc(_, let message, _) = error, message.hasPrefix("not a quick/plugin/") { throw executionError }
+                    throw error
+                }
+            }
+        }
+        if result.type == "alias" {
+            guard let target = result.target, !target.isEmpty else { throw HermesError.malformedResponse("Empty command alias.") }
+            let expanded = (target.hasPrefix("/") ? target : "/" + target) + (invocation.argument.isEmpty ? "" : " " + invocation.argument)
+            let next = try Self.slashInvocation(expanded)
+            let targetEntry = catalog?.entry(named: next.name)
+            guard targetEntry != nil || SlashCommandSupport.localCommands.contains("/" + next.name) else {
+                throw HermesError.unsupported("The alias target /\(next.name) was not advertised by this backend. Your draft is preserved.")
+            }
+            return try await resolveSlash(next, entry: targetEntry, catalog: catalog, api: api,
+                client: client, sessionID: sessionID, scope: scope, depth: depth + 1)
+        }
+        return result
+    }
+
     // MARK: - Sending (the optimistic contract, spec §2)
 
     /// Steps 0–2 of the send contract, synchronous so they paint in the frame of the tap and so re-entry is the double-tap guard — `.disabled(!canSend)` lands a render late.
     func sendTapped() {
+        guard !isExecutingSlash else { return }
+        if let editing = editingEntryID {
+            sendEdit(replacing: editing)
+            return
+        }
+        if slashCompletion.commandIntent(for: draft) {
+            sendSlashCommand()
+            return
+        }
         let text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
         guard enqueueSend(text: text, attachments: attachments) else { return }
+        draft = ""
+        attachments.removeAll()
+    }
+
+    /// Send the composer as the replacement for an earlier user turn. The backend refuses a cut while a turn runs (4009, `methods_prompt.py:676-677`), so the edit waits with its draft intact rather than going out as an ordinary message.
+    private func sendEdit(replacing entryID: String) {
+        guard !live.isBusy else {
+            errorMessage = "Hermes is still working. Wait for the turn to finish, or stop it, before replacing an earlier message."
+            return
+        }
+        guard let target = editedEntry(entryID) else {
+            // The turn left the transcript (a branch, a cut from another client); what is typed is still the person's.
+            editingEntryID = nil
+            editingTarget = nil
+            errorMessage = "That message is no longer in this conversation. Your text is still in the composer."
+            return
+        }
+        let text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard enqueueSend(text: text, attachments: attachments, replacing: replacement(for: target)) else { return }
+        editingEntryID = nil
+        editingTarget = nil
         draft = ""
         attachments.removeAll()
     }
@@ -758,7 +1304,12 @@ final class ChatModel {
 
     /// Start an optimistic send without deciding what a caller owns after it succeeds.
     @discardableResult
-    private func enqueueSend(text: String, attachments: [PendingAttachment]) -> Bool {
+    private func enqueueSend(
+        text: String,
+        attachments: [PendingAttachment],
+        promptText: String? = nil,
+        replacing: OutboundMessage.Replacement? = nil
+    ) -> Bool {
         guard !isSending else { return false }
         guard !text.isEmpty || !attachments.isEmpty else { return false }
         guard app.promptAPI != nil else {
@@ -766,7 +1317,8 @@ final class ChatModel {
             return false
         }
 
-        let message = OutboundMessage(text: text, attachments: attachments)
+        var message = OutboundMessage(text: text, attachments: attachments, promptText: promptText)
+        message.replacing = replacing
         outbound.append(message)
         errorMessage = nil
         isSending = true
@@ -787,6 +1339,11 @@ final class ChatModel {
         outbound[index].failure = nil
         outbound[index].refusal = nil
         errorMessage = nil
+        // The cut takes the target and everything after it, so a replacement retried after newer turns were sent would delete them; it goes out as a plain message instead, and says so.
+        if let replacement = outbound[index].replacing, newerTurnsFollow(replacement, retrying: id) {
+            outbound[index].replacing = nil
+            errorMessage = Self.replacementOvertakenNotice
+        }
         isSending = true
         lastAckStatus = nil
         sendPhase = .sending
@@ -951,11 +1508,13 @@ final class ChatModel {
         if live.hasBlockingPrompt || live.needsInput {
             return "Waiting for your answer"
         }
+        // The agent's tool is blocked on the connection card until it settles or its deadline passes.
+        if live.connection != nil {
+            return "Waiting for you to connect an app"
+        }
         // BUG-030: a steer only happens while a turn is streaming, so this branch must beat the streaming-bubble guard below.
         if sendPhase == .queued, lastAckStatus == "steered" || lastAckStatus == "redirected" {
-            return lastAckStatus == "steered"
-                ? "Steered — the current turn continues with your message"
-                : "Redirected — the current turn restarted with your message"
+            return "Update accepted for this turn"
         }
         if live.entries.contains(where: { $0.isStreaming }) { return nil }
         // BUG-030: `appendUserEntry` claims `isBusy` before the submit ack, so an idle send is distinguished from a mid-turn steer here.
@@ -1054,6 +1613,8 @@ final class ChatModel {
                 inFlightMessageID = nil
                 sendJoinedRunningTurn = false
                 isSending = false
+                // Persist the confirmed correction even when no further event follows its reply.
+                saveLiveCheckpoint(force: true)
                 if sendPhase == .sending || sendPhase == .stalled {
                     // The pipeline ended without an ack transition, so the status line must not keep promising progress.
                     if outbound.contains(where: { $0.id == messageID && $0.failure != nil }) {
@@ -1083,10 +1644,18 @@ final class ChatModel {
             if !message.uploadedReferenceTexts.isEmpty {
                 blocks.append(message.uploadedReferenceTexts.joined(separator: "\n"))
             }
-            if !message.text.isEmpty { blocks.append(message.text) }
+            let promptText = message.promptText ?? message.text
+            if !promptText.isEmpty { blocks.append(promptText) }
             var body = blocks.joined(separator: "\n\n")
             if body.isEmpty, !message.uploadedImageNames.isEmpty {
                 body = "What do you see in this image?"
+            }
+
+            // Desktop parity: a Retry or an Edit names the durable row it replaces, looked up by content when the chat never learned it; without one it goes out as a plain send.
+            var replacingRowID = message.replacing?.rowID
+            if let replacement = message.replacing, replacingRowID == nil {
+                replacingRowID = await resolveDurableRowID(for: replacement)
+                guard !Task.isCancelled, outbound.contains(where: { $0.id == messageID }) else { return }
             }
 
             // Handoff: the engine's user entry fronts for the optimistic bubble, because events can arrive before the submit's own response frame.
@@ -1094,10 +1663,11 @@ final class ChatModel {
             // BUG-019: `live.isBusy` is read here, at the handoff, where it cannot yet be this send's own optimism.
             let handoffID = app.engine.appendUserEntry(
                 sessionID: sessionID,
-                text: body,
+                text: message.promptText == nil ? body : message.text,
                 imageRefs: message.uploadedImageNames,
                 joiningRunningTurn: live.isBusy
             )
+            app.engine.registerSubmission(sessionID: sessionID, ref: messageID.uuidString, entryID: handoffID)
             mutateOutbound(messageID) {
                 $0.handedOffEntryID = handoffID
                 $0.handedOffSessionID = sessionID
@@ -1109,10 +1679,21 @@ final class ChatModel {
             }
 
             var ackEndedVoiceChat = false
+            // Where the acknowledged bubble lives; the resume-and-retry path below moves both.
+            var ackedSessionID = sessionID
+            var ackedEntryID = handoffID
             do {
-                let ack = try await promptAPI.submit(sessionID: sessionID, text: body)
-                lastAckStatus = ack.status
+                let ack = try await promptAPI.submit(sessionID: sessionID, text: body,
+                    submissionRef: app.engine.sharedSessionSupported ? messageID.uuidString : nil,
+                    replacingRowID: replacingRowID)
+                app.engine.acknowledgeSubmission(sessionID: sessionID, ack: ack)
+                lastAckStatus = ack.effectiveStatus
                 ackEndedVoiceChat = ack.voiceStopped
+                if let rowID = ack.userRowID {
+                    // Published now: a turn that fails fast may already have sent its last frame, and a Retry reads `live`.
+                    app.engine.setRowID(sessionID: sessionID, entryID: handoffID, rowID: rowID)
+                    publishHandoff(sessionID: sessionID)
+                }
             } catch let error as HermesError where Self.shouldResumeAndRetrySubmit(error) {
                 // First statement in this block, deliberately: `resumeAndBind` applies its result destructively and cancellation does not propagate into `await task.value` of a `Task<_, Never>`.
                 guard !Task.isCancelled else { return }
@@ -1122,9 +1703,10 @@ final class ChatModel {
                 else { throw error }
                 let retryHandoffID = app.engine.appendUserEntry(
                     sessionID: result.sessionID,
-                    text: body,
+                    text: message.promptText == nil ? body : message.text,
                     joiningRunningTurn: live.isBusy
                 )
+                app.engine.registerSubmission(sessionID: result.sessionID, ref: messageID.uuidString, entryID: retryHandoffID)
                 mutateOutbound(messageID) {
                     $0.handedOffEntryID = retryHandoffID
                     $0.handedOffSessionID = result.sessionID
@@ -1133,13 +1715,53 @@ final class ChatModel {
                 if !handoffIsOnScreen(retryHandoffID) {
                     mutateOutbound(messageID) { $0.handedOffEntryID = nil }
                 }
-                let ack = try await promptAPI.submit(sessionID: result.sessionID, text: body)
-                lastAckStatus = ack.status
+                let ack = try await promptAPI.submit(sessionID: result.sessionID, text: body,
+                    submissionRef: app.engine.sharedSessionSupported ? messageID.uuidString : nil,
+                    replacingRowID: replacingRowID)
+                app.engine.acknowledgeSubmission(sessionID: result.sessionID, ack: ack)
+                lastAckStatus = ack.effectiveStatus
                 ackEndedVoiceChat = ack.voiceStopped
+                ackedSessionID = result.sessionID
+                ackedEntryID = retryHandoffID
+                if let rowID = ack.userRowID {
+                    app.engine.setRowID(sessionID: result.sessionID, entryID: retryHandoffID, rowID: rowID)
+                    publishHandoff(sessionID: result.sessionID)
+                }
+            } catch let error as HermesError where replacingRowID != nil && Self.isStaleReplacementTarget(error) {
+                // The replaced row was compressed away or deleted on another client, so a Retry naming it again is refused the same way. Desktop re-resolves the turn from a fresh transcript and tries once more (`use-prompt-actions/index.ts:1170-1207`); a turn that cannot be found again leaves the bubble with a Retry that sends the text as a new message, and says so.
+                guard !Task.isCancelled, let replacement = message.replacing else { return }
+                let resolved = await refindReplacedRow(for: replacement)
+                guard !Task.isCancelled, outbound.contains(where: { $0.id == messageID }) else { return }
+                guard let resolved, resolved != replacingRowID else {
+                    mutateOutbound(messageID) { $0.replacing = nil }
+                    throw ReplacementTargetGone()
+                }
+                replacingRowID = resolved
+                mutateOutbound(messageID) { $0.replacing?.rowID = resolved }
+                let ack: PromptAck
+                do {
+                    ack = try await promptAPI.submit(sessionID: sessionID, text: body,
+                        submissionRef: app.engine.sharedSessionSupported ? messageID.uuidString : nil,
+                        replacingRowID: resolved)
+                } catch let again as HermesError where Self.isStaleReplacementTarget(again) {
+                    mutateOutbound(messageID) { $0.replacing = nil }
+                    throw ReplacementTargetGone()
+                }
+                app.engine.acknowledgeSubmission(sessionID: sessionID, ack: ack)
+                lastAckStatus = ack.effectiveStatus
+                ackEndedVoiceChat = ack.voiceStopped
+                if let rowID = ack.userRowID {
+                    app.engine.setRowID(sessionID: sessionID, entryID: handoffID, rowID: rowID)
+                    publishHandoff(sessionID: sessionID)
+                }
             }
 
             // Acknowledged: the engine owns the entry for good now, unless Stop landed while the ack was in flight and the cancelled bubble already carries its verdict.
             if !Task.isCancelled {
+                // A stop phrase is answered before any cut is made (`methods_prompt.py:600`), so only a real turn drops what it replaced.
+                if let replacement = message.replacing, replacingRowID != nil, !ackEndedVoiceChat {
+                    dropSupersededTurn(replacement, keeping: ackedEntryID, sessionID: ackedSessionID)
+                }
                 let handedOff = outbound.first { $0.id == messageID }
                 if ackEndedVoiceChat {
                     // A typed stop phrase was never a message, so the optimistic entry comes back unconditionally — nothing else would ever release the handoff's `isBusy` claim.
@@ -1173,6 +1795,16 @@ final class ChatModel {
         } catch {
             // A cancel that landed mid-flight owns the bubble's verdict.
             guard !Task.isCancelled else { return }
+            if let disposition = live.submissionDispositions[messageID.uuidString],
+               ["executing", "queued", "terminal", "absorbed", "cancelled"].contains(disposition) {
+                // Positive server evidence survived a lost reply. Never offer a
+                // blind retry that would create another occurrence.
+                lastAckStatus = disposition == "queued" ? "queued" : "streaming"
+                if let entryID = outbound.first(where: { $0.id == messageID })?.handedOffEntryID,
+                   handoffIsOnScreen(entryID) { outbound.removeAll { $0.id == messageID } }
+                sendPhase = disposition == "queued" ? .queued : .idle
+                return
+            }
             // BUG-141: a 4090 that names why it refused gets plain language; everything else goes through `describe(error)` untouched.
             let refusal = (error as? HermesError)?.activeSessionRefusal
             markFailed(
@@ -1240,14 +1872,17 @@ final class ChatModel {
             do {
                 switch attachment.kind {
                 case .image:
-                    _ = try await attachmentAPI.attachImageBytes(
+                    let result = try await attachmentAPI.attachImageBytes(
                         sessionID: sessionID,
                         data: attachment.data,
                         filename: attachment.filename
                     )
+                    // The bubble is keyed by the gateway's own path, the name history will carry, and the bytes stay on the phone under it so the thumbnail never has to come back over the wire.
+                    let ref = result.path.isEmpty ? attachment.filename : result.path
+                    MediaByteCache.shared.remember(attachment.data, keys: [attachment.filename, ref])
                     mutateOutbound(messageID) {
                         $0.uploadedIDs.insert(attachment.id)
-                        $0.uploadedImageNames.append(attachment.filename)
+                        $0.uploadedImageNames.append(ref)
                     }
                 case .file:
                     let result = try await attachmentAPI.attachFile(
@@ -1312,7 +1947,7 @@ final class ChatModel {
         // Disarm the expiry timer across the await, or it can fire mid-flight and claim the approval expired while the backend is running the command.
         cancelApprovalExpiry()
         do {
-            let resolved = try await approvalAPI.respond(sessionID: sessionID, choice: choice)
+            let resolved = try await approvalAPI.respond(sessionID: sessionID, choice: choice, serverRequest: approval.serverRequest, legacyRequestID: approval.legacyRequestID)
             app.engine.removeApproval(sessionID: sessionID, id: approval.id)
             app.publish(sessionID: sessionID)
             if resolved == false {
@@ -1331,7 +1966,8 @@ final class ChatModel {
     ///
     /// The anchor is `receivedAt` at this client, one transport hop behind the backend's own deadline, so the timer can only fire after the backend has already given up (BUG-073).
     func approvalBudget(for approval: ApprovalRequestEvent) -> (received: Date, seconds: TimeInterval)? {
-        guard let seconds = app.settings.approvalTimeoutSeconds(), seconds > 0 else { return nil }
+        // Current requests expire through request.cancel, never a guessed local deadline.
+        guard approval.serverRequest == nil, let seconds = app.settings.approvalTimeoutSeconds(), seconds > 0 else { return nil }
         return (approval.receivedAt, seconds)
     }
 
@@ -1390,28 +2026,30 @@ final class ChatModel {
         else { return }
         // Never silently consent: a dismissal sends an empty string, not "no response" (reference §5.3).
         do {
-            _ = try await approvalAPI.respondClarify(requestID: request.id, answer: answer)
-            app.engine.clearClarify(sessionID: sessionID)
+            _ = try await approvalAPI.respondClarify(requestID: request.id, answer: answer, serverRequest: request.serverRequest, isBatch: request.isBatch)
+            if request.serverRequest == nil || live.clarify?.id == request.id {
+                app.engine.clearClarify(sessionID: sessionID)
+            }
             app.publish(sessionID: sessionID)
         } catch {
             errorMessage = describe(error)
         }
     }
 
-    /// Batch clarify: lock one question's answer, addressed by its qid, and return whether the backend accepted it; clearing the card is `finishClarify`'s job once the whole set has landed.
-    func lockClarifyAnswer(_ answer: String, questionID: String, requestID: String) async -> Bool {
+    /// Batch clarify: lock one question's answer, addressed by its qid, and return the acknowledgment plus its client revision; clearing the card is `finishClarify`'s job once the whole set has landed.
+    func lockClarifyAnswer(_ answer: String, questionID: String, requestID: String) async -> ClarifyRespondResult? {
         guard let approvalAPI = app.approvalAPI,
               let request = live.clarify,
               request.id == requestID
-        else { return false }
+        else { return nil }
         do {
-            _ = try await approvalAPI.respondClarify(
-                requestID: request.id, answer: answer, questionID: questionID
+            let result = try await approvalAPI.respondClarify(
+                requestID: request.id, answer: answer, questionID: questionID, serverRequest: request.serverRequest
             )
-            return true
+            return result.status != "expired" ? result : nil
         } catch {
             errorMessage = describe(error)
-            return false
+            return nil
         }
     }
 
@@ -1429,8 +2067,10 @@ final class ChatModel {
               let sessionID = runtimeSessionID
         else { return }
         do {
-            _ = try await approvalAPI.respondSudo(requestID: request.id, password: password)
-            app.engine.clearSudo(sessionID: sessionID)
+            _ = try await approvalAPI.respondSudo(requestID: request.id, password: password, serverRequest: request.serverRequest)
+            if request.serverRequest == nil || live.sudo?.id == request.id {
+                app.engine.clearSudo(sessionID: sessionID)
+            }
             app.publish(sessionID: sessionID)
         } catch {
             errorMessage = describe(error)
@@ -1444,8 +2084,10 @@ final class ChatModel {
               let sessionID = runtimeSessionID
         else { return }
         do {
-            _ = try await approvalAPI.respondSecret(requestID: request.id, value: value)
-            app.engine.clearSecret(sessionID: sessionID)
+            _ = try await approvalAPI.respondSecret(requestID: request.id, value: value, serverRequest: request.serverRequest)
+            if request.serverRequest == nil || live.secret?.id == request.id {
+                app.engine.clearSecret(sessionID: sessionID)
+            }
             app.publish(sessionID: sessionID)
         } catch {
             errorMessage = describe(error)
@@ -1476,6 +2118,8 @@ final class ChatModel {
                 kind: isImage ? .image : .file
             )
         )
+        // The optimistic bubble names the pick by its filename; holding the bytes under it draws the thumbnail before the upload answers.
+        if isImage { MediaByteCache.shared.remember(data, keys: [filename]) }
     }
 
     func removeAttachment(id: UUID) {
@@ -1511,7 +2155,12 @@ final class ChatModel {
         guard !storedSessionID.isEmpty,
               let cut = history.firstIndex(where: { $0.id == entryID })
         else { return }
-        let rows = Array(history[...cut])
+        // The branch wrote the child's copies under new durable rows, so the parent's would aim a Retry in the child at rows it does not have (4018).
+        let rows = history[...cut].map { row -> ChatEntry in
+            var copy = row
+            copy.rowID = nil
+            return copy
+        }
         var ordinals: [String: Int] = [:]
         for row in rows where historyOrdinals[row.id] != nil {
             ordinals[row.id] = historyOrdinals[row.id]
@@ -1524,23 +2173,214 @@ final class ChatModel {
         historyOrdinals[entryID]
     }
 
-    /// Retry: re-run the user turn preceding `entry` — the protocol has no replace-a-turn call, so this submits the same text as a fresh turn.
+    /// Retry: replace the user turn preceding `entry`, and everything after it, with the same text. `prompt.submit`'s `truncate_before_row_id` drops the old turn instead of appending a duplicate the model also sees; a turn with no durable row degrades to a plain resend, which appends, as Desktop's does.
+    ///
+    /// BUG-146: through `enqueueSend`, the one send prologue, so a retry with no backend is refused up front rather than spawning a send that can only fail, and with no copy of the prologue left to drift (the old copy's `live.isBusy` writes were dead behind its own `!live.isBusy` guard).
     func resendPrecedingUserTurn(before entryID: String) {
-        guard let index = entries.firstIndex(where: { $0.id == entryID }) else { return }
-        guard let userEntry = entries[..<index].last(where: { $0.kind == .user }) else { return }
-        guard !isSending, !live.isBusy else { return }
-        let message = OutboundMessage(text: userEntry.text, attachments: [])
-        outbound.append(message)
+        guard let userEntry = precedingUserEntry(before: entryID) else { return }
+        guard !live.isBusy else { return }
+        enqueueSend(text: userEntry.text, attachments: [], replacing: replacement(for: userEntry))
+    }
+
+    /// The user turn a Retry or an Edit on the reply `entryID` acts on.
+    func precedingUserEntry(before entryID: String) -> ChatEntry? {
+        guard let index = entries.firstIndex(where: { $0.id == entryID }) else { return nil }
+        return entries[..<index].last(where: { $0.kind == .user })
+    }
+
+    /// What a Retry or an Edit of `entry` replaces, or nil when it can only go out as a plain send: a queued, mid-turn or optimistic row is not an addressable turn, and a turn with images cannot be rebuilt from its text without dropping them from what the model sees.
+    private func replacement(for entry: ChatEntry) -> OutboundMessage.Replacement? {
+        guard entry.kind == .user, entry.noticeKind.isEmpty, entry.imageRefs.isEmpty,
+              !entry.id.hasPrefix("outbound-") else { return nil }
+        let users = entries.filter { $0.kind == .user && $0.noticeKind.isEmpty }
+        let after = users.firstIndex { $0.id == entry.id }.map { users.count - $0 - 1 } ?? 0
+        return OutboundMessage.Replacement(entryID: entry.id, rowID: entry.rowID, text: entry.text,
+                                           isLatestUserTurn: users.last?.id == entry.id,
+                                           userTurnsAfter: after, userTurnCount: users.count)
+    }
+
+    static let replacementOvertakenNotice = "Newer messages follow the one this was replacing, so it was sent as a new message and nothing was deleted."
+
+    struct ReplacementTargetGone: LocalizedError {
+        static let notice = "The message this was replacing is no longer in the conversation, so it could not be replaced. Retry sends it as a new message."
+        var errorDescription: String? { Self.notice }
+    }
+
+    /// 4018 is also the backend's code for an oversized PDF, so the sentence decides, as Desktop's check does (`use-prompt-actions/index.ts:1133-1134`).
+    nonisolated static func isStaleReplacementTarget(_ error: HermesError) -> Bool {
+        guard case let .rpc(code, message, _) = error, code == 4018 else { return false }
+        let text = message.lowercased()
+        return text.contains("no longer in session history") || text.contains("not in session history")
+    }
+
+    /// Whether the chat now shows more user turns than when `replacement` was composed, in all or after its target — the turns a cut would now delete that the person never agreed to lose. The retried message's own failed bubble is not one of them.
+    private func newerTurnsFollow(_ replacement: OutboundMessage.Replacement, retrying messageID: UUID) -> Bool {
+        let own = "outbound-\(messageID.uuidString)"
+        let users = entries.filter { $0.kind == .user && $0.noticeKind.isEmpty && $0.id != own }
+        if users.count > replacement.userTurnCount { return true }
+        // Found by id, or by row once a reload has renamed it `rest-<rowID>`; a target found by neither leaves the count above as the whole test.
+        let restID = replacement.rowID.map { "rest-\($0)" }
+        guard let index = users.firstIndex(where: { entry in
+            entry.id == replacement.entryID || entry.id == restID
+                || (replacement.rowID != nil && entry.rowID == replacement.rowID)
+        }) else { return false }
+        return users.count - index - 1 > replacement.userTurnsAfter
+    }
+
+    /// The backend accepted the replacement, so the superseded turn leaves the screen now rather than at the next reload; the transcript reload when the new turn ends is still the authoritative picture, and it rebinds any survivor row the cut rewrote (`survivor_row_id_map`).
+    private func dropSupersededTurn(_ replacement: OutboundMessage.Replacement, keeping keepEntryID: String, sessionID: String) {
+        needsHistoryReconciliation = true
+        guard handoffIsOnScreen(keepEntryID) else { return }
+        if let cut = history.firstIndex(where: { $0.id == replacement.entryID }) {
+            for entry in history[cut...] { historyOrdinals[entry.id] = nil }
+            history.removeSubrange(cut...)
+            // Everything live sits below the REST history, so all of it before the replacement went with the cut.
+            app.engine.dropEntries(sessionID: sessionID, from: nil, before: keepEntryID)
+        } else {
+            app.engine.dropEntries(sessionID: sessionID, from: replacement.entryID, before: keepEntryID)
+        }
+        publishHandoff(sessionID: sessionID)
+    }
+
+    /// Desktop's `resolveDurableRowId` (`apps/desktop/src/app/session/hooks/use-prompt-actions/rewind.ts:213-257`) over the REST transcript, for a turn whose row this chat never learned (a mirrored turn, an older backend's ack). Nil sends the text as a plain message; it never guesses a cut.
+    private func resolveDurableRowID(for replacement: OutboundMessage.Replacement) async -> Int? {
+        guard let rest = app.rest, let storedSessionID else { return nil }
+        guard let page = try? await rest.getMessages(sessionID: storedSessionID, profile: profileScope) else { return nil }
+        return Self.durableRowID(matching: replacement.text, in: page.messages, targetIsLatest: replacement.isLatestUserTurn)
+    }
+
+    /// The replaced turn looked up again after the backend refused its row with 4018, from a fresh REST page.
+    private func refindReplacedRow(for replacement: OutboundMessage.Replacement) async -> Int? {
+        guard let rest = app.rest, let storedSessionID else { return nil }
+        guard let page = try? await rest.getMessages(sessionID: storedSessionID, profile: profileScope) else { return nil }
+        return Self.refoundRowID(for: replacement, in: page.messages)
+    }
+
+    /// Which row of `rows` is the replaced turn, once the backend has said its old row is gone.
+    ///
+    /// A text match alone is not enough here: the old row is gone by the backend's word, so a lone match may be a different message that reads the same, before or after it, and a cut there deletes turns the person never agreed to lose. The match counts only where the person saw the replaced turn: as many user turns in all as when they chose it, and as many after it.
+    nonisolated static func refoundRowID(for replacement: OutboundMessage.Replacement, in rows: [TranscriptMessage]) -> Int? {
+        guard let found = durableRowID(matching: replacement.text, in: rows, targetIsLatest: replacement.isLatestUserTurn) else { return nil }
+        let users = rows.filter { $0.role == .user && $0.displayKind.isEmpty && $0.id > 0 }
+        guard users.count == replacement.userTurnCount,
+              let index = users.firstIndex(where: { $0.id == found }),
+              users.count - index - 1 == replacement.userTurnsAfter
+        else { return nil }
+        return found
+    }
+
+    /// Exact-or-nothing: a unique trimmed-text match among real user rows wins; with several, the last one only when the target is the latest user turn and that match is the latest user row.
+    nonisolated static func durableRowID(matching text: String, in rows: [TranscriptMessage], targetIsLatest: Bool) -> Int? {
+        let wanted = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !wanted.isEmpty else { return nil }
+        let users = rows.filter { $0.role == .user && $0.displayKind.isEmpty && $0.id > 0 }
+        let matches = users.filter {
+            DisplayRedaction.stripImageDirectives($0.content.plainText).body
+                .trimmingCharacters(in: .whitespacesAndNewlines) == wanted
+        }
+        if matches.count == 1 { return matches[0].id }
+        if matches.count > 1, targetIsLatest, let last = matches.last, users.last?.id == last.id { return last.id }
+        return nil
+    }
+
+    // MARK: - Edit & resend
+
+    /// The user turn the composer is replacing; nil for an ordinary send.
+    private(set) var editingEntryID: String?
+
+    /// Whether `entryID` is a user turn this chat can load into the composer and replace.
+    func canEdit(entryID: String) -> Bool {
+        guard let entry = entries.first(where: { $0.id == entryID }) else { return false }
+        return replacement(for: entry) != nil
+    }
+
+    /// Load the user turn into the composer; Send then replaces it and everything after it. Refused while the composer holds other unsent work, which this would overwrite.
+    @discardableResult
+    func beginEditing(entryID: String) -> Bool {
+        guard canEdit(entryID: entryID), let entry = entries.first(where: { $0.id == entryID }) else { return false }
+        let pending = draft.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard (pending.isEmpty || pending == entry.text) && attachments.isEmpty else {
+            errorMessage = "Send or clear what is in the composer before editing an earlier message."
+            return false
+        }
+        editingEntryID = entryID
+        editingTarget = replacement(for: entry)
+        draft = entry.text
         errorMessage = nil
-        isSending = true
-        lastAckStatus = nil
-        sendPhase = .sending
-        HapticFeedback.sent()
-        armWatchdog()
-        inFlightMessageID = message.id
-        sendJoinedRunningTurn = live.isBusy
-        phaseAttachedToRunningTurn = live.isBusy
-        sendTask = Task { await performSend(messageID: message.id) }
+        return true
+    }
+
+    /// Leave edit mode and discard the edit; the earlier message is untouched.
+    func cancelEditing() {
+        guard editingEntryID != nil else { return }
+        editingEntryID = nil
+        editingTarget = nil
+        draft = ""
+    }
+
+    /// The turn being edited as it was when editing began. An edit may begin while its turn runs, and the reload when the turn ends replaces every live entry with `rest-<rowID>` rows (`install(page:)`), so Send must be able to find the turn again without its old id.
+    private var editingTarget: OutboundMessage.Replacement?
+
+    /// The entry the edit replaces now: by id; once a reload has renamed it, by durable row, or, for a turn whose row this chat never learned, by the exact-text rule `durableRowID(matching:in:targetIsLatest:)` applies to the REST rows. Nil only when the turn has really left the transcript.
+    private func editedEntry(_ entryID: String) -> ChatEntry? {
+        if let entry = entries.first(where: { $0.id == entryID }) { return entry }
+        guard let target = editingTarget, target.entryID == entryID else { return nil }
+        let users = entries.filter { $0.kind == .user && $0.noticeKind.isEmpty && !$0.id.hasPrefix("outbound-") }
+        if let rowID = target.rowID {
+            return users.first { $0.rowID == rowID || $0.id == "rest-\(rowID)" }
+        }
+        let wanted = target.text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !wanted.isEmpty else { return nil }
+        let matches = users.filter { $0.text.trimmingCharacters(in: .whitespacesAndNewlines) == wanted }
+        if matches.count == 1 { return matches[0] }
+        if matches.count > 1, target.isLatestUserTurn, let last = matches.last, users.last?.id == last.id { return last }
+        return nil
+    }
+
+    // MARK: - Connection card
+
+    /// The `manage_connections` operation the agent is blocked on in this chat.
+    var pendingConnection: ConnectionRequest? { live.connection }
+
+    /// True while an answer to the card is on the wire, so its buttons cannot double-send.
+    private(set) var isAnsweringConnection = false
+
+    /// Not now on one row.
+    func skipConnectionTarget(_ name: String) {
+        answerConnection { api, sessionID, opID in
+            try await api.skip(sessionID: sessionID, opID: opID, targets: [name])
+        }
+    }
+
+    /// End the operation now with whatever is unresolved; the agent continues without it.
+    func continueConnection() {
+        answerConnection { api, sessionID, opID in
+            try await api.continueOperation(sessionID: sessionID, opID: opID)
+        }
+    }
+
+    /// The browser leg of a sign-in came back: ask the backend to read the account now instead of at its next tick. Best effort; the backend's own watcher reads it regardless.
+    func wakeConnection() {
+        guard let card = live.connection, let client = app.client else { return }
+        Task { await ConnectorsAPI(client: client).wake(sessionID: card.sessionID, opID: card.opID) }
+    }
+
+    /// One answer at a time. The card itself never changes here: only the backend's `connection.update` (or its settlement) moves a row, because the card is a projection of the operation (`connectors_operation.py:1-8`).
+    private func answerConnection(
+        _ send: @escaping (ConnectorsAPI, String, String) async throws -> ConnectionRespondResult
+    ) {
+        guard !isAnsweringConnection, let card = live.connection, let client = app.client else { return }
+        isAnsweringConnection = true
+        errorMessage = nil
+        Task {
+            defer { isAnsweringConnection = false }
+            do {
+                _ = try await send(ConnectorsAPI(client: client), card.sessionID, card.opID)
+            } catch {
+                guard live.connection?.opID == card.opID else { return }
+                errorMessage = "Couldn't answer the connection request: \(describe(error))"
+            }
+        }
     }
 
     /// Whether the turn that produced `entry` ran tools that mutate state, in which case retrying discards work and the affordance escalates to a hold.
@@ -2017,7 +2857,7 @@ final class ChatModel {
 
             switch message.role {
             case .user:
-                let raw = message.content.plainText
+                let raw = SteerDisplay.text(message.content.plainText, kind: message.displayKind)
                 let stripped = DisplayRedaction.stripImageDirectives(raw)
                 let inlineImages = message.content.imageReferences
                 let refs = stripped.refs + inlineImages
@@ -2027,7 +2867,10 @@ final class ChatModel {
                     kind: .user,
                     text: stripped.body,
                     imageRefs: refs,
-                    timestamp: timestamp
+                    noticeKind: message.displayKind == "steer" ? "correction" : "",
+                    timestamp: timestamp,
+                    // The REST row's `id` is the same durable SQLite row `truncate_before_row_id` addresses (`hermes_state_messages.py:1663-1664` stamps `_row_id` from `row["id"]`).
+                    rowID: message.id > 0 ? message.id : nil
                 ))
 
             case .assistant:
@@ -2098,5 +2941,23 @@ final class ChatModel {
             }
         }
         return (entries, ordinals)
+    }
+}
+
+// MARK: - Session automation controls
+
+extension ChatModel {
+    /// Nil when there is nothing to talk to: no open socket, no runtime session yet, or demo mode, where the strip must stay silent.
+    var sessionControlTransport: SessionControlTransport? {
+        guard !app.isDemoActive, app.connectionState.isOpen, let client = app.client, let sessionID = runtimeSessionID else { return nil }
+        return SessionControlTransport(client: client, sessionID: sessionID, profile: profileScope)
+    }
+
+    /// A `goal.resume` answers `type: "send"` with its kickoff prompt; it goes out the way a `send`-type slash result does, shown as its display text. False when the chat could not take it (a send already in flight, no backend), which the sheet then says.
+    @discardableResult
+    func submitControlDispatch(_ dispatch: SessionControlDispatch) -> Bool {
+        guard let message = dispatch.message?.trimmingCharacters(in: .whitespacesAndNewlines), !message.isEmpty else { return false }
+        let display = dispatch.display.flatMap { $0.isEmpty ? nil : $0 } ?? "Continue the goal"
+        return enqueueSend(text: display, attachments: [], promptText: message)
     }
 }

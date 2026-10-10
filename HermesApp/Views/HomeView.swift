@@ -22,11 +22,24 @@ enum HomeChrome {
     /// Desktop's `tracking-[0.08em]`, held as a ratio rather than a constant because this mark is drawn at two sizes.
     static let wordmarkTrackingRatio: CGFloat = 0.08
 
+    /// The wordmark's ink: Desktop's `text-midground dark:text-foreground/90` (`apps/desktop/src/components/chat/wordmark.tsx`), a mid rung in light and nearly the foreground in dark. It was `text1` at 15 %, a ghost that made the empty Home read as a screen that had not loaded.
+    static func wordmarkInk(_ t: HermesTokens, scheme: ColorScheme) -> Color {
+        scheme == .dark ? t.text1.opacity(0.9) : t.text3
+    }
+
     /// The name on the first screen, which is the app's own and not the agent's.
     static let appMark = "HARC"
 
     /// One line, under the mark, on the first-run screen only.
     static let appTagline = "Remote control for Hermes Agent"
+
+    /// What the first-run screen says a person needs before Connect can work, since the app is a client and does nothing on its own.
+    static let firstRunRequirement = "To start, you need Hermes Agent running on a computer this iPhone can reach, on the same Wi-Fi or over a VPN, and that computer's address."
+
+    static let getHermesAgentTitle = "Get Hermes Agent"
+
+    /// The agent's own public project page, which explains how to install and run it.
+    static let getHermesAgentURL = URL(string: "https://github.com/NousResearch/hermes-agent")
 }
 
 /// The quiet link row on the first-run screen; a `nil` URL draws nothing at all.
@@ -59,10 +72,27 @@ enum FirstRunLinkRow: String, CaseIterable, Identifiable {
         privacyPolicy: URL? = HermesLinks.privacyPolicy,
         support: URL? = HermesLinks.support
     ) -> [FirstRunLinkRow] {
-        allCases.filter {
-            $0.url(github: github, privacyPolicy: privacyPolicy, support: support) != nil
+        visibleLinks(github: github, privacyPolicy: privacyPolicy, support: support).map(\.row)
+    }
+
+    /// What the first-run screen draws: each row with the URL it is drawn with, from the same values that decided it exists (BUG-146; the view used to decide here and then re-read `HermesLinks` for the URL, so an injected link drew an empty slot).
+    static func visibleLinks(
+        github: URL? = HermesLinks.github,
+        privacyPolicy: URL? = HermesLinks.privacyPolicy,
+        support: URL? = HermesLinks.support
+    ) -> [FirstRunLink] {
+        allCases.compactMap { row in
+            row.url(github: github, privacyPolicy: privacyPolicy, support: support).map { FirstRunLink(row: row, url: $0) }
         }
     }
+}
+
+/// One drawn first-run link.
+struct FirstRunLink: Identifiable, Equatable {
+    let row: FirstRunLinkRow
+    let url: URL
+
+    var id: String { row.id }
 }
 
 /// Home's empty-state mark, drawn once and used at both of its sizes.
@@ -71,6 +101,7 @@ enum FirstRunLinkRow: String, CaseIterable, Identifiable {
 @MainActor
 private struct HomeWordmark: View {
     @Environment(\.hermes) private var t
+    @Environment(\.colorScheme) private var scheme
 
     let style: HermesTextStyle
 
@@ -82,7 +113,7 @@ private struct HomeWordmark: View {
             .minimumScaleFactor(0.5)
             // The mark is decoration over the composer, not a heading.
             .accessibilityHidden(true)
-            .foregroundStyle(t.text1.opacity(0.15))
+            .foregroundStyle(HomeChrome.wordmarkInk(t, scheme: scheme))
     }
 }
 
@@ -139,7 +170,8 @@ struct HomeView: View {
             LiveSessionPickerSheet { pendingLiveSession = $0 }
         }
         // Promote on the send, not on session creation: waiting for `session.create` would paint the first steps of the send into a transcript nobody can see.
-        .onChange(of: draftModel.isSending) { _, sending in
+        // FEAT-040: a slash command's Send counts too. Its output and its refusals are written to the thread's transcript and error row, and Home renders neither.
+        .onChange(of: draftModel.hasStartedSubmission) { _, sending in
             guard sending else { return }
             let promoted = draftRoute
             path.append(.thread(promoted))
@@ -209,6 +241,17 @@ struct HomeView: View {
                 // Landscape: composer and resume strip cap at 640 pt and centre; a no-op at phone widths.
                 VStack(spacing: 0) {
                     resumeStrip
+                    // A command refused on Home stays on Home (it never raises `hasStartedSubmission`), so its refusal is read here, as in a conversation's dock.
+                    if let error = draftModel.errorMessage {
+                        HomeErrorRow(
+                            message: error,
+                            // The keyboard goes first, as Send puts it away on Home before a send carries the draft into its conversation.
+                            sendAsText: ComposerSendAsText.isOffered(for: draftModel) ? {
+                                Keyboard.dismiss()
+                                ComposerSendAsText.send(draftModel)
+                            } : nil
+                        )
+                    }
                     ComposerView(model: draftModel, viewportHeight: viewport)
                     if let reason = app.noBackendSendReason {
                         sendBlockedReason(reason)
@@ -230,15 +273,7 @@ struct HomeView: View {
                 // The rail is already open — the button is removed, not disabled; the clear slot keeps the chips centred.
                 Color.clear.frame(width: Hit.min, height: Hit.min)
             } else {
-                Button {
-                    hubOpen = true
-                } label: {
-                    Image(systemName: "line.3.horizontal")
-                        .font(.system(size: 17, weight: .medium))
-                        .foregroundStyle(t.text1)
-                }
-                .buttonStyle(IconButtonStyle())
-                .accessibilityLabel("Menu")
+                HomeMenuButton { hubOpen = true }
             }
 
             // BUG-063: the mirror slot that pays for the second trailing control, a sibling of the hamburger rather than a wider frame on it, which would have doubled its hit box.
@@ -261,8 +296,7 @@ struct HomeView: View {
             }
             HomeModeControlButton(mode: mode, action: onToggleMode)
         }
-        .padding(.horizontal, Space.s3)
-        .frame(height: 52)
+        .homeBarRow()
     }
 
     private var hasLiveSession: Bool {
@@ -275,9 +309,8 @@ struct HomeView: View {
             HomeLiveIndicator.open(pickerOpen: &livePickerOpen, path: &path)
         } label: {
             PulsingDot(color: t.warn, size: 9)
-                .frame(width: Hit.min, height: Hit.min)
         }
-        .buttonStyle(IconButtonStyle())
+        .buttonStyle(HomeBarButtonStyle())
         .accessibilityLabel("A session is running")
         .accessibilityHint("Lists the sessions running now")
     }
@@ -351,6 +384,28 @@ struct HomeView: View {
                 .multilineTextAlignment(.center)
                 .fixedSize(horizontal: false, vertical: true)
 
+            Text(HomeChrome.firstRunRequirement)
+                .font(HermesFont.subhead)
+                .foregroundStyle(t.text2)
+                .multilineTextAlignment(.center)
+                .fixedSize(horizontal: false, vertical: true)
+                .accessibilityIdentifier("firstrun.requirement")
+
+            if let url = HomeChrome.getHermesAgentURL {
+                Link(destination: url) {
+                    HStack(spacing: Space.s2) {
+                        Text(HomeChrome.getHermesAgentTitle)
+                        Image(systemName: "arrow.up.right")
+                            .imageScale(.small)
+                            .accessibilityHidden(true)
+                    }
+                    .font(HermesFont.subhead)
+                    .foregroundStyle(t.action)
+                }
+                .frame(minHeight: Hit.min)
+                .accessibilityIdentifier("firstrun.getHermesAgent")
+            }
+
             Button("Connect a backend") {
                 isAddingBackend = true
             }
@@ -377,7 +432,7 @@ struct HomeView: View {
         }
     }
 
-    /// The first-run screen's only chrome: a gear, trailing — no hamburger, since the hub has nothing to say with no backend.
+    /// The first-run screen's only chrome: a gear, trailing — no hamburger, since the hub has nothing to say with no backend. It stands on the same glass disc as Home's controls, in the same ink, so the first screen's bar is the bar the rest of the app wears.
     private var firstRunBar: some View {
         HStack(spacing: Space.s4) {
             Spacer(minLength: 0)
@@ -385,41 +440,34 @@ struct HomeView: View {
                 path.append(.settings)
             } label: {
                 Image(systemName: "gearshape")
-                    .font(.system(size: 17, weight: .medium))
-                    .foregroundStyle(t.text2)
+                    .font(.system(size: HomeModeControl.glyphSize, weight: .medium))
+                    .foregroundStyle(t.text1)
             }
-            .buttonStyle(IconButtonStyle())
+            .buttonStyle(HomeBarButtonStyle())
             .accessibilityLabel("Settings")
             .accessibilityIdentifier("firstrun.settings")
         }
-        .padding(.horizontal, Space.s3)
-        .frame(height: 52)
+        .homeBarRow()
     }
 
     /// GitHub · Privacy · Support, rendered only where a URL exists.
     private var firstRunLinks: some View {
-        let rows = FirstRunLinkRow.visibleRows()
+        let links = FirstRunLinkRow.visibleLinks()
         return HStack(spacing: Space.s3) {
-            ForEach(Array(rows.enumerated()), id: \.element.id) { index, row in
+            ForEach(Array(links.enumerated()), id: \.element.id) { index, link in
                 if index > 0 {
                     Text("·")
                         .font(HermesFont.footnote)
                         .foregroundStyle(t.text4)
                         .accessibilityHidden(true)
                 }
-                if let url = row.url(
-                    github: HermesLinks.github,
-                    privacyPolicy: HermesLinks.privacyPolicy,
-                    support: HermesLinks.support
-                ) {
-                    Link(destination: url) {
-                        Text(row.title)
-                            .font(HermesFont.footnote)
-                            .foregroundStyle(t.text3)
-                    }
-                    .frame(minHeight: Hit.min)
-                    .accessibilityIdentifier("firstrun.link.\(row.rawValue)")
+                Link(destination: link.url) {
+                    Text(link.row.title)
+                        .font(HermesFont.footnote)
+                        .foregroundStyle(t.text3)
                 }
+                .frame(minHeight: Hit.min)
+                .accessibilityIdentifier("firstrun.link.\(link.row.rawValue)")
             }
         }
         .frame(maxWidth: .infinity)
@@ -454,12 +502,14 @@ struct HomeView: View {
             VStack(alignment: .leading, spacing: 0) {
                 SectionHeader("Continue")
                 ForEach(rows) { thread in
+                    let waiting = waitingKind(for: thread)
                     Button {
                         path.append(.thread(.existing(thread)))
                     } label: {
                         FlatRow {
                             HStack(spacing: Space.s3) {
-                                if app.isLiveWorking(thread.id) {
+                                // A parked question is shown whatever `session.active_list` says, because the registry is the authority on it.
+                                if waiting != nil || app.isLiveWorking(thread.id) {
                                     PulsingDot(color: t.warn, size: 6)
                                 }
                                 Text(thread.displayTitle)
@@ -468,7 +518,13 @@ struct HomeView: View {
                                     .lineLimit(1)
                             }
                         } trailing: {
-                            if app.isLiveWorking(thread.id) {
+                            if let waiting {
+                                Text(HomeWaitingMark.label(for: waiting))
+                                    .font(HermesFont.footnote)
+                                    .foregroundStyle(t.warn)
+                                    .lineLimit(1)
+                                    .accessibilityIdentifier("home.continue.waiting")
+                            } else if app.isLiveWorking(thread.id) {
                                 // The fraction comes from the turn engine's own plan and is absent, not `0/0`, until a plan has arrived.
                                 Text(liveDetail(for: thread.id))
                                     .font(HermesFont.footnote)
@@ -493,6 +549,11 @@ struct HomeView: View {
         app.continueRows()
     }
 
+    /// BUG-062 C. What this row's session is waiting on, from the current-request registry; the `session.active_list` join is read here, at render, because that list moves on its own poll.
+    private func waitingKind(for thread: SessionSummary) -> ApprovalNotifications.PromptKind? {
+        app.liveActivities.waiting.kind(storedID: thread.id, runtimeID: app.liveStatus(forStoredID: thread.id)?.id)
+    }
+
     /// The live row's trailing text: the gateway's status word, and the step fraction when the session has a plan.
     private func liveDetail(for sessionID: String) -> String {
         let label = app.liveWorkingLabel(for: sessionID)
@@ -513,5 +574,19 @@ struct HomeView: View {
               let remembered = LastProjectStore.remembered(profileID: app.activeProfileID)
         else { return }
         draftModel.draftCwd = remembered
+    }
+}
+
+/// BUG-062 C, Home's half: the mark a Continue row wears while its session waits on the person holding the phone.
+///
+/// Keyed off the current-request registry through `WaitingSessions`, not `session.active_list`, whose `waiting` word an approval-blocked session never reports.
+enum HomeWaitingMark {
+    static func label(for kind: ApprovalNotifications.PromptKind) -> String {
+        // A Desktop-only request cannot be answered from this phone, so the row does not ask for an answer.
+        switch kind {
+        case .desktop: return "Continue in Desktop"
+        case .signIn: return "Sign in needed"
+        default: return "Needs your answer"
+        }
     }
 }

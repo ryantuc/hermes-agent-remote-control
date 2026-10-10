@@ -144,14 +144,30 @@ public actor WebSocketTransport: GatewayTransport {
     /// neither the pong nor a write error arrives, so an undeadlined probe would park forever.
     private func probeSocket() async -> Bool {
         guard let task, state == .open else { return false }
-        let timeout = KeepaliveMonitor.defaultPongTimeout
-        return await withCheckedContinuation { (continuation: CheckedContinuation<Bool, Never>) in
+        return await Self.boundedPing(timeout: KeepaliveMonitor.defaultPongTimeout) { answer in
+            task.sendPing { error in answer(error == nil) }
+        }
+    }
+
+    /// One ping raced against a deadline; whichever lands first answers, exactly once. `sleep` is the
+    /// deadline's clock, injectable so a test can see what becomes of it.
+    static func boundedPing(
+        timeout: TimeInterval,
+        sleep: @escaping @Sendable (TimeInterval) async -> Void = { seconds in
+            try? await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
+        },
+        ping: @escaping (_ answer: @escaping @Sendable (Bool) -> Void) -> Void
+    ) async -> Bool {
+        await withCheckedContinuation { (continuation: CheckedContinuation<Bool, Never>) in
             let once = PingOutcome(continuation)
-            task.sendPing { error in once.finish(error == nil) }
-            Task {
-                try? await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
+            // Armed BEFORE the ping, so a pong answered synchronously still finds it to cancel: an
+            // answered probe must not leave its deadline sleeping out the window (BUG-146).
+            once.arm(Task {
+                await sleep(timeout)
+                guard !Task.isCancelled else { return }
                 once.finish(false)
-            }
+            })
+            ping { answered in once.finish(answered) }
         }
     }
 
@@ -163,20 +179,34 @@ public actor WebSocketTransport: GatewayTransport {
     }
 
     /// Resolves a continuation exactly once: the ping completion and the timeout race by design,
-    /// and a `CheckedContinuation` traps on a double resume rather than ignoring it.
+    /// and a `CheckedContinuation` traps on a double resume rather than ignoring it. Whichever side
+    /// wins also cancels the deadline task, so the loser never outlives the probe.
     private final class PingOutcome: @unchecked Sendable {
         private let lock = NSLock()
         private var continuation: CheckedContinuation<Bool, Never>?
+        private var deadline: Task<Void, Never>?
 
         init(_ continuation: CheckedContinuation<Bool, Never>) {
             self.continuation = continuation
+        }
+
+        /// Hold the deadline; one armed after the outcome is already settled is cancelled at once.
+        func arm(_ task: Task<Void, Never>) {
+            lock.lock()
+            let settled = continuation == nil
+            if !settled { deadline = task }
+            lock.unlock()
+            if settled { task.cancel() }
         }
 
         func finish(_ answered: Bool) {
             lock.lock()
             let pending = continuation
             continuation = nil
+            let timer = deadline
+            deadline = nil
             lock.unlock()
+            timer?.cancel()
             pending?.resume(returning: answered)
         }
     }

@@ -15,7 +15,71 @@ struct SettingOption: Identifiable, Equatable {
     }
 }
 
-enum SettingRowKind {
+/// Which config keys a model row writes, and through which route.
+enum ModelSettingTarget: Equatable {
+    /// The backend's main model, `model.provider` + `model.default`: written through `POST /api/model/set` like Desktop's picker, which validates the pick and normalises the slug; a typed slug goes through the flat `model` key instead, where the backend infers the provider.
+    case mainDefault
+    /// Two sibling keys written together as one partial; the row's own key is the model, `providerKey` its provider. An empty pair means "use the main model".
+    case pair(providerKey: String)
+    /// An auxiliary task slot, written through `POST /api/model/set` scope `auxiliary` like Desktop. `auto` + empty means "use the main model".
+    case auxiliary(task: String)
+
+    /// The key holding the pair's provider, given the row's model key.
+    func providerKey(forModelKey modelKey: String) -> String? {
+        switch self {
+        case .mainDefault: return nil
+        case .pair(let providerKey): return providerKey
+        case .auxiliary(let task): return "auxiliary.\(task).provider"
+        }
+    }
+
+    /// Whether an empty pick is on offer, meaning the slot follows the main model.
+    var canInherit: Bool { self != .mainDefault }
+
+    /// Where a pick goes for this target, decided apart from the view so the routing can be pinned.
+    func write(for choice: ModelSettingChoice, modelKey: String) -> ModelSettingWrite {
+        switch (self, choice) {
+        case (.mainDefault, .catalogue(let pair)):
+            return .assign(.main, pair)
+        case (.mainDefault, .typed(let slug)):
+            return .flatModel(slug)
+        case (.mainDefault, .inherit):
+            return .refuse("The main model cannot be blank.")
+        case (.auxiliary(let task), .catalogue(let pair)):
+            return .assign(.auxiliary(task: task), pair)
+        case (.auxiliary(let task), .typed(let text)):
+            let pair = ModelPair.parsing(text)
+            guard !pair.provider.isEmpty else { return .refuse(Self.needsProviderMessage) }
+            return .assign(.auxiliary(task: task), pair)
+        case (.auxiliary(let task), .inherit):
+            return .assign(.auxiliary(task: task), ModelPair(provider: "auto", model: ""))
+        case (.pair(let providerKey), .catalogue(let pair)):
+            return .pair(providerKey: providerKey, modelKey: modelKey, pair)
+        case (.pair(let providerKey), .typed(let text)):
+            let pair = ModelPair.parsing(text)
+            guard !pair.provider.isEmpty else { return .refuse(Self.needsProviderMessage) }
+            return .pair(providerKey: providerKey, modelKey: modelKey, pair)
+        case (.pair(let providerKey), .inherit):
+            return .pair(providerKey: providerKey, modelKey: modelKey, ModelPair(provider: "", model: ""))
+        }
+    }
+
+    static let needsProviderMessage = "Type it as provider/model, so the backend knows who serves it."
+}
+
+/// The write a model row makes for a pick.
+enum ModelSettingWrite: Equatable {
+    /// `POST /api/model/set`, the route Desktop's picker uses.
+    case assign(ModelAssignmentAPI.Slot, ModelPair)
+    /// The flat `model` key through `PUT /api/config`; the backend infers the provider from the slug.
+    case flatModel(String)
+    /// Two sibling keys in one partial.
+    case pair(providerKey: String, modelKey: String, ModelPair)
+    /// Nothing is written and the sheet says why.
+    case refuse(String)
+}
+
+enum SettingRowKind: Equatable {
     /// Boolean → `SwitchRow`.
     case toggle
     /// 2–3 closed options → `SegmentedRow`; a value in `holdFor` is destructive and arms an inline `HoldToConfirmButton` instead of committing on the tap.
@@ -28,6 +92,10 @@ enum SettingRowKind {
     case number(integer: Bool)
     /// `[String]` value → list editor sheet.
     case stringList(addPrompt: String)
+    /// A model slug → the catalogue picker the composer uses, in its choose-for-a-setting mode.
+    case model(ModelSettingTarget)
+    /// The `fallback_providers` list → the chain editor.
+    case fallbackChain
     /// Read-only display — a value the phone shows but does not edit.
     case display
 }
@@ -66,11 +134,20 @@ extension SettingRowDescriptor {
     func numberDisplay(_ value: JSONValue?, integer: Bool) -> String {
         guard let value, !value.isNull else { return unsetLabel ?? "" }
         if unsetLabel != nil, Self.readsAsUnlimited(value) { return unsetLabel ?? "" }
-        guard let number = value.coercedDouble else {
+        // BUG-146: what is still unreadable resolves to the backend's default, as an absent key does, so it takes the same label.
+        guard let number = Self.strippedNumber(value) else {
             return unsetLabel ?? (value.coercedString ?? "")
         }
         if integer || number.rounded() == number { return Self.integerText(number) }
         return String(number)
+    }
+
+    /// The number a value holds, reading a string the way the backend does: `resolve_turn_limit` strips before it parses, where Swift's `Double(_:)` rejects any leading or trailing whitespace, so `" 40 "` would otherwise read as unreadable rather than as 40 (BUG-146).
+    static func strippedNumber(_ value: JSONValue) -> Double? {
+        if case .string(let s) = value {
+            return Double(s.trimmingCharacters(in: .whitespacesAndNewlines))
+        }
+        return value.coercedDouble
     }
 
     /// The largest magnitude that can go through `Int(_: Double)`, which traps for a finite value outside `Int64`'s range (BUG-109).
@@ -107,7 +184,8 @@ extension SettingRowDescriptor {
         case .number(let n):
             return n <= 0
         case .string(let s):
-            let trimmed = s.trimmingCharacters(in: .whitespaces).lowercased()
+            // Python's `str.strip()` takes newlines as well as spaces and tabs.
+            let trimmed = s.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
             if trimmed.isEmpty { return true }
             if unlimitedSpellings.contains(trimmed) { return true }
             if let n = Double(trimmed) { return n <= 0 }
@@ -238,19 +316,39 @@ enum SettingsCatalog {
             SettingsSectionDescriptor(header: "Model", rows: [
                 SettingRowDescriptor(
                     "model", "Default model",
-                    description: "provider/model slug, as the CLI accepts it. New conversations start here; the composer pill changes one conversation.",
-                    kind: .text(placeholder: "provider/model")
+                    description: "Model new chats start with. The pill in a conversation changes that conversation only.",
+                    kind: .model(.mainDefault)
                 ),
                 SettingRowDescriptor(
                     "fallback_providers", "Fallback models",
-                    description: "Provider + model pairs tried when the primary fails. Edited from the desktop or CLI.",
-                    kind: .display
+                    description: "Tried in order if the main model fails.",
+                    kind: .fallbackChain
                 ),
                 SettingRowDescriptor(
                     "model_context_length", "Context window",
                     description: "Tokens. 0 auto-detects from the catalogue.",
                     advanced: true,
                     kind: .number(integer: true)
+                ),
+            ]),
+            SettingsSectionDescriptor(header: "Helper models", rows: [
+                SettingRowDescriptor(
+                    "auxiliary.vision.model", "Images",
+                    description: "Reads the pictures you send. Blank uses the main model.",
+                    advanced: true,
+                    kind: .model(.auxiliary(task: "vision"))
+                ),
+                SettingRowDescriptor(
+                    "auxiliary.compression.model", "Compression",
+                    description: "Summarises older context when a chat gets long. Blank uses the main model.",
+                    advanced: true,
+                    kind: .model(.auxiliary(task: "compression"))
+                ),
+                SettingRowDescriptor(
+                    "auxiliary.title_generation.model", "Chat titles",
+                    description: "Names each conversation. Blank uses the main model.",
+                    advanced: true,
+                    kind: .model(.auxiliary(task: "title_generation"))
                 ),
             ]),
             SettingsSectionDescriptor(header: "Reasoning", rows: [
@@ -500,8 +598,8 @@ enum SettingsCatalog {
             SettingsSectionDescriptor(header: "Subagents", rows: [
                 SettingRowDescriptor(
                     "delegation.model", "Subagent model",
-                    description: "Blank inherits the agent's model.",
-                    kind: .text(placeholder: "provider/model")
+                    description: "Blank uses the main model.",
+                    kind: .model(.pair(providerKey: "delegation.provider"))
                 ),
                 SettingRowDescriptor("delegation.max_concurrent_children", "Concurrent subagents", kind: .number(integer: true)),
                 SettingRowDescriptor("delegation.max_iterations", "Subagent iterations", kind: .number(integer: true)),

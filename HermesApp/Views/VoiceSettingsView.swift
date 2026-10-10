@@ -19,7 +19,7 @@ struct VoiceSettingsView: View {
         ScrollView {
             LazyVStack(alignment: .leading, spacing: 0) {
                 SectionHeader("Dictation")
-                    .padding(.top, Space.s6)
+                    .padding(.top, Space.settingsTop)
 
                 VStack(alignment: .leading, spacing: Space.s3) {
                     Text("Engine")
@@ -101,7 +101,7 @@ struct VoiceSettingsView: View {
                     )
                 )
 
-                Text("Voice chat always listens with on-device recognition, whatever the engine above is set to. Turn-taking needs to know the moment you start and stop talking, and the backend transcribes a finished recording — several seconds after the fact.")
+                Text("Voice chat always uses on-device recognition, so it can hear when you start and stop talking.")
                     .font(HermesFont.footnote)
                     .foregroundStyle(t.text3)
                     .fixedSize(horizontal: false, vertical: true)
@@ -114,7 +114,7 @@ struct VoiceSettingsView: View {
                 providerRow("Speech to text", key: "stt.provider")
                 providerRow("Text to speech", key: "tts.provider")
 
-                Text("Configured on the desktop. The Hermes dictation engine runs whichever provider is set here; reading answers aloud uses this iPhone's own voice and does not.")
+                Text("The Hermes engine uses the speech-to-text provider set on your computer. Reading answers aloud always uses this iPhone's voice.")
                     .font(HermesFont.footnote)
                     .foregroundStyle(t.text3)
                     .fixedSize(horizontal: false, vertical: true)
@@ -126,7 +126,7 @@ struct VoiceSettingsView: View {
         .background(t.canvas)
         .navigationTitle("Voice")
         .navigationBarTitleDisplayMode(.inline)
-        .toolbarBackground(t.canvas, for: .navigationBar)
+        .hermesTopBar()
         .task { await store.loadIfNeeded() }
     }
 

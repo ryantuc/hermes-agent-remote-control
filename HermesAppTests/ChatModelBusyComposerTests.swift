@@ -119,7 +119,7 @@ final class ChatModelBusyComposerTests: XCTestCase {
         XCTAssertEqual(chat.sendPhase, .queued)
         XCTAssertEqual(
             chat.statusLineText,
-            "Steered — the current turn continues with your message",
+            "Update accepted for this turn",
             "the status line must say the message entered the live turn, not that it queued"
         )
 

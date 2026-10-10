@@ -15,9 +15,9 @@ public enum ValueState: Equatable, Sendable {
     /// The backend stopped describing this, so the row is removed rather than disabled.
     case unsupported
 
-    /// The common derivation. `lazy` is `SessionInfo.lazy`.
+    /// The common derivation. `lazy` is `SessionInfo.lazy`, and it does not change the answer: an empty value is `.unknown` from either shape of `session.info`, because a full reply also leaves a field empty when there is nothing to report (no cwd, no branch), so emptiness never proves the backend stopped describing the row, which is what `.unsupported` would claim.
     public static func of(_ value: String, connected: Bool, lazy: Bool) -> ValueState {
-        if value.isEmpty { return lazy ? .unknown : .unknown }
+        if value.isEmpty { return .unknown }
         return connected ? .live : .stale
     }
 }

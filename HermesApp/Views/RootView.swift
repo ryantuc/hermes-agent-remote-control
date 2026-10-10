@@ -47,6 +47,8 @@ struct RootView: View {
     @State private var releaseSweep: Task<Void, Never>?
     /// Home's draft conversation, hoisted out of `HomeView` so a mode switch cannot take the half-typed message with it.
     @State private var draftRoute = ThreadRoute.new(UUID())
+    /// Screenshot harness only: one of the activity strip's sheets, presented over the seeded chat because the strip itself is mounted by `ChatView`.
+    @State private var harnessStripSheet: HarnessStripSheet?
 
     var body: some View {
         Group {
@@ -73,6 +75,12 @@ struct RootView: View {
         // FEAT-020: a top safe-area inset on the shell's root, so the demo marker displaces every screen instead of covering one.
         .demoModeMarker(isActive: app.isDemoActive) {
             Task { await app.exitDemo() }
+        }
+        .sheet(item: $harnessStripSheet) { sheet in
+            switch sheet.kind {
+            case .automation: SessionControlSheet(controls: sheet.chat.sessionControls)
+            case .processes: BackgroundProcessesSheet(processes: sheet.chat.backgroundProcesses)
+            }
         }
         .animation(Motion.layer(reduced: reduceMotion), value: hubOpen)
         // `hermes://chat/<runtime session id>` — the only link this app opens.
@@ -231,8 +239,8 @@ struct RootView: View {
     private var hubLayer: some View {
         if hubOpen {
             t.scrim
-                // BUG-118: the scrim and the drawer's own ground must not paint over the demo banner.
-                .ignoresSafeArea(edges: [.bottom, .horizontal])
+                // The whole screen dims, the status bar included, so the drawer reads as a layer over the app and not a panel pasted below the clock. BUG-118's demo banner is safe because `demoModeMarker` raises it above this whole layer.
+                .ignoresSafeArea(.container)
                 .onTapGesture { hubOpen = false }
                 .transition(.opacity)
                 .accessibilityLabel("Close menu")
@@ -241,7 +249,20 @@ struct RootView: View {
             NavigationHubView(path: $path, isPresented: $hubOpen, mode: $mode)
                 .frame(width: 300)
                 .frame(maxHeight: .infinity)
-                .background(t.surface.ignoresSafeArea(edges: [.bottom, .horizontal]))
+                .background(t.surface.ignoresSafeArea(.container))
+                // The drawer's lift onto the scrim: a gradient past its trailing edge rather than a shadow, so the list is not rendered offscreen on every frame of the slide.
+                .background(alignment: .trailing) {
+                    LinearGradient(
+                        colors: [Color.black.opacity(HubDrawer.liftOpacity), Color.black.opacity(0)],
+                        startPoint: .leading,
+                        endPoint: .trailing
+                    )
+                    .frame(width: HubDrawer.liftWidth)
+                    .offset(x: HubDrawer.liftWidth)
+                    .ignoresSafeArea(.container)
+                    .allowsHitTesting(false)
+                    .accessibilityHidden(true)
+                }
                 .transition(.move(edge: .leading))
                 .gesture(
                     DragGesture(minimumDistance: 24)
@@ -344,6 +365,18 @@ struct RootView: View {
             case "settings": seedPath([.settings])
             case "appearance": seedPath([.settings, .settingsAppearance])
             case "settings-model": seedPath([.settings, .settingsScreen(.modelReasoning)])
+            // The model rows with a stood-in document, and the two editors opened on arrival.
+            case "settings-model-demo":
+                app.settings.seedDocumentForScreenshots(ModelSettingsDemo.document)
+                seedPath([.settings, .settingsScreen(.modelReasoning)])
+            case "settings-model-picker":
+                app.settings.seedDocumentForScreenshots(ModelSettingsDemo.document)
+                ModelSettingsDemo.autoOpenKey = "model"
+                seedPath([.settings, .settingsScreen(.modelReasoning)])
+            case "settings-fallbacks":
+                app.settings.seedDocumentForScreenshots(ModelSettingsDemo.document)
+                ModelSettingsDemo.autoOpenKey = "fallback_providers"
+                seedPath([.settings, .settingsScreen(.modelReasoning)])
             case "settings-safety": seedPath([.settings, .settingsScreen(.safety)])
             case "settings-memory": seedPath([.settings, .settingsScreen(.memory)])
             case "settings-workspace": seedPath([.settings, .settingsScreen(.workspace)])
@@ -418,6 +451,25 @@ struct RootView: View {
                 let windowed = ThreadRoute.new(UUID())
                 app.chat(for: windowed).seedWindowedDemoTranscript()
                 seedPath([.thread(windowed)])
+            // The automation line's fixtures: a goal, a loop and a heartbeat plus two background processes on a demo transcript; `automation-sheet` and `processes-sheet` also open the matching sheet.
+            case "automation", "automation-sheet", "processes-sheet":
+                let demo = ThreadRoute.new(UUID())
+                let chat = app.chat(for: demo)
+                chat.seedDemoTranscript()
+                chat.seedDemoAutomation()
+                seedPath([.thread(demo)])
+                if route != "automation" {
+                    Task { @MainActor in
+                        try? await Task.sleep(nanoseconds: 2_500_000_000)
+                        harnessStripSheet = HarnessStripSheet(kind: route == "automation-sheet" ? .automation : .processes, chat: chat)
+                    }
+                }
+            case "media-showcase":
+                // A sent photo as the store persists it, a clip the phone plays, and a container it does not.
+                let media = ThreadRoute.new(UUID())
+                await MediaShowcase.prime()
+                app.chat(for: media).seedFixturePageOnMain(MediaShowcase.page())
+                seedPath([.thread(media)])
             case "approval", "approval-short":
                 // The prompt has to arrive after ChatView is mounted: the sheet is presented by an `onChange`, and a prompt already in place at mount is an initial value, not a change.
                 let demo = ThreadRoute.new(UUID())
@@ -498,4 +550,10 @@ struct RootView: View {
         return arguments[index + 1]
     }
     #endif
+}
+
+/// The compact-width hub drawer's lift: the shade it casts on the scrim past its trailing edge.
+enum HubDrawer {
+    static let liftWidth: CGFloat = 12
+    static let liftOpacity: Double = 0.18
 }

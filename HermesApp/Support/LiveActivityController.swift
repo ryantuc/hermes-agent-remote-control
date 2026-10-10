@@ -1,6 +1,8 @@
 import ActivityKit
+import CryptoKit
 import Foundation
 import HermesServeKit
+import Observation
 import SwiftUI
 import UIKit
 import os
@@ -33,10 +35,17 @@ final class LiveActivityController: ApprovalActivityHandling {
     /// A refused session stays in `desired`, and reconcile runs on every engine flush, so an unremembered refusal is thirty retries a second.
     private var startRefusals: [String: String] = [:]
 
+    /// BUG-062 C, Home's half: which sessions are waiting on a person right now, for views. Written by `reconcile`, which already sees every tracked session; nothing here depends on whether a card is allowed.
+    let waiting = WaitingSessions()
+
     /// Cosmetic updates coalesce; anything that changes what a person is being asked goes immediately.
     private static let minimumUpdateInterval: TimeInterval = 1.0
     /// How long a finished card lingers showing its ended state before the real ActivityKit end, and the resurrection window.
     var windDownLinger: TimeInterval = 8
+    /// How long after its last push a card waiting on a person is pushed again with a fresh stale date: inside the stale window, so the card does not grey out while this app is alive to vouch for the wait.
+    var waitingRefreshInterval: TimeInterval = LiveActivityDerivation.staleWindow - 60
+    /// The pending re-push of a waiting card, by session. A task sleeps through a suspension, so a card the app can no longer vouch for greys out on time.
+    private var refreshTasks: [String: Task<Void, Never>] = [:]
 
     init(surface: LiveActivitySurface) {
         self.surface = surface
@@ -103,7 +112,10 @@ final class LiveActivityController: ApprovalActivityHandling {
 
         // Deliberately above the cap and the suppression filter: whether a card is allowed has nothing to do with whether a person should be told their agent is blocked.
         // BUG-062: this is the one place that sees every tracked session's turn state, so syncing here covers clarify, sudo and secret as well as approval.
-        ApprovalNotifications.sync(prompts: Self.blockingPrompts(in: live))
+        let prompts = Self.blockingPrompts(in: live)
+        let signIns = Self.signInsWaiting(in: live)
+        ApprovalNotifications.sync(prompts: prompts, signIns: signIns)
+        waiting.update(prompts: Self.waitingPrompts(prompts, signIns: signIns)) { runtimeID in storedIDs(forRuntimeID: runtimeID, app: app) }
 
         // A dismissal only holds for the turn it was made in.
         suppressed = suppressed.filter { live[$0].map(deserves) ?? false }
@@ -145,7 +157,7 @@ final class LiveActivityController: ApprovalActivityHandling {
             } else if state.sudo != nil {
                 prompts[sessionID] = .sudo
             } else if state.secret != nil {
-                prompts[sessionID] = .secret
+                prompts[sessionID] = state.secret?.requiresDesktop == true ? .desktop : .secret
             } else if state.clarify != nil {
                 prompts[sessionID] = .clarify
             }
@@ -153,11 +165,40 @@ final class LiveActivityController: ApprovalActivityHandling {
         return prompts
     }
 
+    /// Which sessions' turns wait on a connector sign-in card. The card is not a blocking prompt (it is a dock row, not the approval sheet), so it is listed apart from them, but the person is needed all the same.
+    static func signInsWaiting(in live: [String: LiveActivityContext]) -> Set<String> {
+        Set(live.filter { $0.value.state.connection != nil }.map(\.key))
+    }
+
+    /// What Home and the other-chat banner mark as waiting: every blocking prompt, plus a sign-in card on a session with no blocking prompt.
+    static func waitingPrompts(_ prompts: [String: ApprovalNotifications.PromptKind], signIns: Set<String>) -> [String: ApprovalNotifications.PromptKind] {
+        var waiting = prompts
+        for sessionID in signIns where waiting[sessionID] == nil { waiting[sessionID] = .signIn }
+        return waiting
+    }
+
+    /// BUG-062 B. The card's parked line for a blocking prompt; nil for an approval, which has its own copy and the only buttons a card may carry.
+    static func parkedQuestion(for kind: ApprovalNotifications.PromptKind?) -> ParkedQuestion? {
+        switch kind {
+        case .clarify, .sudo, .secret: return .answer
+        case .desktop: return .desktop
+        case .approval, .signIn, nil: return nil
+        }
+    }
+
+    /// The durable ids Home's rows are keyed by, for one runtime session: the open chat's stored id, and any `session.active_list` row that names this runtime id.
+    private func storedIDs(forRuntimeID runtimeID: String, app: AppModel) -> [String] {
+        var ids: [String] = []
+        if let stored = app.chat(runtimeSessionID: runtimeID)?.storedSessionID, !stored.isEmpty { ids.append(stored) }
+        for (key, status) in app.liveStatuses where status.id == runtimeID { ids.append(key) }
+        return ids
+    }
+
     /// A turn is running or someone is being asked something, and FEAT-019's when-to-show row agrees; an unattended session additionally needs the auto-start row.
     private func deserves(_ context: LiveActivityContext) -> Bool {
         guard LiveActivityPreferences.showPolicy.admits(
             isBusy: context.state.isBusy,
-            hasBlockingPrompt: context.state.hasBlockingPrompt
+            hasBlockingPrompt: context.state.hasBlockingPrompt || context.state.connection != nil
         ) else { return false }
         return context.isAttended || LiveActivityPreferences.autoStartForCron
     }
@@ -188,6 +229,7 @@ final class LiveActivityController: ApprovalActivityHandling {
             activities[sessionID] = activity
             lastPushed[sessionID] = snapshot
             lastPushAt[sessionID] = Date()
+            armWaitingRefresh(sessionID: sessionID, snapshot: snapshot)
             startRefusals[sessionID] = nil
             note("start session=\(sessionID) id=\(activity.id) tools=\(snapshot.toolsCompleted)/\(snapshot.toolsTotal)")
             observe(activity, sessionID: sessionID)
@@ -209,14 +251,20 @@ final class LiveActivityController: ApprovalActivityHandling {
         let state = describe(UIApplication.shared.applicationState)
         let prompt = blockingPrompts(in: ["k": context])["k"]?.rawValue ?? "none"
         let token = context.state.currentApproval?.id.uuidString ?? ""
-        return "\(state)|\(prompt)|\(token)|\(context.state.isBusy)"
+        return "\(state)|\(prompt)|\(token)|\(context.state.isBusy)|\(context.state.connection != nil)"
     }
 
     /// BUG-116. A card that could not start, on a turn that is blocked on a person.
     /// iOS refuses to start a Live Activity from the background and this app requests no push-to-start token, so under "Questions" the notification is the only surface left.
     private func fallBackToNotification(sessionID: String, context: LiveActivityContext) {
         let prompts = Self.blockingPrompts(in: [sessionID: context])
-        guard let kind = prompts[sessionID] else { return }
+        guard let kind = prompts[sessionID] else {
+            if context.state.connection != nil {
+                note("start fallback session=\(sessionID) notification=sign-in")
+                ApprovalNotifications.scheduleSignIn(sessionID: sessionID)
+            }
+            return
+        }
         note("start fallback session=\(sessionID) notification=\(kind.rawValue)")
         ApprovalNotifications.schedule(sessionID: sessionID, kind: kind)
     }
@@ -239,13 +287,17 @@ final class LiveActivityController: ApprovalActivityHandling {
 
         let started = startedAt[sessionID] ?? Date()
         let snapshot = snapshot(for: sessionID, context: context, startedAt: started)
-        guard snapshot != lastPushed[sessionID] else { return }
+        // A session waiting on a person sends nothing until it is answered, so its unchanged card is pushed again before its stale date passes.
+        let refreshDue = Self.staleRefreshDue(snapshot, lastPushAt: lastPushAt[sessionID], interval: waitingRefreshInterval, now: Date())
+        guard snapshot != lastPushed[sessionID] || refreshDue else { return }
 
         // An approval appearing or being answered changes what the person is being asked, so it is never coalesced; everything else can wait a second, because ActivityKit budgets updates and silently drops the excess.
         let consentChanged = snapshot.approvalToken != lastPushed[sessionID]?.approvalToken
         // FEAT-019: nor is a surface being switched off, because the next engine flush that would carry it may never come.
         let presentationChanged = snapshot.shownSurfaces != lastPushed[sessionID]?.shownSurfaces
-        if !consentChanged, !presentationChanged,
+        // BUG-062 B: nor a question arriving or going, because a session parked on one sends nothing more until it is answered.
+        let parkedChanged = snapshot.parkedQuestion != lastPushed[sessionID]?.parkedQuestion
+        if !consentChanged, !presentationChanged, !parkedChanged, !refreshDue,
            let last = lastPushAt[sessionID],
            Date().timeIntervalSince(last) < Self.minimumUpdateInterval {
             return
@@ -254,13 +306,38 @@ final class LiveActivityController: ApprovalActivityHandling {
         lastPushed[sessionID] = snapshot
         lastPushAt[sessionID] = Date()
         activity.update(snapshot, staleDate: LiveActivityDerivation.staleDate(from: Date()))
+        armWaitingRefresh(sessionID: sessionID, snapshot: snapshot)
         if consentChanged {
-            note("update session=\(sessionID) approval=\(snapshot.approvalToken.isEmpty ? "none" : snapshot.approvalToken) fitsIsland=\(snapshot.approvalFitsIsland)")
+            note("update session=\(sessionID) approval=\(Self.logFingerprint(snapshot.approvalToken)) fitsIsland=\(snapshot.approvalFitsIsland)")
+        }
+        if parkedChanged {
+            note("update session=\(sessionID) parked=\(snapshot.parkedQuestion?.rawValue ?? "none")")
+        }
+    }
+
+    /// Whether an unchanged card is due a re-push: it is waiting on a person and its last push is nearly as old as the refresh interval.
+    static func staleRefreshDue(_ snapshot: LiveActivitySnapshot, lastPushAt: Date?, interval: TimeInterval, now: Date) -> Bool {
+        guard snapshot.isWaitingOnPerson, let lastPushAt else { return false }
+        // A sleeping task wakes a little early or late; five percent keeps the timer's own wake-up from missing.
+        return now.timeIntervalSince(lastPushAt) >= interval * 0.95
+    }
+
+    /// Re-push a waiting card before it goes stale; anything else cancels the pending re-push.
+    private func armWaitingRefresh(sessionID: String, snapshot: LiveActivitySnapshot) {
+        refreshTasks.removeValue(forKey: sessionID)?.cancel()
+        guard snapshot.isWaitingOnPerson else { return }
+        let interval = waitingRefreshInterval
+        refreshTasks[sessionID] = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(interval * 1_000_000_000))
+            guard !Task.isCancelled, let self else { return }
+            self.refreshTasks[sessionID] = nil
+            self.update(sessionID: sessionID)
         }
     }
 
     /// The turn behind this card is over: say so on the glass now and schedule the real end after the linger, in case a queued prompt starts the next turn onto the same card.
     private func windDown(sessionID: String) {
+        refreshTasks.removeValue(forKey: sessionID)?.cancel()
         guard activities[sessionID] != nil, windDownTasks[sessionID] == nil else { return }
         guard let base = lastPushed[sessionID] else {
             end(sessionID: sessionID, reason: "turn ended")
@@ -290,6 +367,7 @@ final class LiveActivityController: ApprovalActivityHandling {
 
     private func end(sessionID: String, reason: String) {
         windDownTasks.removeValue(forKey: sessionID)?.cancel()
+        refreshTasks.removeValue(forKey: sessionID)?.cancel()
         guard let activity = activities.removeValue(forKey: sessionID) else { return }
         let final = lastPushed[sessionID]
         lastPushed[sessionID] = nil
@@ -319,11 +397,13 @@ final class LiveActivityController: ApprovalActivityHandling {
     /// BUG-004 housekeeping, called when AppModel forgets an engine session; `recency` in particular grows with every session ever touched and is walked on every reconcile.
     func sessionEvicted(sessionID: String) {
         recency.removeAll { $0 == sessionID }
+        refreshTasks.removeValue(forKey: sessionID)?.cancel()
         startRefusals[sessionID] = nil
         suppressed.remove(sessionID)
         startedAt[sessionID] = nil
         lastPushed[sessionID] = nil
         lastPushAt[sessionID] = nil
+        waiting.forget(runtimeID: sessionID)
     }
 
     struct RosterRow: Identifiable {
@@ -341,6 +421,8 @@ final class LiveActivityController: ApprovalActivityHandling {
                 detail = snapshot.statusText.isEmpty ? "Finished" : snapshot.statusText
             } else if snapshot.hasApproval {
                 detail = "Waiting for your approval"
+            } else if let parked = snapshot.parkedQuestion {
+                detail = parked.line
             } else if snapshot.toolsTotal > 0 {
                 detail = "\(snapshot.toolName.isEmpty ? "Working" : snapshot.toolName) · \(snapshot.toolsCompleted)/\(snapshot.toolsTotal)"
             } else {
@@ -364,6 +446,7 @@ final class LiveActivityController: ApprovalActivityHandling {
             if state == .dismissed || state == .ended {
                 // A wind-down counting down to an end that can no longer happen must not outlive the card.
                 self?.windDownTasks.removeValue(forKey: sessionID)?.cancel()
+                self?.refreshTasks.removeValue(forKey: sessionID)?.cancel()
                 self?.activities.removeValue(forKey: sessionID)
                 self?.lastPushed[sessionID] = nil
                 if state == .dismissed { self?.suppressed.insert(sessionID) }
@@ -376,7 +459,7 @@ final class LiveActivityController: ApprovalActivityHandling {
         context: LiveActivityContext,
         startedAt: Date
     ) -> LiveActivitySnapshot {
-        LiveActivityDerivation.snapshot(
+        let derived = LiveActivityDerivation.snapshot(
             from: context.state,
             title: context.title,
             startedAt: startedAt,
@@ -385,6 +468,11 @@ final class LiveActivityController: ApprovalActivityHandling {
             // FEAT-019. In the content state, not the attributes: attributes are immutable for the life of an activity, so a surface switched off mid-turn would never reach a card already up.
             surfaces: LiveActivityPreferences.surfaces
         )
+        // BUG-062 B. Keyed off the session's prompt fields, which `TurnEngine` projects from the current-request registry, and not off `isBusy` or the running tool: a turn parked on a question is still "busy" and its running tool is the question.
+        let kind = Self.blockingPrompts(in: [sessionID: context])[sessionID]
+        // A blocking prompt outranks a sign-in card; an approval keeps its own copy and buttons.
+        let parked: ParkedQuestion? = kind == nil && context.state.connection != nil ? .signIn : Self.parkedQuestion(for: kind)
+        return ParkedQuestion.applying(parked, to: derived)
     }
 
     // MARK: - ApprovalActivityHandling
@@ -408,11 +496,11 @@ final class LiveActivityController: ApprovalActivityHandling {
         // BUG-070 A. The bridge is installed in `HermesMobileApp.init()`, so a button pressed during a cold launch reaches this before the model that owns the approval queue exists.
         let ready = await waitForApp()
         if !ready {
-            note("\(approving ? "approve" : "deny") NO-MODEL session=\(session) token=\(short(token)) — the app never finished launching")
+            note("\(approving ? "approve" : "deny") NO-MODEL session=\(session) token=\(Self.logFingerprint(token)) — the app never finished launching")
         }
         let decision = preflight(token: token, session: session, approving: approving)
         if decision != .submit {
-            note("\(approving ? "approve" : "deny") PREFLIGHT-REFUSED session=\(session) token=\(short(token)) decision=\(decision.rawValue)")
+            note("\(approving ? "approve" : "deny") PREFLIGHT-REFUSED session=\(session) token=\(Self.logFingerprint(token)) decision=\(decision.rawValue)")
             // With no `AppModel` the gate refuses for want of a queue to read, not because the queue is empty, so the request may still be waiting.
             refuse(session: session, reason: ready ? .requestGone : .appNotReady)
         }
@@ -450,7 +538,7 @@ final class LiveActivityController: ApprovalActivityHandling {
 
     /// The gated path: foreground, biometric, then the gate re-evaluated against the queue as it stands after the prompt, because an approval ages out at 300 s and the next one takes the head slot.
     func approveFromActivity(token: String, session: String) async {
-        note("approve BEGIN session=\(session) token=\(short(token)) appState=\(Self.describe(UIApplication.shared.applicationState))")
+        note("approve BEGIN session=\(session) token=\(Self.logFingerprint(token)) appState=\(Self.describe(UIApplication.shared.applicationState))")
 
         let foreground = await waitForForeground()
         note("approve foreground=\(foreground)")
@@ -490,7 +578,7 @@ final class LiveActivityController: ApprovalActivityHandling {
     func denyFromActivity(token: String, session: String) async {
         let head = headApproval(session: session)
         let decision = IslandApprovalGate.decideDeny(token: token, headToken: head?.id.uuidString)
-        note("deny session=\(session) token=\(short(token)) decision=\(decision.rawValue)")
+        note("deny session=\(session) token=\(Self.logFingerprint(token)) decision=\(decision.rawValue)")
         guard decision == .submit, let request = head, let chat = chat(session: session) else {
             // BUG-070 B. Deny has no second factor, so every way of failing this guard means the request is gone.
             refuse(session: session, reason: .requestGone)
@@ -536,7 +624,12 @@ final class LiveActivityController: ApprovalActivityHandling {
         return UIApplication.shared.applicationState == .active
     }
 
-    private func short(_ token: String) -> String { String(token.prefix(8)) }
+    /// What a log line may say about an approval token: "none", or a short one-way fingerprint that matches lines about the same approval up. The token is what the island's Approve sends back to answer the request, and `note` reaches the unified log in every build, so neither the token nor a piece of it is written.
+    static func logFingerprint(_ token: String) -> String {
+        guard !token.isEmpty else { return "none" }
+        let digest = SHA256.hash(data: Data(token.utf8))
+        return "#" + digest.prefix(4).map { String(format: "%02x", $0) }.joined()
+    }
 
     private static func describe(_ state: UIApplication.State) -> String {
         switch state {
@@ -551,10 +644,16 @@ final class LiveActivityController: ApprovalActivityHandling {
     private func note(_ message: String) {
         logger.info("\(message, privacy: .public)")
         #if DEBUG
+        notesForTesting.append(message)
         print("[live-activity] \(message)")
         fflush(stdout)
         #endif
     }
+
+    #if DEBUG
+    /// Every line `note` wrote, so a test can read what reached the log.
+    private(set) var notesForTesting: [String] = []
+    #endif
 }
 
 /// What the app knows about a session that the activity needs and the kit cannot derive.
@@ -565,6 +664,42 @@ struct LiveActivityContext {
     var skin: LiveActivitySkinSeed
     /// This phone has a `ChatModel` for the session; false means a cron or desktop-started run we are only watching on the socket.
     var isAttended: Bool
+}
+
+/// BUG-062 C, Home's half. Which sessions the current-request registry says are waiting on a person, observable so a question arriving, or being answered on another client, repaints Home with no turn event behind it.
+///
+/// Two keys because Home and the registry use two id spaces: Home's rows carry durable ids, the registry and the engine carry runtime ids.
+@MainActor
+@Observable
+final class WaitingSessions {
+    private(set) var byRuntimeID: [String: ApprovalNotifications.PromptKind] = [:]
+    private(set) var byStoredID: [String: ApprovalNotifications.PromptKind] = [:]
+
+    /// What a Home row's session is waiting on, if anything. `runtimeID` is the row's `session.active_list` join, passed in at render time because that list moves on its own poll.
+    func kind(storedID: String, runtimeID: String?) -> ApprovalNotifications.PromptKind? {
+        if let kind = byStoredID[storedID] { return kind }
+        if let runtimeID, let kind = byRuntimeID[runtimeID] { return kind }
+        // A live-only row with no durable key is keyed by its runtime id.
+        return byRuntimeID[storedID]
+    }
+
+    /// Replace the whole picture from one reconcile pass; `storedIDs` maps a runtime id to the durable ids Home might key it by.
+    func update(prompts: [String: ApprovalNotifications.PromptKind], storedIDs: (String) -> [String]) {
+        var stored: [String: ApprovalNotifications.PromptKind] = [:]
+        for (runtimeID, kind) in prompts {
+            for id in storedIDs(runtimeID) where stored[id] == nil || kind == .approval {
+                stored[id] = kind
+            }
+        }
+        // Guarded: `@Observable` publishes on every assignment, and this runs on every engine flush.
+        if prompts != byRuntimeID { byRuntimeID = prompts }
+        if stored != byStoredID { byStoredID = stored }
+    }
+
+    /// The engine forgot this session, so nothing can be waiting on it any more.
+    func forget(runtimeID: String) {
+        if byRuntimeID[runtimeID] != nil { byRuntimeID[runtimeID] = nil }
+    }
 }
 
 extension String {

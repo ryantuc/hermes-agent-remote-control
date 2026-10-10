@@ -112,11 +112,12 @@ public enum Redaction {
         // Only key names that are a credential in every context: `token`, `key`, `code` and `state` are deliberately absent, because `tokens: 1500` and `state: running` are ordinary agent output.
         // Quoted values get a paired-quote pattern since a passphrase can contain spaces, and `authorization` gets its own entry because its unquoted value has an internal space after the scheme.
         // The `[A-Za-z0-9_]*` prefix is load-bearing: an env dump prints `SOME_API_KEY=…` and a leading `\b` never matches before an underscore, so the closing `\b` does the discriminating.
+        // The lookbehind pins that prefix to the first character of a run (BUG-154). Unpinned, the engine retried it from every position inside a run and rescanned the run's tail each time, so a 20,000-character run took minutes. A match could only ever start where a run starts, because a start inside a run loses to the earlier start whose prefix absorbs the rest, so pinning changes the cost and not the matches.
         let credentialNames: String =
             "api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret"
             + "|password|passwd|code[_-]?verifier"
         let assignmentKeyPattern: String =
-            "(?i)(\"?[A-Za-z0-9_]*(?:" + credentialNames + ")\\b\"?\\s*[:=]\\s*)"
+            "(?i)(\"?(?<![A-Za-z0-9_])[A-Za-z0-9_]*(?:" + credentialNames + ")\\b\"?\\s*[:=]\\s*)"
         let quotedAssignmentPattern: String =
             assignmentKeyPattern + "([\"'])[^\"']*\\2"
         let unquotedAssignmentPattern: String =

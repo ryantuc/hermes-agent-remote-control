@@ -82,15 +82,22 @@ public struct RGBA: Equatable, Sendable {
 
 // MARK: - Layer 2: per-mode mix knobs
 
-/// The only thing that differs between polarities: dark pulls the card seed toward ink, light keeps surfaces near full strength and tints from the accent.
+/// The only thing that differs between polarities: dark pulls the card seed toward ink, light keeps surfaces near full strength.
+///
+/// Strokes and fills are tinted from the foreground in both polarities, so a neutral control is grey in light as it is in dark. Light used to tint them from the accent, which made every segmented row, secondary button and skin card pale blue beside a grey model pill: two designs rather than one design in two polarities.
 struct MixKnobs {
     let canvas: Double, canvasDeep: Double
     let surface: Double, surface2: Double, surface3: Double, enclosure: Double
     let text: [Double]
     let stroke: [Double]
     let fill: [Double]
-    /// What strokes and fills are tinted with.
-    let tintIsAccent: Bool
+    /// Dark only: the least each elevated surface rises off the canvas, as the share of the way from the canvas to the foreground. Nil in light, where a raised card is the darker one and the derivation already puts it there.
+    let elevation: Elevation?
+
+    /// The four elevated surfaces' floors, in the order they stack: the sheet ground, the enclosure, the wells, code blocks and pills, then `surface3`.
+    struct Elevation {
+        let surface: Double, enclosure: Double, surface2: Double, surface3: Double
+    }
 
     static let dark = MixKnobs(
         canvas: 0.40, canvasDeep: 0.33,
@@ -98,7 +105,7 @@ struct MixKnobs {
         text: [0.94, 0.72, 0.52, 0.36],
         stroke: [0.22, 0.14, 0.09, 0.05],
         fill: [0.04, 0.07, 0.12, 0.18, 0.26],
-        tintIsAccent: false
+        elevation: Elevation(surface: 0.04, enclosure: 0.05, surface2: 0.07, surface3: 0.10)
     )
 
     static let light = MixKnobs(
@@ -107,7 +114,7 @@ struct MixKnobs {
         text: [0.94, 0.72, 0.62, 0.44],
         stroke: [0.22, 0.14, 0.12, 0.07],
         fill: [0.04, 0.07, 0.10, 0.16, 0.24],
-        tintIsAccent: true
+        elevation: nil
     )
 }
 
@@ -130,6 +137,9 @@ public struct HermesTokens: Equatable, Sendable {
 
     // Action
     public let action, actionInk, accent, accentFill: Color
+
+    /// A control that cannot act, whatever its role: the label on the tertiary text rung over the resting neutral fill. Never a faded copy of the enabled colours, which put the primary's label at about 1.1:1 on its own ground in both polarities; a disabled control still says what it will do, so its words keep the text ramp's AA guarantee, and it drops the accent so the colour that means "press this" appears only when it can be pressed.
+    public let controlDisabledFill, controlDisabledInk: Color
 
     // Semantics: pinned, never derived and never `.red` / `.orange` / `.green`, which shift under Increase Contrast and under skins.
     public let danger, dangerFill, warn, warnFill, ok, okFill: Color
@@ -155,14 +165,23 @@ public struct HermesTokens: Equatable, Sendable {
         let skin = Self.repaired(rawSkin, polarity: polarity, knobs: knobs)
         let ink = HermesSkin.ink
         let fg = skin.fg
-        let tint = knobs.tintIsAccent ? skin.accent : skin.fg
+        // What strokes and fills are tinted with, in both polarities.
+        let tint = skin.fg
 
         let canvasRGBA = skin.bg.mixed(knobs.canvas, with: ink)
 
+        // In dark a raised surface is the lighter one, but a card seed darker than the background (Desktop's Nous and GitHub dark, `#010409` under `#0D1117`) pulled toward ink lands under the canvas, and code blocks, tables and the model pill read as holes. So a dark surface never sits below the canvas lifted toward the foreground by its step; a skin whose card already rises further keeps its own.
+        func elevated(_ derived: RGBA, _ step: Double?) -> RGBA {
+            guard let step else { return derived }
+            let floor = fg.mixed(step, with: canvasRGBA)
+            return derived.luminance >= floor.luminance ? derived : floor
+        }
+        let surfaceRGBA = elevated(skin.card.mixed(knobs.surface, with: ink), knobs.elevation?.surface)
+
         // The session grounds are resolved before the text ramp because the ramp is checked against them, not against `canvas` alone.
-        let surface2RGBA = skin.card.mixed(knobs.surface2, with: ink)
-        let surface3RGBA = skin.card.mixed(knobs.surface3, with: ink)
-        let enclosureRGBA = skin.card.mixed(knobs.enclosure, with: ink)
+        let surface2RGBA = elevated(skin.card.mixed(knobs.surface2, with: ink), knobs.elevation?.surface2)
+        let surface3RGBA = elevated(skin.card.mixed(knobs.surface3, with: ink), knobs.elevation?.surface3)
+        let enclosureRGBA = elevated(skin.card.mixed(knobs.enclosure, with: ink), knobs.elevation?.enclosure)
         let bubbleMix = polarity == .dark ? Self.userBubbleMixDark : Self.userBubbleMixLight
         let neutralCard = polarity == .dark ? Self.neutralCardDark : Self.neutralCardLight
         // The fallbacks are deliberately four different derived surfaces; in light `surface` and `enclosure` coincide, so the bot bubble and the tool card share a ground and are told apart by the enclosure border.
@@ -174,10 +193,10 @@ public struct HermesTokens: Equatable, Sendable {
 
         canvas = canvasRGBA.color
         canvasDeep = skin.bg.mixed(knobs.canvasDeep, with: ink).color
-        surface = skin.card.mixed(knobs.surface, with: ink).color
-        surface2 = skin.card.mixed(knobs.surface2, with: ink).color
-        surface3 = skin.card.mixed(knobs.surface3, with: ink).color
-        enclosure = skin.card.mixed(knobs.enclosure, with: ink).color
+        surface = surfaceRGBA.color
+        surface2 = surface2RGBA.color
+        surface3 = surface3RGBA.color
+        enclosure = enclosureRGBA.color
 
         scrim = RGBA(hex: 0x03081A, alpha: polarity == .dark ? 0.62 : 0.34).color
         // The step up from `scrim` is the only cue that a prompt cannot be dismissed; do not equalise them.
@@ -205,6 +224,9 @@ public struct HermesTokens: Equatable, Sendable {
         fill3 = tint.alpha(knobs.fill[2]).color
         fill4 = tint.alpha(knobs.fill[3]).color
         fill5 = tint.alpha(knobs.fill[4]).color
+
+        controlDisabledFill = fill2
+        controlDisabledInk = text3
 
         // Rung 5: an accent that cannot carry ink stops being a fill.
         let inkOnAction = polarity == .dark ? skin.bg : RGBA(hex: 0xFCFCFC)
@@ -310,8 +332,9 @@ public struct HermesTokens: Equatable, Sendable {
         func passes(_ alpha: Double) -> Bool {
             grounds.allSatisfy { fg.alpha(alpha).contrast(over: $0) >= 4.5 }
         }
+        // BUG-146: the condition is stated over the same rungs the lift is applied to. It used to test only `ramp[1]` and `ramp[2]` while lifting `ramp[0]` too; the result is the same, because contrast rises with alpha and `ramp[0]` is the highest rung, so it passes whenever the lower two do, but a lift should never be applied on a condition it was not checked against.
         var lift = 0.0
-        while lift + 0.04 <= ceiling + 1e-9, !passes(ramp[2] + lift) || !passes(ramp[1] + lift) {
+        while lift + 0.04 <= ceiling + 1e-9, !wordBearing.allSatisfy({ passes(ramp[$0] + lift) }) {
             lift += 0.04
         }
         guard lift > 0 else { return ramp }
@@ -597,6 +620,8 @@ public enum Space {
     public static let s9: CGFloat = 32
     /// Bottom pad on a scroller ending at the home indicator.
     public static let s10: CGFloat = 42
+    /// Above the first section header of every settings screen, so sibling screens start their content at one height and nothing jumps when you move between them.
+    public static let settingsTop: CGFloat = s6
 }
 
 public enum Radius {

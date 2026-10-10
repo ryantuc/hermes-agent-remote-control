@@ -1,12 +1,11 @@
 # XcodeGen project definition for the Hermes iOS client.
 #
-# On a Mac:
+# On a Mac, from the root of the clone:
 #   brew install xcodegen
-#   cd HermesMobile
 #   xcodegen generate
 #   open HermesMobile.xcodeproj
 #
-# Set DEVELOPMENT_TEAM below (or in Xcode's Signing pane) before device builds.
+# Before a device build, put your own team id in the four DEVELOPMENT_TEAM lines and your own identifiers in bundleIdPrefix and the four PRODUCT_BUNDLE_IDENTIFIER lines (CONTRIBUTING.md lists them). Xcode's Signing pane does not survive the next xcodegen generate.
 name: HermesMobile
 options:
   bundleIdPrefix: com.hermes.mobile
@@ -78,22 +77,22 @@ targets:
           - UIInterfaceOrientationLandscapeLeft
           - UIInterfaceOrientationLandscapeRight
         NSCameraUsageDescription: "Attach photos of documents or scenes to your Hermes conversation."
-        NSPhotoLibraryUsageDescription: "Attach photos from your library to your Hermes conversation."
+        NSPhotoLibraryUsageDescription: "Attach photos and videos from your library to your Hermes conversation."
         # Add-only (spec §4.5 / §3 media viewer): saving a generated image to
         # the camera roll needs *Add*, not full library access. The read key
         # above is the picker's and stays a separate grant — asking for read
         # access in order to write one file is the kind of over-ask that gets
         # a prompt denied once and then forever.
-        NSPhotoLibraryAddUsageDescription: "Save an image from a Hermes conversation to your photo library."
+        NSPhotoLibraryAddUsageDescription: "Save an image or video from a Hermes conversation to your photo library."
         # Voice (spec §4.5). Both are required before the first use of either
         # dictation engine: the recogniser needs the speech grant even when it
         # runs entirely on device, and the microphone grant is what actually
         # starts the audio engine. A missing string here is a launch-time
         # crash on first use, not a build error.
-        NSMicrophoneUsageDescription: "Dictate a message, or talk to Hermes hands-free."
-        NSSpeechRecognitionUsageDescription: "Turn your dictation into text. On-device recognition keeps the audio on your iPhone; the Hermes engine sends the recording to your own backend."
+        NSMicrophoneUsageDescription: "Dictate a message, or talk to Hermes hands-free. With the Hermes dictation engine, the recording goes to your own backend to be transcribed."
+        NSSpeechRecognitionUsageDescription: "Turn what you say into text for dictation and voice chat. Recognition runs on your iPhone, so the audio stays on it."
         NSFaceIDUsageDescription: "Confirm dangerous agent actions with Face ID."
-        NSLocalNetworkUsageDescription: "Connect to your own hermes serve backend on your local network or tailnet."
+        NSLocalNetworkUsageDescription: "HARC connects to the Hermes Agent you run on your own computer, over your local network or VPN."
         # Allow plain-http backends over private networks (Tailscale) during
         # development. Production guidance is HTTPS/WSS — see docs/DEPLOYMENT.md.
         NSAppTransportSecurity:

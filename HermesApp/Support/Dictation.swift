@@ -53,7 +53,7 @@ final class Dictation {
             switch speech {
             case .authorized: break
             case .denied, .restricted:
-                return "Speech recognition is turned off for Hermes. Turn it on in Settings › Hermes, or switch the engine to Hermes in Settings › Voice."
+                return "Speech recognition is turned off for HARC. Turn it on in iOS Settings › HARC, or switch the engine to Hermes in Settings › Voice."
             case .notDetermined: return "Speech recognition was not granted."
             @unknown default: return "Speech recognition is unavailable."
             }
@@ -62,7 +62,7 @@ final class Dictation {
             AVAudioApplication.requestRecordPermission { continuation.resume(returning: $0) }
         }
         guard mic else {
-            return "Hermes cannot use the microphone. Turn it on in Settings › Hermes."
+            return "HARC cannot use the microphone. Turn it on in iOS Settings › HARC."
         }
         return nil
     }
@@ -107,13 +107,14 @@ final class Dictation {
     /// the gateway first, which is why `.transcribing` is a visible state.
     func stop() {
         guard state == .listening else { return }
-        switch (recorder, engine) {
-        case (let recorder?, _):
+        if let recorder {
             recorder.stop()
             self.recorder = nil
+            // `start` runs one engine, so this finds nothing today; it is here so that a live on-device engine can never outlive a Hermes stop (BUG-146).
+            teardownOnDevice()
             state = .transcribing
             Task { await finishHermes() }
-        default:
+        } else {
             let text = partial
             teardownOnDevice()
             endAudioSession()

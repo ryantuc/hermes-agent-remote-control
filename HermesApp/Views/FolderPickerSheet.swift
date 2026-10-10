@@ -24,6 +24,8 @@ struct FolderPickerSheet: View {
     /// The load in flight is a host disk walk, not a cache read (FEAT-013).
     @State private var scanning = false
     @State private var failure: String?
+    /// BUG-092: why the lists below are missing or stale, kept apart from `failure` (a pick that did not land) because only this one is fixed by loading again.
+    @State private var loadFailure: String?
     @State private var applying: String?
     @State private var browsing = false
 
@@ -38,6 +40,9 @@ struct FolderPickerSheet: View {
                     .foregroundStyle(t.danger)
                     .padding(.horizontal, Space.s6)
                     .padding(.bottom, Space.s3)
+            }
+            if let loadFailure {
+                loadFailureRow(loadFailure)
             }
 
             ScrollView {
@@ -56,10 +61,7 @@ struct FolderPickerSheet: View {
                                 pathRow(label: repo.label, path: repo.root, isRepo: true)
                             }
                         }
-                        let extraProjects = projects.filter { project in
-                            !project.isNoProject && !project.path.isEmpty
-                                && !repos.contains { $0.root == project.path }
-                        }
+                        let extraProjects = Self.extraProjects(projects, besides: repos)
                         if !extraProjects.isEmpty {
                             SectionHeader("Projects")
                                 .padding(.top, Space.s5)
@@ -100,6 +102,63 @@ struct FolderPickerSheet: View {
         if !currentPath.isEmpty { return currentPath }
         if !app.defaultCwd.isEmpty { return app.defaultCwd }
         return repos.first?.root ?? projects.first(where: { !$0.path.isEmpty })?.path ?? ""
+    }
+
+    /// The Projects section: a project is listed only when no Repositories row already names its directory.
+    /// BUG-091: through `HostPath.isSame`, never `==` — on a Windows host `discover_repos` spells a root `X:\…` and `projects.tree` spells the same directory `X:/…`.
+    static func extraProjects(
+        _ projects: [ProjectsAPI.Project],
+        besides repos: [ProjectsAPI.DiscoveredRepo]
+    ) -> [ProjectsAPI.Project] {
+        projects.filter { project in
+            !project.isNoProject && !project.path.isEmpty
+                && !repos.contains(where: { HostPath.isSame($0.root, project.path) })
+        }
+    }
+
+    /// Whether a row is the working directory already in play, which earns it the checkmark; `HostPath.isSame` for the same reason as above.
+    static func isCurrent(_ path: String, currentPath: String) -> Bool {
+        !currentPath.isEmpty && HostPath.isSame(path, currentPath)
+    }
+
+    /// BUG-092: one line for whichever of the two list calls failed; nil when both answered.
+    static func loadFailureText(repositories: String?, projects: String?) -> String? {
+        switch (repositories, projects) {
+        case (nil, nil):
+            return nil
+        case let (reason?, nil):
+            return "Couldn't list repositories: \(reason)"
+        case let (nil, reason?):
+            return "Couldn't list projects: \(reason)"
+        case let (repoReason?, projectReason?):
+            return repoReason == projectReason
+                ? "Couldn't list repositories or projects: \(repoReason)"
+                : "Couldn't list repositories: \(repoReason) Couldn't list projects: \(projectReason)"
+        }
+    }
+
+    /// The reason, and a retry that reloads without the host disk walk the refresh button runs.
+    private func loadFailureRow(_ message: String) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: Space.s4) {
+            Text(message)
+                .font(HermesFont.footnote)
+                .foregroundStyle(t.danger)
+                .fixedSize(horizontal: false, vertical: true)
+            Spacer(minLength: 0)
+            if app.projectsAPI != nil {
+                Button("Try again") {
+                    Task { await load() }
+                }
+                .font(HermesFont.subhead)
+                .foregroundStyle(t.action)
+                .buttonStyle(.plain)
+                .frame(minHeight: Hit.min)
+                .contentShape(Rectangle())
+                .disabled(loading)
+            }
+        }
+        .padding(.horizontal, Space.s6)
+        .padding(.bottom, Space.s3)
     }
 
     private var browseRow: some View {
@@ -202,7 +261,7 @@ struct FolderPickerSheet: View {
             } trailing: {
                 if applying == path {
                     ProgressView().controlSize(.small)
-                } else if path == currentPath {
+                } else if Self.isCurrent(path, currentPath: currentPath) {
                     Image(systemName: "checkmark")
                         .foregroundStyle(t.action)
                 }
@@ -237,11 +296,37 @@ struct FolderPickerSheet: View {
             scanning = false
         }
         guard let projectsAPI = app.projectsAPI else {
-            failure = "Not connected to a backend."
+            loadFailure = "Not connected to a backend."
             return
         }
         failure = nil
-        repos = (try? await projectsAPI.discoverRepos(scan: scan)) ?? []
-        projects = (try? await projectsAPI.tree()) ?? []
+        let repoLoad = await HostListLoad.run(keeping: repos) {
+            try await projectsAPI.discoverRepos(scan: scan)
+        }
+        repos = repoLoad.rows
+        let projectLoad = await HostListLoad.run(keeping: projects) {
+            try await projectsAPI.tree()
+        }
+        projects = projectLoad.rows
+        loadFailure = Self.loadFailureText(repositories: repoLoad.failure, projects: projectLoad.failure)
+    }
+}
+
+/// One list fetch for the folder and worktree sheets: the rows to draw and, when the fetch failed, why.
+/// BUG-092: a thrown call is not an empty answer. It keeps the rows already on screen and carries the reason, so no sheet can tell the user their backend has nothing when all the client knows is that the call failed.
+struct HostListLoad<Row> {
+    var rows: [Row]
+    var failure: String?
+
+    static func run(keeping previous: [Row], _ fetch: () async throws -> [Row]) async -> HostListLoad<Row> {
+        do {
+            return HostListLoad(rows: try await fetch(), failure: nil)
+        } catch is CancellationError {
+            // The sheet went away or its key changed; nothing to report, and no answer either.
+            return HostListLoad(rows: previous, failure: nil)
+        } catch {
+            let reason = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+            return HostListLoad(rows: previous, failure: reason)
+        }
     }
 }

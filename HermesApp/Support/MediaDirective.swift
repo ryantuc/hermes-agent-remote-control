@@ -25,9 +25,9 @@ enum MediaDirective {
         var id: String { path }
     }
 
-    /// Desktop's extension table, verbatim, plus its markdown set.
+    /// Desktop's extension table, verbatim, plus its markdown set and `m4v`, which iOS plays and Desktop's table omits.
     private static let kindByExtension: [String: Kind] = [
-        "avi": .video, "mkv": .video, "mov": .video, "mp4": .video, "webm": .video,
+        "avi": .video, "m4v": .video, "mkv": .video, "mov": .video, "mp4": .video, "webm": .video,
         "flac": .audio, "m4a": .audio, "mp3": .audio, "ogg": .audio, "opus": .audio, "wav": .audio,
         "bmp": .image, "gif": .image, "jpeg": .image, "jpg": .image, "png": .image, "svg": .image, "webp": .image,
         "md": .markdown, "markdown": .markdown, "mdown": .markdown, "mkd": .markdown,
@@ -105,8 +105,62 @@ enum MediaDirective {
     /// Pull every `MEDIA:` reference out of a message, and return the message without them. Order matters and is Desktop's: line form first, then inline, or inline consumes the path of a line-form token.
     /// Callers must not run this on a streaming message — use ``extractCompleted(from:)`` there, since a partial tail satisfies the `$` anchor and would extract a truncated path.
     static func extract(from text: String) -> (text: String, refs: [Ref]) {
-        guard text.contains("MEDIA:") else { return (text, []) }
-        return run([(lineExpression, true), (inlineExpression, false)], on: text)
+        let directive = text.contains("MEDIA:")
+            ? run([(lineExpression, true), (inlineExpression, false)], on: text)
+            : (text: text, refs: [])
+        let linked = extractMarkdownMedia(from: directive.text)
+        return (linked.text, dedupe(directive.refs + linked.refs))
+    }
+
+    // MARK: Markdown links to media
+
+    /// `![alt](target)` and `[text](target)`, where the target is an image, video or audio file the phone can obtain: a host path (`C:\…`, `/…`, `~/…`), a public URL or a `data:` URL. An agent that writes a markdown link instead of a `MEDIA:` line gets the same thumbnail or poster; a link to anything else (a document, a web page) is left for the markdown renderer.
+    private static let markdownLinkExpression = try? NSRegularExpression(
+        pattern: #"(!?)\[([^\]\n]*)\]\(([^)\s]+)\)"#
+    )
+
+    /// Fenced blocks (to their closing fence, or the end of the text) and inline code spans: a link written there is an example of markdown, not a delivery.
+    private static let codeExpressions: [NSRegularExpression] = [
+        #"(?m)^[ \t]*(`{3,}|~{3,})[^\n]*$[\s\S]*?(?:^[ \t]*\1[ \t]*$|\z)"#,
+        #"`[^`\n]+`"#,
+    ].compactMap { try? NSRegularExpression(pattern: $0) }
+
+    private static func codeRanges(in text: String) -> [NSRange] {
+        guard text.contains("`") || text.contains("~~~") else { return [] }
+        let full = NSRange(text.startIndex..<text.endIndex, in: text)
+        return codeExpressions.flatMap { $0.matches(in: text, range: full).map(\.range) }
+    }
+
+    /// The image form goes entirely (its alt text was never prose); the link form keeps its words, since a sentence was written around them.
+    static func extractMarkdownMedia(from text: String) -> (text: String, refs: [Ref]) {
+        guard text.contains("]("), let expression = markdownLinkExpression else { return (text, []) }
+        var output = ""
+        var refs: [Ref] = []
+        var cursor = text.startIndex
+        let full = NSRange(text.startIndex..<text.endIndex, in: text)
+        let code = codeRanges(in: text)
+        for match in expression.matches(in: text, range: full) {
+            // A backtick-quoted target is a span of its own and does not count as code around the link.
+            let targetSpan = match.range(at: 3)
+            guard !code.contains(where: { NSIntersectionRange($0, match.range).length > 0 && NSIntersectionRange($0, targetSpan) != $0 }) else { continue }
+            guard let matchRange = Range(match.range, in: text),
+                  let bangRange = Range(match.range(at: 1), in: text),
+                  let labelRange = Range(match.range(at: 2), in: text),
+                  let targetRange = Range(match.range(at: 3), in: text)
+            else { continue }
+            let target = unquote(String(text[targetRange]))
+            let kind = kind(of: target)
+            guard kind == .image || kind == .video || kind == .audio,
+                  isResolvableFilePath(target) || isInlineSource(target)
+            else { continue }
+            output += text[cursor..<matchRange.lowerBound]
+            if text[bangRange].isEmpty { output += text[labelRange] }
+            refs.append(Ref(path: target, kind: kind, name: name(of: target)))
+            cursor = matchRange.upperBound
+        }
+        guard !refs.isEmpty else { return (text, []) }
+        output += text[cursor...]
+        return (tidy(output), dedupe(refs))
     }
 
     /// The same extraction, restricted to tokens that are provably finished, for a message that is still streaming (BUG-133). Only the line form runs here, and only where a real newline follows it: there is no way to know a bare inline path has finished arriving when more characters can still follow it on the same line.

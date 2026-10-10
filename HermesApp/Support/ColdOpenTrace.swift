@@ -46,7 +46,7 @@ enum ColdOpenTrace {
         return value
     }
 
-    /// Print the run: every stage with its offset from `begin` and its delta from the stage before it, every measured span, and the worst main-thread stall seen since `begin`.
+    /// Print the run: every stage with its offset from `begin` and its delta from the stage before it, every measured span, and the worst main-thread stall seen since `begin`. Reporting ends the run and stops the stall probe.
     static func report(_ note: String = "") {
         guard isEnabled else { return }
         state.report(note)
@@ -97,6 +97,8 @@ final class TraceState: @unchecked Sendable {
     /// Named cost buckets: a per-row or per-line span summed over the window, with the call count beside it.
     private var buckets: [String: (calls: Int, seconds: Double)] = [:]
     private var probing = false
+    /// Which probe loop is current, so a loop left over from a reported run exits even when the next run starts the probe again before that loop next wakes.
+    private var probeGeneration = 0
 
     func begin(_ label: String) {
         lock.lock()
@@ -123,30 +125,35 @@ final class TraceState: @unchecked Sendable {
         stages.append(Stage(name: stage, detail: detail, at: now))
     }
 
+    /// Recorded only inside a run: `begin` discards anything earlier, and after `report` nothing reads it.
     func span(_ name: String, seconds: Double) {
         lock.lock()
+        defer { lock.unlock() }
+        guard epoch != nil else { return }
         spans.append((name, seconds))
-        lock.unlock()
     }
 
     func accumulate(_ bucket: String, seconds: Double) {
         lock.lock()
+        defer { lock.unlock() }
+        guard epoch != nil else { return }
         var entry = buckets[bucket] ?? (0, 0)
         entry.calls += 1
         entry.seconds += seconds
         buckets[bucket] = entry
-        lock.unlock()
     }
 
     func startProbe() {
         lock.lock()
         guard !probing else { lock.unlock(); return }
         probing = true
+        probeGeneration += 1
+        let generation = probeGeneration
         lock.unlock()
         let queue = DispatchQueue(label: "hermes.coldopen.stallprobe", qos: .userInitiated)
         queue.async { [weak self] in
             while true {
-                guard let self, self.isProbing else { return }
+                guard let self, self.probeContinues(generation) else { return }
                 let posted = CFAbsoluteTimeGetCurrent()
                 DispatchQueue.main.async { [weak self] in
                     self?.recordHop(posted: posted, ran: CFAbsoluteTimeGetCurrent())
@@ -156,10 +163,24 @@ final class TraceState: @unchecked Sendable {
         }
     }
 
-    private var isProbing: Bool {
+    private func probeContinues(_ generation: Int) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return probing && probeGeneration == generation
+    }
+
+    /// Whether the 10 ms main-queue probe is posting hops; read by tests.
+    var probeIsRunning: Bool {
         lock.lock()
         defer { lock.unlock() }
         return probing
+    }
+
+    /// How many main-queue hops the probe has recorded in the current run; read by tests.
+    var stallSampleCount: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return stalls.count
     }
 
     private func recordHop(posted: CFAbsoluteTime, ran: CFAbsoluteTime) {
@@ -169,6 +190,7 @@ final class TraceState: @unchecked Sendable {
         stalls.append((posted - epoch, ran - posted))
     }
 
+    /// Print the run and end it (BUG-146): the probe stops and nothing more is recorded until the next `startProbe` / `begin`, which is how every traced route calls it. Before this the probe hopped to the main queue every 10 ms for the life of the process and `stalls` grew without bound.
     func report(_ note: String) {
         lock.lock()
         let label = self.label
@@ -177,6 +199,8 @@ final class TraceState: @unchecked Sendable {
         let spans = self.spans
         let stalls = self.stalls
         let buckets = self.buckets
+        self.epoch = nil
+        probing = false
         lock.unlock()
         guard let epoch else { return }
         var lines = ["[coldopen] === report \(label) \(note) ==="]
@@ -211,9 +235,8 @@ final class TraceState: @unchecked Sendable {
         for stall in stalls.filter({ $0.delay > 0.016 }).sorted(by: { $0.at < $1.at }) {
             let start = stall.at
             let end = stall.at + stall.delay
-            if let open = windowStart, start <= windowEnd {
+            if windowStart != nil, start <= windowEnd {
                 windowEnd = max(windowEnd, end)
-                _ = open
             } else {
                 if let open = windowStart { blocked += windowEnd - open }
                 windowStart = start

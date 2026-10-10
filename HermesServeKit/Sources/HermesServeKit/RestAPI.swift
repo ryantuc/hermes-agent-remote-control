@@ -283,7 +283,7 @@ public struct TranscriptMessage: Sendable, Equatable, Identifiable {
     /// Bookkeeping rows every other Hermes surface filters out
     /// (rest §6.4 step 6).
     public var isBookkeeping: Bool {
-        role == .user && !displayKind.isEmpty
+        role == .user && !displayKind.isEmpty && displayKind != "steer"
     }
 
     public var isHidden: Bool { displayKind == "hidden" }
@@ -461,7 +461,7 @@ public struct RestAPI: Sendable {
         return try await auth.performJSON(request)
     }
 
-    /// PUT/POST with a JSON body, returning the response JSON (`.null` for empty bodies).
+    /// PUT/POST with a JSON body, returning the response JSON (`.null` for an empty body) and throwing `malformedResponse` for a body that is not JSON.
     @discardableResult
     public func sendJSON(_ method: String, _ path: String, body: JSONValue = .null) async throws -> JSONValue {
         let data: Data
@@ -477,8 +477,13 @@ public struct RestAPI: Sendable {
             contentType: "application/json"
         )
         let (responseData, _) = try await auth.perform(request)
-        guard !responseData.isEmpty else { return .null }
-        return (try? JSONDecoder().decode(JSONValue.self, from: responseData)) ?? .null
+        return try Self.sendResponseBody(responseData)
+    }
+
+    /// What `sendJSON` makes of a 2xx body; separate so the decision can be pinned without a network stub.
+    /// It used to answer `.null` for a body it could not decode, the same value as an empty 204, so a captive portal's page read as success and each caller filled in a default (BUG-146); it now judges the body exactly as `performJSON` does for every read.
+    static func sendResponseBody(_ data: Data) throws -> JSONValue {
+        try AuthenticationClient.decodeBody(data)
     }
 
     // MARK: Ops
@@ -556,6 +561,55 @@ public struct RestAPI: Sendable {
             offset: json["pagination"]?["offset"]?.coercedInt ?? offset,
             returned: json["pagination"]?["returned"]?.coercedInt ?? rows.count
         )
+    }
+
+    /// `GET /api/sessions/{id}/timeline`: the session's prompts, metadata only, at most 500 a page, oldest first.
+    /// A backend without the route answers 404, the same status an unknown session gets; `isRouteMissing(_:)` tells the two apart as far as the body allows.
+    public func getTimeline(
+        sessionID: String,
+        profile: String? = nil,
+        afterRowID: Int = 0,
+        limit: Int = 500
+    ) async throws -> PromptTimelinePage {
+        var query: [URLQueryItem] = [URLQueryItem(name: "limit", value: String(min(max(limit, 1), 500)))]
+        if afterRowID > 0 { query.append(URLQueryItem(name: "after_row_id", value: String(afterRowID))) }
+        if let profile, !profile.isEmpty { query.append(URLQueryItem(name: "profile", value: profile)) }
+        let path = "/api/sessions/\(Self.escapePathComponent(sessionID))/timeline"
+        let request = await auth.makeRequest(path, query: query)
+        let json = try await auth.performJSON(request)
+        return PromptTimelinePage(json: json, requestedSessionID: sessionID)
+    }
+
+    /// `GET /api/sessions/{id}/messages/around?row_id=`: at most 120 display rows starting at one of the timeline's prompts, in the `/messages` row shape.
+    public func getMessagesAround(
+        sessionID: String,
+        rowID: Int,
+        profile: String? = nil,
+        limit: Int = 120
+    ) async throws -> (page: TranscriptPage, window: TranscriptWindow) {
+        var query: [URLQueryItem] = [
+            URLQueryItem(name: "row_id", value: String(rowID)),
+            URLQueryItem(name: "limit", value: String(min(max(limit, 1), 120))),
+        ]
+        if let profile, !profile.isEmpty { query.append(URLQueryItem(name: "profile", value: profile)) }
+        let path = "/api/sessions/\(Self.escapePathComponent(sessionID))/messages/around"
+        let request = await auth.makeRequest(path, query: query)
+        let json = try await auth.performJSON(request)
+        let rows = (json["messages"]?.arrayValue ?? []).map(TranscriptMessage.init(json:))
+        let page = TranscriptPage(
+            sessionID: json["session_id"]?.coercedString ?? sessionID,
+            messages: rows,
+            limit: json["pagination"]?["limit"]?.coercedInt ?? limit,
+            offset: json["pagination"]?["offset"]?.coercedInt ?? 0,
+            returned: json["pagination"]?["returned"]?.coercedInt ?? rows.count
+        )
+        return (page, TranscriptWindow(json: json, rowID: rowID))
+    }
+
+    /// Whether a failure from one of the timeline routes means the backend does not have the route at all, as opposed to not having the session or the prompt. FastAPI answers an unrouted path with `{"detail": "Not Found"}`; the session routes answer their own sentence.
+    public static func isRouteMissing(_ error: Error) -> Bool {
+        guard case .httpStatus(let code, let message) = error as? HermesError, code == 404 else { return false }
+        return message.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "not found"
     }
 
     /// `PATCH /api/sessions/{id}` — rename / archive / pin. All-nil ⇒ 400.
@@ -657,12 +711,7 @@ public struct RestAPI: Sendable {
         // The in-memory ceiling is checked FIRST because it is the operative one and sits below
         // the server cap; refuse once, naming the limit that is really enforced.
         guard data.count <= Self.managedFileInMemoryAssemblyLimit else {
-            let size = ByteCountFormatter.string(fromByteCount: Int64(data.count), countStyle: .file)
-            let limit = ByteCountFormatter.string(
-                fromByteCount: Int64(Self.managedFileInMemoryAssemblyLimit),
-                countStyle: .file
-            )
-            throw HermesError.unsupported("That file is \(size); the upload cap is \(limit).")
+            throw HermesError.unsupported(AttachmentSize.tooLargeMessage(bytes: data.count, limit: Self.managedFileInMemoryAssemblyLimit))
         }
         // Kept as a backstop so the constant stays meaningful if the in-memory
         // ceiling is ever raised above the server's.
@@ -729,6 +778,18 @@ public struct RestAPI: Sendable {
         return data
     }
 
+    /// The server's ceiling on one managed file (`_MANAGED_FILE_MAX_BYTES`, `hermes_cli/web_server.py:870`): `download` and `stream` answer 413 above it.
+    public static let managedFileByteLimit = 100 * 1024 * 1024
+
+    /// The authorised request for `GET` or `HEAD /api/files/stream?path=` (`hermes_cli/web_routers/files.py:609-616`): inline, Range-aware, media extensions only, and it answers HEAD, so a caller can read the size before moving the body. Returned as a request rather than performed, because the body belongs on disk and `perform` buffers in memory.
+    public func managedFileStreamRequest(path: String, method: String = "GET") async -> URLRequest {
+        await auth.makeRequest(
+            "/api/files/stream",
+            method: method,
+            query: [URLQueryItem(name: "path", value: path)]
+        )
+    }
+
     /// `GET /api/media?path=` → `{"data_url": "data:…"}`. The route a chat
     /// client uses to display an image the agent just wrote to gateway disk.
     public func mediaDataURL(path: String) async throws -> String {
@@ -736,6 +797,19 @@ public struct RestAPI: Sendable {
         let json = try await auth.performJSON(request)
         guard let dataURL = json["data_url"]?.coercedString else {
             throw HermesError.malformedResponse("/api/media returned no data_url")
+        }
+        return dataURL
+    }
+
+    /// `GET /api/fs/read-data-url?path=&profile=`: a file under a named Hermes profile's own home, which `/api/media`'s roots (the app-global home) refuse. Answers `{"dataUrl": …}`.
+    public func readDataURL(path: String, profile: String) async throws -> String {
+        let request = await auth.makeRequest("/api/fs/read-data-url", query: [
+            URLQueryItem(name: "path", value: path),
+            URLQueryItem(name: "profile", value: profile),
+        ])
+        let json = try await auth.performJSON(request)
+        guard let dataURL = json["dataUrl"]?.coercedString else {
+            throw HermesError.malformedResponse("/api/fs/read-data-url returned no dataUrl")
         }
         return dataURL
     }

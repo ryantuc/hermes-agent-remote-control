@@ -188,12 +188,5 @@ final class WalkTweakChromeTests: XCTestCase {
         )
     }
 
-    /// A one-pixel fade is a line; a band the size of the header is a second
-    /// bar. `Space.s6` is the token in between. This is the top-bar fade, not
-    /// a mask on the composer plate.
-    func testTheFrostEdgeFadeIsABandNotALineAndNotAPanel() {
-        XCTAssertEqual(ChatChrome.frostEdgeFade, Space.s6)
-        XCTAssertGreaterThan(ChatChrome.frostEdgeFade, 8, "the fade collapsed to a line")
-        XCTAssertLessThan(ChatChrome.frostEdgeFade, 40, "the fade is dissolving the top bar")
-    }
+    // The BUG-120 top-bar fade (`ChatChrome.frostEdgeFade`, a 16 pt material band masked over the transcript under the bar) was retired by the glass pass: with the transcript passing behind the bar, a second material over the first read as a smudge. The bar's edge is now the top plane's rim and lift, asserted in `GlassTokensTests`.
 }

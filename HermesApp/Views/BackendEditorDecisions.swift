@@ -21,7 +21,7 @@ enum BackendAuthMethod: String, CaseIterable, Identifiable {
     var title: String {
         switch self {
         case .password: return "Password"
-        case .bearer: return "Bearer token"
+        case .bearer: return "Access token"
         case .sessionToken: return "Session token"
         case .none: return "None"
         }
@@ -151,6 +151,26 @@ enum BackendProbeReason {
     }
 }
 
+// MARK: - Credential
+
+/// What the editor writes to the Keychain for a typed credential.
+enum BackendCredentialInput {
+    /// The secret to store for `method` from what was typed, or nil to keep the stored one.
+    ///
+    /// A token never contains whitespace: the backend mints its session token with `secrets.token_urlsafe` and compares the header byte for byte, and an access token is a JWT. So every space and line break in a token field came with the paste and is removed, and a token field holding nothing else keeps the stored token instead of overwriting it. A password is stored exactly as typed, because a password may contain spaces.
+    static func secretToStore(_ typed: String, for method: BackendAuthMethod) -> String? {
+        switch method {
+        case .sessionToken, .bearer:
+            let token = typed.filter { !$0.isWhitespace }
+            return token.isEmpty ? nil : token
+        case .password:
+            return typed.isEmpty ? nil : typed
+        case .none:
+            return nil
+        }
+    }
+}
+
 // MARK: - Save
 
 /// Whether Save can be tapped, and — when it cannot — the one line under it that says what is missing.
@@ -189,4 +209,22 @@ struct BackendSaveDecision: Equatable {
 
     /// The line that sits under Save whatever its state — the answer to "do I have to test first".
     static let caption = "Save connects right away. Testing first is optional."
+}
+
+// MARK: - Copy
+
+/// What the editor says, in words a person setting up the app for the first time can act on: no environment variables, header names or protocol frames.
+enum BackendEditorCopy {
+    /// An example address, drawn verbatim: a `LocalizedStringKey` title is auto-linked, so an address placeholder used to draw in link blue and read as already filled in.
+    static let addressPlaceholder = "http://192.168.1.20:9119"
+    static let addressHelp = "The address and port your Hermes backend listens on."
+    static let sessionTokenHelp = "The session token your backend prints when it starts. It changes each time the backend restarts unless a fixed one is set."
+    static let accessTokenHelp = "The access token your backend's sign-in issues. HARC sends it with every request."
+    static let passwordHelp = "Leave Provider empty unless the backend offers more than one way to sign in. The password is stored in the iOS Keychain and used only to sign in again when the session expires."
+    static let noneHelp = "Sends no credential. Use this only for a backend that asks for no sign-in."
+    static let profileFooter = "Optional. The name of a Hermes profile on that computer. Leave empty for the default."
+    static let testFooter = "Optional. Opens a real connection to check the address and the sign-in together."
+
+    /// Every help line the editor draws, for the test that keeps developer words out of them.
+    static let all = [addressHelp, sessionTokenHelp, accessTokenHelp, passwordHelp, noneHelp, profileFooter, testFooter]
 }

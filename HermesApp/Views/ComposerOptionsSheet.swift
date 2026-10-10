@@ -1,4 +1,5 @@
 import AVFoundation
+import CoreTransferable
 import HermesServeKit
 import PhotosUI
 import SwiftUI
@@ -11,6 +12,10 @@ import UniformTypeIdentifiers
 /// rides `file.attach` like a PDF, since the protocol has no video path.
 enum AttachmentPick {
     static let failedToLoadMessage = "One of those attachments could not be loaded."
+    /// The camera closed without a photo the app could send (BUG-080).
+    static let cameraFailedMessage = "That photo could not be prepared. Try taking it again."
+    /// The Camera tile was tapped after the camera stopped being available.
+    static let cameraUnavailableMessage = "The camera isn't available right now."
 
     /// A nil load writes `failedToLoadMessage` so both pickers can share
     /// the size-cap path's user-visible copy.
@@ -20,6 +25,112 @@ enum AttachmentPick {
             return nil
         }
         return data
+    }
+
+    /// What one picker arm produced: the payloads to queue, and the line the sheet shows when something did not make it.
+    struct Outcome {
+        var payloads: [AttachmentPayload] = []
+        var failure: String?
+    }
+
+    /// One picked file read against a byte cap.
+    enum CappedRead: Equatable {
+        case loaded(Data)
+        case tooLarge(bytes: Int)
+        case unreadable
+    }
+
+    /// Reads `url` and holds the bytes to `limit`, refusing a file the file system already says is too big without reading any of it (BUG-079): a long 4K video used to be pulled whole into memory just to learn it was over the cap, and the app died before the refusal could show.
+    static func readCapped(
+        _ url: URL,
+        limit: Int,
+        read: (URL) throws -> Data = { try Data(contentsOf: $0) }
+    ) -> CappedRead {
+        if let size = byteSize(of: url), size > limit { return .tooLarge(bytes: size) }
+        guard let data = try? read(url) else { return .unreadable }
+        // A size the file system could not report, or under-reported, is still held to the cap once read.
+        guard data.count <= limit else { return .tooLarge(bytes: data.count) }
+        return .loaded(data)
+    }
+
+    /// The file's size from its metadata, without opening it.
+    static func byteSize(of url: URL) -> Int? {
+        let values = try? url.resourceValues(forKeys: [.fileSizeKey, .totalFileSizeKey])
+        return values?.fileSize ?? values?.totalFileSize
+    }
+
+    /// The Files arm: one payload per readable file under the cap, and the last failure as the sheet's line.
+    static func importFiles(
+        _ result: Result<[URL], Error>,
+        limit: Int,
+        read: (URL) throws -> Data = { try Data(contentsOf: $0) }
+    ) -> Outcome {
+        var outcome = Outcome()
+        let urls: [URL]
+        switch result {
+        case .success(let picked):
+            urls = picked
+        case .failure(let error):
+            // BUG-080: this arm used to return with nothing on the sheet, indistinguishable from a cancel.
+            if !isCancellation(error) { outcome.failure = failedToLoadMessage }
+            return outcome
+        }
+        for url in urls {
+            let scoped = url.startAccessingSecurityScopedResource()
+            defer { if scoped { url.stopAccessingSecurityScopedResource() } }
+            switch readCapped(url, limit: limit, read: read) {
+            case .unreadable:
+                outcome.failure = failedToLoadMessage
+            case .tooLarge(let bytes):
+                outcome.failure = tooLargeMessage(bytes: bytes, limit: limit)
+            case .loaded(let data):
+                let type = UTType(filenameExtension: url.pathExtension)
+                outcome.payloads.append(AttachmentAPI.preparedForUpload(AttachmentPayload(
+                    data: data,
+                    filename: url.lastPathComponent,
+                    mimeType: type?.preferredMIMEType ?? "application/octet-stream"
+                )))
+            }
+        }
+        return outcome
+    }
+
+    /// Backing out of a picker is not a failure worth a line on the sheet.
+    static func isCancellation(_ error: Error) -> Bool {
+        let error = error as NSError
+        return error.domain == NSCocoaErrorDomain && error.code == NSUserCancelledError
+    }
+
+    /// The Photo arm once an item's bytes are in hand: name and MIME type come from the item's content type, and the extension is appended to `baseName`.
+    static func photoPayload(data: Data, contentType: UTType?, baseName: String) -> AttachmentPayload {
+        let isVideo = contentType?.conforms(to: .movie) ?? false
+        let ext = contentType?.preferredFilenameExtension ?? (isVideo ? "mov" : "jpg")
+        let mime = contentType?.preferredMIMEType ?? (isVideo ? "video/quicktime" : "image/jpeg")
+        return AttachmentAPI.preparedForUpload(AttachmentPayload(
+            data: data,
+            filename: "\(baseName).\(ext)",
+            mimeType: mime
+        ))
+    }
+
+    static func tooLargeMessage(bytes: Int, limit: Int) -> String {
+        AttachmentSize.tooLargeMessage(bytes: bytes, limit: limit)
+    }
+}
+
+/// A video from the photo library, copied to a temporary file so its size can be read before any of it is in memory (BUG-079). The owner deletes `url` once it has read it.
+struct PickedMovie: Transferable {
+    let url: URL
+
+    static var transferRepresentation: some TransferRepresentation {
+        FileRepresentation(importedContentType: .movie) { received in
+            // `received.file` is only valid inside this closure.
+            let copy = FileManager.default.temporaryDirectory
+                .appendingPathComponent("picked-\(UUID().uuidString)")
+                .appendingPathExtension(received.file.pathExtension)
+            try FileManager.default.copyItem(at: received.file, to: copy)
+            return PickedMovie(url: copy)
+        }
     }
 }
 
@@ -75,7 +186,12 @@ struct ComposerOptionsSheet: View {
                 }
                 if CameraAvailability.isAvailable {
                     tile("Camera", systemImage: "camera") {
-                        showingCamera = true
+                        // Availability was read when the tile was drawn; read it again at the tap and say so, rather than let CameraPicker open the library in the camera's place (BUG-146).
+                        if CameraAvailability.isAvailable {
+                            showingCamera = true
+                        } else {
+                            loadFailure = AttachmentPick.cameraUnavailableMessage
+                        }
                     }
                 }
                 tile("Files", systemImage: "folder") {
@@ -124,13 +240,17 @@ struct ComposerOptionsSheet: View {
             allowedContentTypes: [.item],
             allowsMultipleSelection: true
         ) { result in
-            handleFileImport(result)
+            Task { @MainActor in await importFiles(result) }
         }
         .fullScreenCover(isPresented: $showingCamera) {
-            CameraPicker { data, filename in
-                model.addAttachment(data: data, filename: filename, mimeType: "image/jpeg")
-                dismiss()
-            }
+            CameraPicker(
+                onCapture: { data, filename in
+                    model.addAttachment(data: data, filename: filename, mimeType: "image/jpeg")
+                    dismiss()
+                },
+                // The camera closes itself; the sheet stays up with the line (BUG-080).
+                onFailure: { message in loadFailure = message }
+            )
             .ignoresSafeArea()
         }
         .onChange(of: photoItems) { _, items in
@@ -253,62 +373,74 @@ extension ComposerOptionsSheet {
         }
         var added = false
         for item in items {
-            var failure = loadFailure
-            guard let data = AttachmentPick.note(
-                data: try? await item.loadTransferable(type: Data.self),
-                into: &failure
-            ) else {
-                loadFailure = failure
-                continue
-            }
             let type = item.supportedContentTypes.first
             let isVideo = type?.conforms(to: .movie) ?? false
-            if isVideo, data.count > Self.fileByteLimit {
-                loadFailure = tooLargeMessage(bytes: data.count)
-                continue
+            let data: Data
+            if isVideo {
+                switch await loadMovie(item) {
+                case .loaded(let bytes):
+                    data = bytes
+                case .tooLarge(let bytes):
+                    loadFailure = AttachmentPick.tooLargeMessage(bytes: bytes, limit: Self.fileByteLimit)
+                    continue
+                case .unreadable:
+                    loadFailure = AttachmentPick.failedToLoadMessage
+                    continue
+                }
+            } else {
+                var failure = loadFailure
+                guard let bytes = AttachmentPick.note(
+                    data: try? await item.loadTransferable(type: Data.self),
+                    into: &failure
+                ) else {
+                    loadFailure = failure
+                    continue
+                }
+                // A photo has no file to measure first, but one over the cap is still refused before it is decoded for conversion or queued.
+                guard bytes.count <= Self.fileByteLimit else {
+                    loadFailure = AttachmentPick.tooLargeMessage(bytes: bytes.count, limit: Self.fileByteLimit)
+                    continue
+                }
+                data = bytes
             }
-            let ext = type?.preferredFilenameExtension ?? (isVideo ? "mov" : "jpg")
-            let mime = type?.preferredMIMEType ?? (isVideo ? "video/quicktime" : "image/jpeg")
             let stem = isVideo ? "video" : "photo"
-            let name = "\(stem)-\(Int(Date().timeIntervalSince1970))-\(abs(item.hashValue % 1000)).\(ext)"
-            model.addAttachment(data: data, filename: name, mimeType: mime)
+            let baseName = "\(stem)-\(Int(Date().timeIntervalSince1970))-\(abs(item.hashValue % 1000))"
+            // A HEIC is decoded and re-encoded here (BUG-077); keep that off the main actor.
+            let payload = await Task.detached(priority: .userInitiated) {
+                AttachmentPick.photoPayload(data: data, contentType: type, baseName: baseName)
+            }.value
+            model.addAttachment(data: payload.data, filename: payload.filename, mimeType: payload.mimeType)
             added = true
         }
         if added, loadFailure == nil { dismiss() }
     }
 
-    private func handleFileImport(_ result: Result<[URL], Error>) {
-        guard case .success(let urls) = result else { return }
-        var added = false
-        for url in urls {
-            let scoped = url.startAccessingSecurityScopedResource()
-            defer { if scoped { url.stopAccessingSecurityScopedResource() } }
-            var failure = loadFailure
-            guard let data = AttachmentPick.note(
-                data: try? Data(contentsOf: url),
-                into: &failure
-            ) else {
-                loadFailure = failure
-                continue
-            }
-            guard data.count <= Self.fileByteLimit else {
-                loadFailure = tooLargeMessage(bytes: data.count)
-                continue
-            }
-            let type = UTType(filenameExtension: url.pathExtension)
-            model.addAttachment(
-                data: data,
-                filename: url.lastPathComponent,
-                mimeType: type?.preferredMIMEType ?? "application/octet-stream"
-            )
-            added = true
-        }
-        if added, loadFailure == nil { dismiss() }
+    /// BUG-079: a video arrives as a temporary file, so the cap is checked against its size before any of it is read. No in-memory fallback: a video that cannot come as a file says so rather than risking the old whole-file load.
+    @MainActor
+    private func loadMovie(_ item: PhotosPickerItem) async -> AttachmentPick.CappedRead {
+        guard let movie = try? await item.loadTransferable(type: PickedMovie.self) else { return .unreadable }
+        let limit = Self.fileByteLimit
+        let read = await Task.detached(priority: .userInitiated) {
+            AttachmentPick.readCapped(movie.url, limit: limit)
+        }.value
+        try? FileManager.default.removeItem(at: movie.url)
+        return read
     }
 
-    private func tooLargeMessage(bytes: Int) -> String {
-        let size = ByteCountFormatter.string(fromByteCount: Int64(bytes), countStyle: .file)
-        let limit = ByteCountFormatter.string(fromByteCount: Int64(Self.fileByteLimit), countStyle: .file)
-        return "That file is \(size); the upload cap is \(limit)."
+    /// The Files arm reads and may convert each file, so it runs off the main actor behind the same spinner as the Photo arm.
+    @MainActor
+    private func importFiles(_ result: Result<[URL], Error>) async {
+        isLoading = true
+        defer { isLoading = false }
+        let limit = Self.fileByteLimit
+        let outcome = await Task.detached(priority: .userInitiated) {
+            AttachmentPick.importFiles(result, limit: limit)
+        }.value
+        // Each pick gets its own verdict, as the Photo arm's does: an earlier pick's failure no longer holds the sheet open after a clean import.
+        loadFailure = outcome.failure
+        for payload in outcome.payloads {
+            model.addAttachment(data: payload.data, filename: payload.filename, mimeType: payload.mimeType)
+        }
+        if !outcome.payloads.isEmpty, loadFailure == nil { dismiss() }
     }
 }

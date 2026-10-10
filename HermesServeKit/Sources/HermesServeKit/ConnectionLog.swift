@@ -19,28 +19,54 @@ public actor ConnectionLog {
         public let level: Level
         public let category: String
         public let message: String
+        /// The backend this entry was recorded under, as `enterBackend` labelled it; nil before any backend was entered.
+        public let backend: String?
 
-        public init(id: UUID = UUID(), date: Date = Date(), level: Level, category: String, message: String) {
+        public init(
+            id: UUID = UUID(),
+            date: Date = Date(),
+            level: Level,
+            category: String,
+            message: String,
+            backend: String? = nil
+        ) {
             self.id = id
             self.date = date
             self.level = level
             self.category = category
             self.message = message
+            self.backend = backend
         }
     }
 
     private var buffer: [Entry] = []
     private let capacity: Int
+    /// Identity of the backend later entries belong to; compared, never logged.
+    private var backendKey: String?
+    /// What a reader sees for that backend, already redacted.
+    private var backendLabel: String?
 
     public init(capacity: Int = 400) {
         self.capacity = max(32, capacity)
+    }
+
+    /// Attribute every later entry to one backend, and mark the trail when it is not the backend before it, so a reader can see where one machine's entries end and the next one's begin (BUG-143).
+    ///
+    /// `key` is the backend's identity and is only compared; `label` is what Diagnostics shows, redacted like any message.
+    public func enterBackend(key: String, label: String) {
+        let label = Redaction.truncated(Redaction.text(label), limit: 120)
+        let changed = key != backendKey
+        backendKey = key
+        backendLabel = label
+        if changed { record(.info, "backend", "— now on \(label) —") }
     }
 
     public func record(_ level: Level, _ category: String, _ message: String) {
         let entry = Entry(
             level: level,
             category: category,
-            message: Redaction.truncated(Redaction.text(message), limit: 600)
+            message: Redaction.truncated(Redaction.text(message), limit: 600),
+            backend: backendLabel
         )
         buffer.append(entry)
         if buffer.count > capacity {
@@ -68,12 +94,15 @@ public actor ConnectionLog {
 
     public func clear() { buffer.removeAll() }
 
-    /// Plain-text export for the share sheet. Already sanitized by construction.
+    /// Plain-text export for the share sheet. Already sanitized by construction; an entry recorded under a backend carries its label in parentheses, so a pasted log names the machine on every line.
     public func export() -> String {
         let formatter = ISO8601DateFormatter()
         formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
         return buffer
-            .map { "\(formatter.string(from: $0.date)) [\($0.level.rawValue.uppercased())] \($0.category): \($0.message)" }
+            .map { entry in
+                let backend = entry.backend.map { "(\($0)) " } ?? ""
+                return "\(formatter.string(from: entry.date)) [\(entry.level.rawValue.uppercased())] \(backend)\(entry.category): \(entry.message)"
+            }
             .joined(separator: "\n")
     }
 }

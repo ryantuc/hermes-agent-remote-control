@@ -72,7 +72,7 @@ final class ChatModelSendingStatusTests: XCTestCase {
         XCTAssertTrue(steered, "the steered send was never acknowledged")
         XCTAssertEqual(
             chat.statusLineText,
-            "Steered — the current turn continues with your message",
+            "Update accepted for this turn",
             "the streaming-bubble guard sits above the steered branch, so the copy is unreachable exactly when a steer happens"
         )
 

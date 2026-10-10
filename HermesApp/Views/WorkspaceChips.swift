@@ -1,4 +1,5 @@
 import HermesServeKit
+import Observation
 import SwiftUI
 
 /// The top-bar chip pair: the project you act on, and an adaptive branch chip for the line of work inside it.
@@ -12,7 +13,7 @@ struct WorkspaceChips: View {
     /// Where a pick lands; returns an error to keep the sheet up, nil to dismiss it.
     let apply: (String) async -> String?
 
-    @State private var resolution = Resolution()
+    @State private var chips = WorkspaceChipsModel()
     @State private var showingProjects = false
     @State private var showingWorktree = false
 
@@ -42,6 +43,8 @@ struct WorkspaceChips: View {
     }
 
     private var resolveKey: String { "\(cwd)|\(app.connectionState.isOpen)" }
+
+    private var resolution: Resolution { chips.resolution }
 
     /// The path the chips actually describe, identical to `cwd` except under the screenshot harness.
     private var effectiveCwd: String {
@@ -210,7 +213,7 @@ struct WorkspaceChips: View {
     }
 
     /// What one `projects.for_cwd` answered, plus what the branch chip needs from `GET /api/git/branches`.
-    private struct Resolution: Equatable {
+    struct Resolution: Equatable {
         var projectName = ""
         var branch = ""
         /// The repo's trunk when the backend can name one; empty means unknown, not "off trunk".
@@ -221,27 +224,24 @@ struct WorkspaceChips: View {
     private func resolve() async {
         #if DEBUG
         if let demo = Self.demo {
-            resolution = demo.resolution
+            chips.show(demo.resolution)
             return
         }
         #endif
-        guard app.connectionState.isOpen, !cwd.isEmpty else {
-            resolution = Resolution()
-            return
+        var forCwd: WorkspaceChipsModel.ForCwd?
+        if let projectsAPI = app.projectsAPI {
+            forCwd = { try await projectsAPI.forCwd($0) }
         }
-        var next = Resolution()
-        if let projectsAPI = app.projectsAPI,
-           let answer = try? await projectsAPI.forCwd(cwd) {
-            next.projectName = answer.project ?? ""
-            next.branch = answer.branch
+        var branches: WorkspaceChipsModel.Branches?
+        if let git = app.gitAPI {
+            branches = { try await git.branches(path: $0) }
         }
-        // `isDefault` exists nowhere on the projects payload, only on `GET /api/git/branches?path=`, which is one call per repository.
-        if !next.branch.isEmpty, let git = app.gitAPI,
-           let branches = try? await git.branches(path: cwd) {
-            next.defaultBranch = branches.first(where: { $0.isDefault })?.name ?? ""
-        }
-        next.didResolve = true
-        resolution = next
+        await chips.resolve(
+            cwd: cwd,
+            isOpen: app.connectionState.isOpen,
+            forCwd: forCwd,
+            branches: branches
+        )
     }
 
     #if DEBUG
@@ -320,6 +320,54 @@ struct WorkspaceChips: View {
         }
     }
     #endif
+}
+
+// MARK: - Resolving what the chips draw
+
+/// Resolves the chips for one working directory. It takes both calls as closures rather than the APIs, so the whole derivation, the order answers land in included, is reachable from a test with no socket (`ChatProjectSubtitleModel`'s pattern).
+@MainActor
+@Observable
+final class WorkspaceChipsModel {
+    typealias ForCwd = (String) async throws -> (project: String?, branch: String)
+    typealias Branches = (String) async throws -> [GitBranch]
+
+    private(set) var resolution = WorkspaceChips.Resolution()
+
+    /// BUG-093: which resolve may still write. `.task(id:)` cancels the old task when the cwd or the socket changes, but `client.request` does not honour cancellation, so the old call runs on and can answer after the new one. Only the most recent resolve, and only while its task is live, may land.
+    @ObservationIgnored private var generation = 0
+
+    /// A fixed answer, for the screenshot harness.
+    func show(_ fixed: WorkspaceChips.Resolution) {
+        generation += 1
+        resolution = fixed
+    }
+
+    func resolve(cwd: String, isOpen: Bool, forCwd: ForCwd?, branches: Branches?) async {
+        generation += 1
+        let mine = generation
+        guard isOpen, !cwd.isEmpty else {
+            resolution = WorkspaceChips.Resolution()
+            return
+        }
+        var next = WorkspaceChips.Resolution()
+        if let forCwd, let answer = try? await forCwd(cwd) {
+            next.projectName = answer.project ?? ""
+            next.branch = answer.branch
+        }
+        // Overtaken already: the branch call would be spent on a directory nobody is looking at.
+        guard isCurrent(mine) else { return }
+        // `isDefault` exists nowhere on the projects payload, only on `GET /api/git/branches?path=`, which is one call per repository.
+        if !next.branch.isEmpty, let branches, let rows = try? await branches(cwd) {
+            next.defaultBranch = rows.first(where: { $0.isDefault })?.name ?? ""
+        }
+        guard isCurrent(mine) else { return }
+        next.didResolve = true
+        resolution = next
+    }
+
+    private func isCurrent(_ ticket: Int) -> Bool {
+        ticket == generation && !Task.isCancelled
+    }
 }
 
 // MARK: - The project picker

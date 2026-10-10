@@ -34,12 +34,12 @@ private final class Fired: @unchecked Sendable {
 /// Transcript with the transcript alive one screen below. So the condition
 /// fired, and this is the observation it calls for.
 ///
-/// The implementation is deliberately the narrow one. Lane 7's sketch — own an
-/// instance at `HermesMobileApp`, inject it through the environment, convert
-/// seven call sites — is a wide diff into `ChatView`, `MessageBubbleView`,
-/// `ToolCardView` and `ConversationDisclosure`, three of which belong to other
-/// executors this week. Putting the observable object *behind* the existing
-/// statics gets the same invalidation with no call site changed at all.
+/// The implementation is deliberately the narrow one. Owning an instance at
+/// `HermesMobileApp`, injecting it through the environment and converting
+/// seven call sites would be a wide diff into `ChatView`, `MessageBubbleView`,
+/// `ToolCardView` and `ConversationDisclosure`. Putting the observable object
+/// *behind* the existing statics gets the same invalidation with no call site
+/// changed at all.
 @MainActor
 final class TranscriptPreferencesObservationTests: XCTestCase {
 
@@ -154,7 +154,7 @@ final class TranscriptPreferencesObservationTests: XCTestCase {
         XCTAssertFalse(store.toolCardsExpandByDefault)
     }
 
-    /// The trap Lane 7 named, as far as a unit test can carry it.
+    /// The trap the wide design would have hit, as far as a unit test can carry it.
     ///
     /// `ToolCardView` reads the expansion preference into `@State` at
     /// construction, so a card already on screen keeps whatever the reader

@@ -40,6 +40,8 @@ struct CapabilitiesView: View {
         let label: String
         let description: String
         var enabled: Bool
+        /// The backend's `configured` (`_toolset_has_keys`): whether the toolset can actually run, which `enabled` does not say. Absent on older backends, and absent reads as true, since unknown is not "missing keys".
+        var configured: Bool = true
         var id: String { key }
     }
 
@@ -60,6 +62,43 @@ struct CapabilitiesView: View {
         var id: String { identifier }
     }
 
+    /// `GET /api/tools/toolsets`: a bare array on current backends, `{toolsets: [...]}` on older ones; the key is `name` now and was `key`.
+    static func toolsetRows(from json: JSONValue) -> [ToolsetRow] {
+        let rows = json["toolsets"]?.arrayValue ?? json.arrayValue ?? []
+        return rows.compactMap { row in
+            guard let key = (row["key"] ?? row["name"])?.coercedString, !key.isEmpty else { return nil }
+            return ToolsetRow(
+                key: key,
+                label: row["label"]?.coercedString ?? key,
+                description: row["description"]?.coercedString ?? "",
+                enabled: row["enabled"]?.coercedBool ?? false,
+                configured: row["configured"]?.coercedBool ?? true
+            )
+        }
+    }
+
+    /// What a toolset row says beyond its description about whether it can run.
+    /// BUG-090: the desktop draws "Needs keys" from `configured`; without it a toolset switched on before its keys exist reads as working while its tools never load. Keys are env-file work, so the note points where that happens.
+    static func setupNote(for row: ToolsetRow) -> String? {
+        guard !row.configured else { return nil }
+        return "Needs keys: its tools load once their API keys are set on your computer."
+    }
+
+    /// What a tab says about when its toggles take effect.
+    /// BUG-090: a Skills or Tools toggle is a config write the backend reads when it next builds an agent, the same as MCP's; a conversation already running keeps what it started with, so these tabs must not look like live switches on the running turn.
+    static func timingNote(for tab: String) -> String? {
+        switch tab {
+        case "Skills":
+            return "Changes here take effect on the next session. A conversation already running keeps the skills it started with."
+        case "Tools":
+            return "Changes here take effect on the next session. A conversation already running keeps the tools it started with."
+        case "MCP":
+            return "Servers are added on the desktop or in the CLI, not here. Toggles here take effect on the next session."
+        default:
+            return nil
+        }
+    }
+
     var body: some View {
         VStack(spacing: 0) {
             TabRow(tabs: ["Skills", "Tools", "MCP", "Hub"], selection: $tab)
@@ -67,7 +106,9 @@ struct CapabilitiesView: View {
                 .padding(.vertical, Space.s4)
 
             if let loadError {
-                errorBlock(loadError)
+                StatePanel.loadFailure(title: "Couldn't load capabilities", error: loadError, hasBackend: app.rest != nil) {
+                    Task { await load() }
+                }
             } else {
                 switch tab {
                 case "Tools": toolsList
@@ -77,10 +118,12 @@ struct CapabilitiesView: View {
                 }
             }
         }
+        // Without this a tab with no flexible child sizes the stack to its content, centres it in the screen, and its canvas covers only that band, leaving the window's black above and below it in dark.
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         .background(t.canvas)
         .navigationTitle("Capabilities")
         .navigationBarTitleDisplayMode(.inline)
-        .toolbarBackground(t.canvas, for: .navigationBar)
+        .hermesTopBar()
         .task { await loadIfNeeded() }
         .refreshable { await load() }
     }
@@ -91,6 +134,9 @@ struct CapabilitiesView: View {
         ScrollView {
             LazyVStack(alignment: .leading, spacing: 0) {
                 searchField($skillQuery, prompt: "Search skills")
+                if let note = Self.timingNote(for: "Skills") {
+                    tabNote(note)
+                }
                 let rows = skills.filter {
                     skillQuery.isEmpty
                         || $0.name.localizedCaseInsensitiveContains(skillQuery)
@@ -116,12 +162,16 @@ struct CapabilitiesView: View {
     private var toolsList: some View {
         ScrollView {
             LazyVStack(alignment: .leading, spacing: 0) {
+                if let note = Self.timingNote(for: "Tools") {
+                    tabNote(note)
+                }
                 ForEach(toolsets) { toolset in
                     toggleRow(
                         title: toolset.label,
                         subtitle: toolset.description,
                         isOn: toolset.enabled,
-                        errorKey: "toolset.\(toolset.key)"
+                        errorKey: "toolset.\(toolset.key)",
+                        warning: Self.setupNote(for: toolset)
                     ) { newValue in
                         await setToolset(toolset.key, enabled: newValue)
                     }
@@ -146,11 +196,13 @@ struct CapabilitiesView: View {
                         await setServer(server.name, enabled: newValue)
                     }
                 }
-                Text("Adding a server means pointing at a binary on disk and editing JSON — that lives on the desktop or in the CLI. Toggles here take effect on the next session.")
-                    .font(HermesFont.footnote)
-                    .foregroundStyle(t.text3)
-                    .fixedSize(horizontal: false, vertical: true)
-                    .padding(Space.s6)
+                if let note = Self.timingNote(for: "MCP") {
+                    Text(note)
+                        .font(HermesFont.footnote)
+                        .foregroundStyle(t.text3)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .padding(Space.s6)
+                }
             }
             .padding(.bottom, Space.s10)
         }
@@ -243,6 +295,7 @@ struct CapabilitiesView: View {
         subtitle: String,
         isOn: Bool,
         errorKey: String,
+        warning: String? = nil,
         write: @escaping (Bool) async -> Void
     ) -> some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -254,6 +307,14 @@ struct CapabilitiesView: View {
                     set: { newValue in Task { await write(newValue) } }
                 )
             )
+            if let warning {
+                Text(warning)
+                    .font(HermesFont.footnote)
+                    .foregroundStyle(t.warn)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .padding(.horizontal, Space.s6)
+                    .padding(.bottom, Space.s3)
+            }
             if let error = rowErrors[errorKey] {
                 Text(error)
                     .font(HermesFont.footnote)
@@ -262,6 +323,15 @@ struct CapabilitiesView: View {
                     .padding(.bottom, Space.s3)
             }
         }
+    }
+
+    private func tabNote(_ text: String) -> some View {
+        Text(text)
+            .font(HermesFont.footnote)
+            .foregroundStyle(t.text3)
+            .fixedSize(horizontal: false, vertical: true)
+            .padding(.horizontal, Space.s6)
+            .padding(.vertical, Space.s4)
     }
 
     private func searchField(_ text: Binding<String>, prompt: String) -> some View {
@@ -279,22 +349,6 @@ struct CapabilitiesView: View {
         .frame(minHeight: Hit.min)
         .padding(.horizontal, Space.s6)
         .hairline()
-    }
-
-    private func errorBlock(_ message: String) -> some View {
-        VStack(alignment: .leading, spacing: Space.s5) {
-            Text("Couldn't load capabilities")
-                .font(HermesFont.heading)
-                .foregroundStyle(t.text1)
-            Text(message)
-                .font(HermesFont.subhead)
-                .foregroundStyle(t.text3)
-            Button("Try again") { Task { await load() } }
-                .buttonStyle(SecondaryButtonStyle())
-                .frame(maxWidth: 220)
-        }
-        .padding(Space.s6)
-        .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     // MARK: Loading
@@ -322,16 +376,7 @@ struct CapabilitiesView: View {
             }
 
             let toolsJSON = try await rest.getJSON("/api/tools/toolsets")
-            let toolRows = toolsJSON["toolsets"]?.arrayValue ?? toolsJSON.arrayValue ?? []
-            toolsets = toolRows.compactMap { row in
-                guard let key = (row["key"] ?? row["name"])?.coercedString, !key.isEmpty else { return nil }
-                return ToolsetRow(
-                    key: key,
-                    label: row["label"]?.coercedString ?? key,
-                    description: row["description"]?.coercedString ?? "",
-                    enabled: row["enabled"]?.coercedBool ?? false
-                )
-            }
+            toolsets = Self.toolsetRows(from: toolsJSON)
 
             let mcpJSON = try await rest.getJSON("/api/mcp/servers")
             servers = (mcpJSON["servers"]?.arrayValue ?? []).compactMap { row in

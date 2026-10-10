@@ -61,6 +61,28 @@ enum AboutSupportEntry: Hashable {
         entries.append(.advancedToggle)
         return entries
     }
+
+    static func entries(_ links: AboutLinks) -> [AboutSupportEntry] {
+        entries(github: links.github, privacyPolicy: links.privacyPolicy, support: links.support)
+    }
+
+    /// Where a row goes, from the same links that decided it exists; nil for the two rows that are not links.
+    func destination(in links: AboutLinks) -> URL? {
+        switch self {
+        case .github(let url): return url
+        case .link(let row): return row.url(privacyPolicy: links.privacyPolicy, support: links.support)
+        case .diagnostics, .advancedToggle: return nil
+        }
+    }
+}
+
+/// The About screen's outbound links, read once (BUG-146): the view used to build its rows from one read of `HermesLinks` and resolve their URLs from another, so a row built from any other values drew nothing.
+struct AboutLinks: Equatable {
+    var github: URL?
+    var privacyPolicy: URL?
+    var support: URL?
+
+    static let shipped = AboutLinks(github: HermesLinks.github, privacyPolicy: HermesLinks.privacyPolicy, support: HermesLinks.support)
 }
 
 /// Settings → About: versions, a configuration export, and the Support group.
@@ -75,13 +97,13 @@ struct AboutView: View {
         ScrollView {
             LazyVStack(alignment: .leading, spacing: 0) {
                 SectionHeader("This app")
-                    .padding(.top, Space.s6)
+                    .padding(.top, Space.settingsTop)
                 infoRow("Version", value: AppVersion.current)
 
                 SectionHeader("Backend")
                     .padding(.top, Space.s8)
                 if let status = app.serverStatus {
-                    infoRow("Hermes", value: "v\(status.version)")
+                    infoRow("Hermes", value: Self.backendVersionLabel(version: status.version, isDemo: app.isDemoActive))
                     if !status.releaseDate.isEmpty {
                         infoRow("Release", value: status.releaseDate)
                     }
@@ -102,9 +124,17 @@ struct AboutView: View {
         .background(t.canvas)
         .navigationTitle("About HARC")
         .navigationBarTitleDisplayMode(.inline)
-        .toolbarBackground(t.canvas, for: .navigationBar)
+        .hermesTopBar()
         .task { await app.settings.loadIfNeeded() }
     }
+
+    /// The backend row's value: the demo by name, never a bare "v" for a backend that reports no version.
+    static func backendVersionLabel(version: String, isDemo: Bool) -> String {
+        if isDemo { return "Demo" }
+        return version.isEmpty ? "Unknown" : "v\(version)"
+    }
+
+    static let advancedSubtitle = "Timeouts, output limits, subagents and other advanced options."
 
     private func infoRow(_ label: String, value: String) -> some View {
         FlatRow {
@@ -167,10 +197,13 @@ struct AboutView: View {
     private var supportSection: some View {
         SectionHeader("Support")
             .padding(.top, Space.s8)
-        ForEach(AboutSupportEntry.entries(), id: \.self) { entry in
+        ForEach(AboutSupportEntry.entries(links), id: \.self) { entry in
             supportRow(entry)
         }
     }
+
+    /// One read for both the rows and their URLs.
+    private var links: AboutLinks { .shipped }
 
     @ViewBuilder
     private func supportRow(_ entry: AboutSupportEntry) -> some View {
@@ -182,7 +215,7 @@ struct AboutView: View {
                 url: url
             )
         case .link(let row):
-            if let url = row.url(privacyPolicy: HermesLinks.privacyPolicy, support: HermesLinks.support) {
+            if let url = entry.destination(in: links) {
                 outboundRow(title: row.title, detail: row.detail, url: url)
             }
         case .diagnostics:
@@ -242,7 +275,7 @@ struct AboutView: View {
     private var advancedToggleRow: some View {
         SwitchRow(
             "Show advanced settings",
-            subtitle: "Timeouts, output caps, subagents, and the sharp edges.",
+            subtitle: Self.advancedSubtitle,
             isOn: Binding(
                 get: { app.settings.showAdvanced },
                 set: { app.settings.showAdvanced = $0 }
