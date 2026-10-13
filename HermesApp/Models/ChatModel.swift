@@ -2738,7 +2738,7 @@ final class ChatModel {
                 "  && git -C /Users/you/Developer/myproject clean -fdx \\",
                 "  && git -C /Users/you/Developer/myproject reset --hard origin/main \\",
             ] + steps + [
-                "  && defaults delete com.hermes.mobile.app \\",
+                "  && defaults delete io.github.ryantuc.harc \\",
                 "  && xcrun simctl erase all \\",
                 #"  && echo "workspace reset complete""#,
             ]).joined(separator: "\n")

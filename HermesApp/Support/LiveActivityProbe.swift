@@ -23,7 +23,7 @@ enum LiveActivityProbe {
                 "sudo rm -rf /var/lib/hermes/cache/* \\",
                 "  && git -C ~/Developer/myproject clean -fdx \\",
                 "  && git -C ~/Developer/myproject reset --hard origin/main \\",
-                "  && defaults delete com.hermes.mobile.app \\",
+                "  && defaults delete io.github.ryantuc.harc \\",
                 "  && xcrun simctl erase all",
               ].joined(separator: "\n"))
             : "rm -rf ~/Developer/myproject/build"
