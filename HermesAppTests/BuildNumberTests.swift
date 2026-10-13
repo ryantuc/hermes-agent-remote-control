@@ -26,9 +26,9 @@ final class BuildNumberTests: XCTestCase {
     /// current `MARKETING_VERSION` — processed, not approved, because every
     /// upload has to carry a higher build string than any earlier one it
     /// processed whether or not App Review approved that build. They are
-    /// different concepts that happen to coincide at 0 today, because nothing
-    /// has been uploaded yet: raise the floor after each processed upload and
-    /// leave the sentinel at 0 forever. The coincidence is harmless — the
+    /// different concepts. They coincided at 0 until the first processed
+    /// upload, 1.0.0 (3) on 2026-10-13, raised the floor to 3: raise it after
+    /// each processed upload and leave the sentinel at 0 forever. The
     /// script's guard tests the derived commit count, and the sentinel is
     /// caught here, by reading the number the built bundle actually carries.
     func testTheBuildNumberIsDerivedRatherThanHandSet() {

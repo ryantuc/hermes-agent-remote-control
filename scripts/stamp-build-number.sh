@@ -81,12 +81,12 @@ set -u
 #
 # It is NOT the same concept as project.yml's CURRENT_PROJECT_VERSION, which is
 # the never-ship sentinel a bundle carries when the stamp phase did not run at
-# all. They are different concepts that happen to coincide at 0 today, because
-# nothing has been uploaded yet; leave the sentinel at 0 forever. Nothing breaks
-# while they coincide — this guard tests the *derived* commit count, and the
+# all. They are different concepts. They coincided at 0 until the first
+# processed upload, 1.0.0 (3) on 2026-10-13, raised the floor to 3; leave the
+# sentinel at 0 forever. This guard tests the *derived* commit count, and the
 # sentinel is caught on the other side by BuildNumberTests reading the built
 # bundle.
-ACCEPTED_BUILD_FLOOR=0
+ACCEPTED_BUILD_FLOOR=3
 
 warn() { echo "warning: FEAT-021 build number: $*"; }
 fail() { echo "error: FEAT-021 build number: $*"; exit 1; }
