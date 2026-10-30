@@ -2384,7 +2384,9 @@ final class ChatModel {
     }
 
     /// Whether the turn that produced `entry` ran tools that mutate state, in which case retrying discards work and the affordance escalates to a hold.
+    /// The demo's tool rows are scripted and nothing ran, so none of its turns did.
     func turnMutatedState(before entryID: String) -> Bool {
+        guard app.demo == nil else { return false }
         guard let index = entries.firstIndex(where: { $0.id == entryID }) else { return false }
         guard let userIndex = entries[..<index].lastIndex(where: { $0.kind == .user }) else { return false }
         return entries[userIndex...index].contains { entry in

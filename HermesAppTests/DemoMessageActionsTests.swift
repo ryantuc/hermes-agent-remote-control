@@ -50,7 +50,7 @@ final class DemoMessageActionsTests: XCTestCase {
             )
             let turnsBefore = await backend.completedTurns
             let answersBefore = finishedAnswers(chat).count
-            // The button's own call; a turn that wrote a file first asks for a hold, which ends in this same call.
+            // The button's own call; the demo never asks for a hold first (see the next test).
             chat.resendPrecedingUserTurn(before: answer.id)
             let replayed = await waitUntil(timeout: 30) { await backend.completedTurns > turnsBefore }
             XCTAssertTrue(replayed, "Retry on the answer to \"\(prompt)\" never reached the demo backend")
