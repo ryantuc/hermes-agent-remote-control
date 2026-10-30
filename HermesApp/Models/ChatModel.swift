@@ -192,10 +192,8 @@ final class ChatModel {
             /// The user turns on screen after the target, and in all, when the person composed this replacement; the cut they agreed to is the target and those turns, so `retryOutbound` refuses a cut once there are more.
             var userTurnsAfter = 0
             var userTurnCount = 0
-            /// Set by Edit & resend, whose banner says Send replaces the message and everything after it; a Retry says nothing about the later turns.
-            var agreedToLaterTurns = false
-            /// The user turns the person agreed this replacement removes, the target's own included; nil when they agreed to nothing beyond the cut the backend makes without asking.
-            var agreedUserTurns: Int? { agreedToLaterTurns ? userTurnsAfter + 1 : nil }
+            /// The user turns the person agreed this replacement removes, the target's own included and counted only among turns the backend holds. Set by Edit & resend, whose banner says Send replaces the message and everything after it; nil for a Retry, which says nothing about the later turns.
+            var agreedUserTurns: Int?
         }
     }
 
@@ -1289,7 +1287,9 @@ final class ChatModel {
         }
         let text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
         var edit = replacement(for: target)
-        edit?.agreedToLaterTurns = true
+        // An unsent bubble never reached the backend, so it is not among the turns the cut removes there.
+        let held = entries.filter { $0.kind == .user && $0.noticeKind.isEmpty && !$0.id.hasPrefix("outbound-") }
+        edit?.agreedUserTurns = held.firstIndex { $0.id == target.id }.map { held.count - $0 }
         guard enqueueSend(text: text, attachments: attachments, replacing: edit) else { return }
         editingEntryID = nil
         editingTarget = nil
@@ -1813,9 +1813,10 @@ final class ChatModel {
             }
             // BUG-141: a 4090 that names why it refused gets plain language; everything else goes through `describe(error)` untouched.
             let refusal = (error as? HermesError)?.activeSessionRefusal
+            let wasEdit = outbound.first { $0.id == messageID }?.replacing?.agreedUserTurns != nil
             markFailed(
                 messageID,
-                reason: Self.failureText(refusal: refusal, fallback: describe(error)),
+                reason: Self.failureText(refusal: refusal, fallback: Self.deepCutRefusalText(error, wasEdit: wasEdit) ?? describe(error)),
                 refusal: refusal
             )
         }
@@ -2206,6 +2207,14 @@ final class ChatModel {
     }
 
     static let replacementOvertakenNotice = "Newer messages follow the one this was replacing, so it was sent as a new message and nothing was deleted."
+
+    /// A refused deep cut (4033) in words the person can act on; nil for any other error. A Retry is refused whenever later turns would go; an edit only when the backend holds turns this chat does not show.
+    nonisolated static func deepCutRefusalText(_ error: Error, wasEdit: Bool) -> String? {
+        guard let error = error as? HermesError, case let .rpc(code, _, _) = error, code == 4033 else { return nil }
+        return wasEdit
+            ? "Hermes has messages after this one that aren't shown here, so nothing was changed. Close and reopen the conversation to load them, then try again."
+            : "Retrying this reply would also remove the messages after it, so nothing was sent. To start over from here, edit your message instead."
+    }
 
     struct ReplacementTargetGone: LocalizedError {
         static let notice = "The message this was replacing is no longer in the conversation, so it could not be replaced. Retry sends it as a new message."
