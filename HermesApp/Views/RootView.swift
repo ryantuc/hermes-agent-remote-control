@@ -49,6 +49,11 @@ struct RootView: View {
     @State private var draftRoute = ThreadRoute.new(UUID())
     /// Screenshot harness only: one of the activity strip's sheets, presented over the seeded chat because the strip itself is mounted by `ChatView`.
     @State private var harnessStripSheet: HarnessStripSheet?
+    /// `app.sessionEditNotice` once the sheet or alert the action came from has finished going away.
+    @State private var shownEditNotice: SessionEditNotice?
+
+    /// The hub's row actions dismiss their sheet and the renames dismiss their alert as the write starts, and an alert presented while either is still animating out is dropped.
+    static let editNoticeDelayNanoseconds: UInt64 = 500_000_000
 
     var body: some View {
         Group {
@@ -81,6 +86,33 @@ struct RootView: View {
             case .automation: SessionControlSheet(controls: sheet.chat.sessionControls)
             case .processes: BackgroundProcessesSheet(processes: sheet.chat.backgroundProcesses)
             }
+        }
+        .onChange(of: app.sessionEditNotice) { _, notice in
+            guard let notice else {
+                shownEditNotice = nil
+                return
+            }
+            Task { @MainActor in
+                try? await Task.sleep(nanoseconds: Self.editNoticeDelayNanoseconds)
+                guard app.sessionEditNotice == notice else { return }
+                shownEditNotice = notice
+            }
+        }
+        .alert(
+            shownEditNotice?.title ?? "",
+            isPresented: Binding(
+                get: { shownEditNotice != nil },
+                set: { presented in
+                    guard !presented else { return }
+                    shownEditNotice = nil
+                    app.sessionEditNotice = nil
+                }
+            ),
+            presenting: shownEditNotice
+        ) { _ in
+            Button("OK", role: .cancel) {}
+        } message: { notice in
+            Text(notice.message)
         }
         .animation(Motion.layer(reduced: reduceMotion), value: hubOpen)
         // `hermes://chat/<runtime session id>` — the only link this app opens.

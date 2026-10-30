@@ -40,7 +40,7 @@ final class SessionMutationFenceTests: XCTestCase {
         let requestID = try XCTUnwrap(body["request_id"] as? String)
         XCTAssertFalse(requestID.isEmpty)
         XCTAssertLessThanOrEqual(requestID.count, 1024)
-        XCTAssertNil(body["expected_generation"], "a sidebar edit does not need the generation, and naming it would turn every turn that lands in between into a conflict")
+        XCTAssertNil(body["expected_generation"], "a sidebar edit does not need the generation, and naming it would let a rewind or compression in between refuse it")
         XCTAssertTrue(writes[0].rawBody.contains(#""expected_revision":7"#), "the route's model is a strict integer, so 7.0 would be refused: \(writes[0].rawBody)")
         let snapshot = try XCTUnwrap(FenceBackend.requests.first { $0.path.hasSuffix("/mutation-snapshot") })
         XCTAssertEqual(snapshot.method, "GET")
@@ -190,6 +190,28 @@ final class SessionMutationFenceTests: XCTestCase {
             XCTAssertEqual(writes.count, 1, body)
             XCTAssertEqual(Set((writes.first?.json ?? [:]).keys), ["pinned", "profile"], "nothing added for a backend that never asked for it: \(body)")
         }
+    }
+
+    func testOnlyTheCatchAllsReadAsABackendWithoutTheFence() {
+        XCTAssertTrue(RestAPI.isUnroutedPath(HermesError.httpStatus(code: 404, message: "Headless backend (hermes serve): web UI disabled — use `hermes dashboard` for the browser UI.")))
+        XCTAssertTrue(RestAPI.isUnroutedPath(HermesError.httpStatus(code: 404, message: "No such API endpoint: /api/sessions/s1/mutation-snapshot")))
+        XCTAssertTrue(RestAPI.isUnroutedPath(HermesError.httpStatus(code: 404, message: "Not Found")))
+        XCTAssertFalse(RestAPI.isUnroutedPath(HermesError.httpStatus(code: 404, message: "Session not found")))
+        XCTAssertFalse(RestAPI.isUnroutedPath(HermesError.httpStatus(code: 404, message: "not_found")))
+        XCTAssertFalse(RestAPI.isUnroutedPath(HermesError.httpStatus(code: 503, message: "No such API endpoint: /api/x")))
+        XCTAssertFalse(RestAPI.isUnroutedPath(HermesError.connectFailed("refused")))
+    }
+
+    func testTheSnapshotDecodesOnlyAnAnswerThatSaysAllOfIt() throws {
+        func decode(_ text: String) throws -> SessionMutationSnapshot? {
+            SessionMutationSnapshot(json: try JSONDecoder().decode(JSONValue.self, from: Data(text.utf8)))
+        }
+        XCTAssertEqual(try decode(#"{"session_id":"s","exists":true,"runtime_revision":4,"runtime_generation":2}"#)?.generation, 2)
+        XCTAssertEqual(try decode(#"{"session_id":"s","exists":false,"runtime_revision":0,"runtime_generation":null}"#)?.exists, false)
+        XCTAssertNil(try decode(#"{"session_id":"s","runtime_revision":0}"#), "no exists")
+        XCTAssertNil(try decode(#"{"session_id":"s","exists":"yes","runtime_revision":0,"runtime_generation":0}"#), "exists is not a bool")
+        XCTAssertNil(try decode(#"{"session_id":"s","exists":true,"runtime_revision":1.5,"runtime_generation":0}"#), "a revision that is not a whole number")
+        XCTAssertNil(try decode(#"{"session_id":"s","exists":true,"runtime_revision":1,"runtime_generation":null}"#), "an existing session always has a generation")
     }
 
     func testABackendWithoutTheSnapshotRouteGetsTodaysDeleteUnchanged() async throws {

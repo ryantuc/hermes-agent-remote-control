@@ -138,6 +138,8 @@ final class AppModel {
     private(set) var threads: [SessionSummary] = []
     private(set) var isLoadingThreads = false
     private(set) var threadsError: String?
+    /// Why the last rename, pin, archive or delete did not go through, until the person dismisses it; `threadsError` is overwritten by the next list refresh and no view shows it.
+    var sessionEditNotice: SessionEditNotice?
     /// Durable session ids the gateway reports as genuinely running, not the wire `is_active`, which is a recency heuristic that never clears on normal turn completion (BUG-001).
     private(set) var liveActiveIDs: Set<String> = []
     /// The whole `session.active_list` row per durable id; kept separate from `liveActiveIDs` because `lastActive` and `preview` move on every poll and would invalidate the hub list each pass.
@@ -1128,6 +1130,8 @@ final class AppModel {
             applyTitle(storedSessionID: summary.id, title: trimmed)
         } catch {
             threadsError = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+            sessionEditNotice = SessionEditNotice(action: .rename, error: error, source: summary.source)
+            await refreshThreads(force: true)
         }
     }
 
@@ -1142,6 +1146,8 @@ final class AppModel {
             await refreshThreads(force: true)
         } catch {
             threadsError = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+            sessionEditNotice = SessionEditNotice(action: pinned ? .pin : .unpin, error: error, source: summary.source)
+            await refreshThreads(force: true)
         }
     }
 
@@ -1155,6 +1161,8 @@ final class AppModel {
             await refreshThreads(force: true)
         } catch {
             threadsError = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+            sessionEditNotice = SessionEditNotice(action: archived ? .archive : .unarchive, error: error, source: summary.source)
+            await refreshThreads(force: true)
         }
     }
 
@@ -1165,6 +1173,7 @@ final class AppModel {
             _ = try? await sessionAPI?.close(sessionID: runtimeID)
             engine.forget(sessionID: runtimeID)
         }
+        let removedAt = threads.firstIndex { $0.id == summary.id }
         threads.removeAll { $0.id == summary.id }
         chats = chats.filter { $0.value.storedSessionID != summary.id }
         do {
@@ -1174,6 +1183,11 @@ final class AppModel {
             )
         } catch {
             threadsError = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+            sessionEditNotice = SessionEditNotice(action: .delete, error: error, source: summary.source)
+            // Put the row back before asking, so it is there even when the list cannot be read.
+            if let removedAt, !threads.contains(where: { $0.id == summary.id }) {
+                threads.insert(summary, at: min(removedAt, threads.count))
+            }
             await refreshThreads(force: true)
         }
     }
