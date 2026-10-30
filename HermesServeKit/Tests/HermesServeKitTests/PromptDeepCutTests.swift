@@ -23,7 +23,7 @@ final class PromptDeepCutTests: XCTestCase {
         ])
 
         let ack = try await PromptAPI(client: client).submit(
-            sessionID: session, text: "edited", replacingRowID: 41, agreedUserTurns: 2)
+            sessionID: session, text: "edited", submissionRef: "ref-1", replacingRowID: 41, agreedUserTurns: 2)
 
         XCTAssertTrue(ack.isStreaming)
         let sent = await ScriptedGateway.allSentParams("prompt.submit", on: socket)
@@ -31,6 +31,8 @@ final class PromptDeepCutTests: XCTestCase {
         XCTAssertNil(sent.first?["confirm_deep_truncate"], "the first attempt must not carry a key an older backend refuses")
         let resend = try XCTUnwrap(sent.last)
         XCTAssertEqual(resend["confirm_deep_truncate"]?.boolValue, true)
+        XCTAssertEqual(resend["session_id"]?.stringValue, session)
+        XCTAssertEqual(resend["submission_ref"]?.stringValue, "ref-1", "the resend is the same submission")
         XCTAssertEqual(resend["truncate_before_row_id"]?.intValue, 41)
         XCTAssertEqual(resend["confirm_truncate"]?.boolValue, true)
         XCTAssertEqual(resend["confirm_empty_truncate"]?.boolValue, true)
@@ -86,6 +88,31 @@ final class PromptDeepCutTests: XCTestCase {
         let sent = await ScriptedGateway.allSentParams("prompt.submit", on: socket)
         XCTAssertEqual(sent.count, 2, "one resend, then the refusal is the answer")
         XCTAssertEqual(sent.last?["confirm_deep_truncate"]?.boolValue, true)
+
+        await client.disconnect()
+    }
+
+    /// Stop or Cancel cancels the send's task while the first submit still waits for its answer, which the request does not abandon. A refusal that arrives after that must not become a new, confirmed cut the person already cancelled.
+    func testACancelledSubmitIsNeverResent() async throws {
+        let (client, socket) = try await ScriptedGateway.connected(replies: [
+            "prompt.submit": [deepCutRefusal(archivedUserTurns: 2), streaming],
+        ])
+        let api = PromptAPI(client: client)
+        let session = self.session
+
+        let cancelled = Task { () async throws -> PromptAck in
+            withUnsafeCurrentTask { $0?.cancel() }
+            return try await api.submit(sessionID: session, text: "edited", replacingRowID: 41, agreedUserTurns: 2)
+        }
+        do {
+            _ = try await cancelled.value
+            XCTFail("a cancelled submit must not be resent into a success")
+        } catch let HermesError.rpc(code, _, _) {
+            XCTAssertEqual(code, 4033)
+        }
+
+        let count = await socket.sentCount("prompt.submit")
+        XCTAssertEqual(count, 1, "nothing may be sent after the cancel")
 
         await client.disconnect()
     }

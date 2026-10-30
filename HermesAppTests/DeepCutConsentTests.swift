@@ -79,6 +79,9 @@ final class DeepCutConsentTests: XCTestCase {
         XCTAssertEqual(calls.count, 1, "a Retry must not answer the refusal on the person's behalf")
         XCTAssertEqual(calls.first?.params["truncate_before_row_id"]?.intValue, 41, "precondition: the Retry was a replacement")
         XCTAssertNil(calls.first?.params["confirm_deep_truncate"])
+        XCTAssertEqual(chat.outbound.first?.failure,
+                       "Retrying this reply would also remove the messages after it, so nothing was sent. To start over from here, edit your message instead.",
+                       "the backend's own sentence names a wire parameter the person cannot act on")
 
         await harness.tearDown()
     }
@@ -97,6 +100,37 @@ final class DeepCutConsentTests: XCTestCase {
         let calls = await harness.backend.calls(to: "prompt.submit")
         XCTAssertEqual(calls.count, 1)
         XCTAssertNil(calls.first?.params["confirm_deep_truncate"])
+        XCTAssertEqual(chat.outbound.first?.failure, Self.editReachesUnseenTurns)
+
+        await harness.tearDown()
+    }
+
+    private static let editReachesUnseenTurns = "Hermes has messages after this one that aren't shown here, so nothing was changed. Close and reopen the conversation to load them, then try again."
+
+    /// A failed bubble from an earlier send never reached the backend, so it is not a turn the edit removes there. Counting it would let the agreement cover a backend turn the chat does not show: here the backend counts 3 (two real turns and one unseen) and the chat shows two real turns plus the failed bubble.
+    func testAFailedBubbleIsNotCountedAmongTheTurnsTheEditRemoves() async throws {
+        let (harness, chat) = try await chatWithTwoTurns()
+        await harness.backend.failNextRPC("prompt.submit", code: 4009, message: "session busy")
+        chat.draft = "a message that never arrived"
+        chat.sendTapped()
+        let bubbleFailed = await waitUntil { chat.outbound.first?.failure != nil && !chat.isSending && !chat.live.isBusy }
+        XCTAssertTrue(bubbleFailed, "precondition: the earlier send never failed: \(chat.outbound.map(\.failure))")
+        XCTAssertEqual(chat.entries.filter { $0.kind == .user }.map { $0.id.hasPrefix("outbound-") }, [false, false, true],
+                       "precondition: two real turns and one failed bubble: \(chat.entries.map(\.id))")
+        await refuseNextSubmitAsDeep(harness, archivedUserTurns: 3)
+
+        XCTAssertTrue(chat.beginEditing(entryID: "rest-41"))
+        chat.draft = "first question, corrected"
+        chat.sendTapped()
+
+        let editFailed = await waitUntil {
+            chat.outbound.count == 2 && chat.outbound.last?.failure != nil && !chat.isSending
+        }
+        XCTAssertTrue(editFailed, "the edit never failed: \(chat.outbound.map(\.failure))")
+        let calls = await harness.backend.calls(to: "prompt.submit")
+        XCTAssertEqual(calls.count, 2, "the failed bubble's send and the edit, with no resend")
+        XCTAssertNil(calls.last?.params["confirm_deep_truncate"])
+        XCTAssertEqual(chat.outbound.last?.failure, Self.editReachesUnseenTurns)
 
         await harness.tearDown()
     }
