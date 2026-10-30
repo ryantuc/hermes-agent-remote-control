@@ -653,19 +653,13 @@ public struct RestAPI: Sendable {
         return snapshot
     }
 
-    /// A 404 from the backend's catch-all rather than from a route: FastAPI's bare `Not Found`, the dashboard's `No such API endpoint: …`, or headless `hermes serve`'s `Headless backend (hermes serve): web UI disabled …` (`hermes_cli/web_server_dashboard.py:122-139`, `:227-233`). The snapshot route itself never answers 404.
+    /// A 404 from the backend's catch-all rather than from a route: FastAPI's bare `Not Found`, the dashboard's `No such API endpoint: …`, or headless `hermes serve`'s `Headless backend (hermes serve): web UI disabled …` (`hermes_cli/web_server_dashboard.py:122-139`, `:227-233`). The snapshot route itself never answers 404 with one of these bodies; its only 404 is an unknown `?profile=`, which names the profile.
     static func isUnroutedPath(_ error: Error) -> Bool {
         guard case .httpStatus(let code, let message) = error as? HermesError, code == 404 else { return false }
         let text = message.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         return text == "not found"
             || text.hasPrefix("no such api endpoint")
             || text.hasPrefix("headless backend (hermes serve)")
-    }
-
-    /// The backend's answer when the session changed between the snapshot and the write; nothing was written.
-    static func isRevisionConflict(_ error: Error) -> Bool {
-        guard case .httpStatus(let code, let message) = error as? HermesError, code == 409 else { return false }
-        return message.trimmingCharacters(in: .whitespacesAndNewlines) == "revision_conflict"
     }
 
     /// Any non-empty string up to 1024 characters; a new one per intent, because the backend replays the stored answer to a reused one.
@@ -675,7 +669,7 @@ public struct RestAPI: Sendable {
 
     /// `PATCH /api/sessions/{id}` — rename / archive / pin. All-nil ⇒ 400.
     ///
-    /// From 0.22.1 the write names the session's revision, read from the snapshot just before it; one `revision_conflict` is read again and retried, because these are plain value sets and the refused write changed nothing. The generation is optional for these and not named, so a rewind or compression landing in between does not refuse a pin.
+    /// From 0.22.1 the write names the session's revision, read from the snapshot just before it. A `revision_conflict` is not retried: the conversation changed after the person decided, so the change is theirs to make again, as on the desktop app. The generation is optional for these and not named, so a rewind or compression landing in between does not refuse a pin.
     @discardableResult
     public func patchSession(
         sessionID: String,
@@ -690,37 +684,25 @@ public struct RestAPI: Sendable {
         if let pinned { body["pinned"] = .bool(pinned) }
         if let profile, !profile.isEmpty { body["profile"] = .string(profile) }
         guard !body.isEmpty else { return nil }
-        let json: JSONValue
-        do {
-            json = try await sendFencedPatch(body, sessionID: sessionID, profile: profile)
-        } catch {
-            guard Self.isRevisionConflict(error) else { throw error }
-            json = try await sendFencedPatch(body, sessionID: sessionID, profile: profile)
-        }
-        return json["title"]?.coercedString
-    }
-
-    /// One PATCH, fenced on a snapshot read just before it when the backend has the route.
-    private func sendFencedPatch(_ body: [String: JSONValue], sessionID: String, profile: String?) async throws -> JSONValue {
-        var fenced = body
         if let snapshot = try await sessionMutationSnapshot(sessionID: sessionID, profile: profile) {
             guard snapshot.exists else { throw HermesError.httpStatus(code: 404, message: "Session not found") }
-            fenced["request_id"] = .string(Self.newMutationRequestID())
-            fenced["expected_revision"] = .number(Double(snapshot.revision))
+            body["request_id"] = .string(Self.newMutationRequestID())
+            body["expected_revision"] = .number(Double(snapshot.revision))
         }
-        let data = try JSONRPCCodec.encodeLine(.object(fenced)).data(using: .utf8) ?? Data()
+        let data = try JSONRPCCodec.encodeLine(.object(body)).data(using: .utf8) ?? Data()
         let request = await auth.makeRequest(
             "/api/sessions/\(Self.escapePathComponent(sessionID))",
             method: "PATCH",
             body: data,
             contentType: "application/json"
         )
-        return try await auth.performJSON(request)
+        let json = try await auth.performJSON(request)
+        return json["title"]?.coercedString
     }
 
     /// `DELETE /api/sessions/{id}`. A session that is already gone is a success, both here and on the backend.
     ///
-    /// From 0.22.1 the query names the session's revision and generation, read from the snapshot just before it, and a conflict is not retried: the conversation changed after the person chose to delete it. The backend can also refuse an existing conversation with 404 `not_found`.
+    /// From 0.22.1 the query names the session's revision and generation, read from the snapshot just before it; a conflict is not retried, as for the other edits. The backend can also refuse an existing conversation with 404 `not_found`.
     public func deleteSession(sessionID: String, profile: String? = nil) async throws {
         var query: [URLQueryItem] = []
         if let profile, !profile.isEmpty { query.append(URLQueryItem(name: "profile", value: profile)) }

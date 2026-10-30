@@ -49,11 +49,8 @@ struct RootView: View {
     @State private var draftRoute = ThreadRoute.new(UUID())
     /// Screenshot harness only: one of the activity strip's sheets, presented over the seeded chat because the strip itself is mounted by `ChatView`.
     @State private var harnessStripSheet: HarnessStripSheet?
-    /// `app.sessionEditNotice` once the sheet or alert the action came from has finished going away.
+    /// The edit notice on screen: the queue's front, set only while nothing else is presented, because an alert the root asks for over a sheet, or over one still animating out, is dropped.
     @State private var shownEditNotice: SessionEditNotice?
-
-    /// The hub's row actions dismiss their sheet and the renames dismiss their alert as the write starts, and an alert presented while either is still animating out is dropped.
-    static let editNoticeDelayNanoseconds: UInt64 = 500_000_000
 
     var body: some View {
         Group {
@@ -87,25 +84,18 @@ struct RootView: View {
             case .processes: BackgroundProcessesSheet(processes: sheet.chat.backgroundProcesses)
             }
         }
-        .onChange(of: app.sessionEditNotice) { _, notice in
-            guard let notice else {
-                shownEditNotice = nil
-                return
-            }
-            Task { @MainActor in
-                try? await Task.sleep(nanoseconds: Self.editNoticeDelayNanoseconds)
-                guard app.sessionEditNotice == notice else { return }
-                shownEditNotice = notice
-            }
+        // Keyed on the front notice, so dismissing one hands over to the next.
+        .task(id: app.sessionEditNotices.front?.id) {
+            await presentFrontEditNotice()
         }
         .alert(
             shownEditNotice?.title ?? "",
             isPresented: Binding(
                 get: { shownEditNotice != nil },
                 set: { presented in
-                    guard !presented else { return }
+                    guard !presented, let shown = shownEditNotice else { return }
                     shownEditNotice = nil
-                    app.sessionEditNotice = nil
+                    app.dismissSessionEditNotice(shown)
                 }
             ),
             presenting: shownEditNotice
@@ -323,6 +313,45 @@ struct RootView: View {
                 alsoKeeping: Set(stashedSessionsPath.compactMap(\.threadRouteKey))
             )
         }
+    }
+
+    // MARK: Edit notices
+
+    /// Shows the queue's front once nothing else is presented, waiting on the presentation itself rather than a timer: the action sheet or rename alert the edit came from, a sheet opened since, or the previous notice going away.
+    ///
+    /// While shown, the alert is the presented controller, so a host found clear twice means the presentation was dropped; it is asked for again rather than left latched in front of every later notice.
+    private func presentFrontEditNotice() async {
+        guard let notice = app.sessionEditNotices.front else {
+            shownEditNotice = nil
+            return
+        }
+        var clearWhileShown = 0
+        while !Task.isCancelled, app.sessionEditNotices.front == notice {
+            if shownEditNotice == notice {
+                try? await Task.sleep(nanoseconds: 500_000_000)
+                clearWhileShown = Self.presentationHostIsClear ? clearWhileShown + 1 : 0
+                if clearWhileShown >= 2, !Task.isCancelled, shownEditNotice == notice {
+                    shownEditNotice = nil
+                    clearWhileShown = 0
+                }
+            } else if Self.presentationHostIsClear {
+                // Let a dismissal that just completed finish committing before presenting over it.
+                await Task.yield()
+                if !Task.isCancelled, Self.presentationHostIsClear { shownEditNotice = notice }
+            } else {
+                try? await Task.sleep(nanoseconds: 50_000_000)
+            }
+        }
+    }
+
+    /// The same test `ChatView` uses before presenting an approval: SwiftUI's sheets and alerts all go through UIKit's presentation host.
+    private static var presentationHostIsClear: Bool {
+        let scenes = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
+        for scene in scenes where scene.activationState != .unattached {
+            let window = scene.windows.first(where: \.isKeyWindow) ?? scene.windows.first
+            if window?.rootViewController?.presentedViewController != nil { return false }
+        }
+        return true
     }
 
     /// Connect to the saved backend on launch; with nothing signed in, stay on Home in its first-run state.

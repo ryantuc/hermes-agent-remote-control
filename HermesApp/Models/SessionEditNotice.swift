@@ -23,11 +23,19 @@ struct SessionEditNotice: Identifiable, Equatable {
     let title: String
     let message: String
 
-    /// - Parameter source: the conversation's `source`, because from 0.22.1 a backend with a gateway refuses every edit to a conversation the phone started with 404 `not_found`, and that refusal deserves its own plain sentence.
-    init(action: Action, error: Error, source: String) {
+    /// Named in the title, because the notice can arrive after the person has moved on to another conversation.
+    ///
+    /// The conversation's `source` matters too: from 0.22.1 a backend with a gateway refuses every edit to a conversation the phone started with 404 `not_found`, and that refusal deserves its own plain sentence.
+    init(action: Action, error: Error, conversation: SessionSummary) {
         self.action = action
-        title = "Couldn't \(action.verb) this conversation"
-        message = Self.reason(for: error, source: source)
+        title = "Couldn't \(action.verb) \(Self.name(of: conversation))"
+        message = Self.reason(for: error, source: conversation.source)
+    }
+
+    /// The name the hub shows, quoted, or "this conversation" for a row that has neither a title nor a preview.
+    static func name(of conversation: SessionSummary) -> String {
+        let hasName = conversation.title?.isEmpty == false || !conversation.preview.isEmpty
+        return hasName ? "“\(conversation.displayTitle)”" : "this conversation"
     }
 
     static func reason(for error: Error, source: String) -> String {
@@ -50,6 +58,9 @@ struct SessionEditNotice: Identifiable, Equatable {
                 return "This conversation changed somewhere else just now. Try again."
             case (409, "session_busy"):
                 return "This conversation is busy right now. Try again when it has finished."
+            // 0.22.1 sends every edit to the offline store, which a running gateway refuses with a sentence naming its home folder.
+            case (409, let other) where other.hasPrefix("Gateway runtime already owns"):
+                return "Hermes's gateway is holding this conversation, so the phone can't change it right now."
             case (403, _):
                 return "The backend doesn't allow the phone to change this conversation. Nothing was changed."
             default:
@@ -57,5 +68,28 @@ struct SessionEditNotice: Identifiable, Equatable {
             }
         }
         return hermes.errorDescription ?? "The backend refused the change."
+    }
+}
+
+/// The notices not yet dismissed, oldest first, so a refusal that lands while another is on screen waits its turn instead of replacing it.
+struct SessionEditNoticeQueue: Equatable {
+    /// Enough for a burst of taps; older ones are dropped rather than queued without end.
+    static let limit = 3
+
+    private(set) var pending: [SessionEditNotice] = []
+
+    /// The one to show now.
+    var front: SessionEditNotice? { pending.first }
+    /// The most recent refusal.
+    var latest: SessionEditNotice? { pending.last }
+
+    mutating func post(_ notice: SessionEditNotice) {
+        pending.append(notice)
+        if pending.count > Self.limit { pending.removeFirst(pending.count - Self.limit) }
+    }
+
+    /// Removes exactly the notice that was on screen, never one that arrived behind it.
+    mutating func dismiss(_ id: SessionEditNotice.ID) {
+        pending.removeAll { $0.id == id }
     }
 }

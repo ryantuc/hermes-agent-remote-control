@@ -86,32 +86,20 @@ final class SessionMutationFenceTests: XCTestCase {
         XCTAssertTrue(FenceBackend.requests.filter { $0.method == "DELETE" }.isEmpty, "already gone is what a delete asks for")
     }
 
-    func testOneRevisionConflictIsReadAgainAndRetriedWithAFreshRequestID() async throws {
+    /// The desktop app never reads a fresh precondition after a conflict (`apps/shared/src/session-http-mutations.ts:45-48`): the conversation changed after the person decided, and a silent retry would overwrite that change.
+    func testARevisionConflictReachesTheCallerAndNothingIsResent() async throws {
         FenceBackend.mode = .fenced(revision: 5, generation: 1)
         FenceBackend.conflicts = 1
 
-        try await rest().patchSession(sessionID: "s1", pinned: true)
-
-        let bodies = FenceBackend.requests.filter { $0.method == "PATCH" }.compactMap(\.json)
-        XCTAssertEqual(bodies.count, 2)
-        XCTAssertEqual(bodies[0]["expected_revision"] as? Int, 5)
-        XCTAssertEqual(bodies[1]["expected_revision"] as? Int, 6, "the retry names the revision the backend has now")
-        XCTAssertNotEqual(bodies[0]["request_id"] as? String, bodies[1]["request_id"] as? String)
-        XCTAssertEqual(FenceBackend.requests.filter { $0.path.hasSuffix("/mutation-snapshot") }.count, 2)
-    }
-
-    func testASecondConflictIsThrownRatherThanRetriedAgain() async throws {
-        FenceBackend.mode = .fenced(revision: 5, generation: 1)
-        FenceBackend.conflicts = 5
-
         do {
             try await rest().patchSession(sessionID: "s1", pinned: true)
-            XCTFail("a write the backend keeps refusing must not succeed")
+            XCTFail("a conflicted write must reach the caller")
         } catch HermesError.httpStatus(let code, let message) {
             XCTAssertEqual(code, 409)
             XCTAssertEqual(message, "revision_conflict")
         }
-        XCTAssertEqual(FenceBackend.requests.filter { $0.method == "PATCH" }.count, 2, "one retry, never a loop")
+        XCTAssertEqual(FenceBackend.requests.filter { $0.method == "PATCH" }.count, 1, "no retry")
+        XCTAssertEqual(FenceBackend.requests.filter { $0.path.hasSuffix("/mutation-snapshot") }.count, 1, "no second read of the counters")
     }
 
     func testADeleteConflictIsNotRetried() async throws {
