@@ -2,12 +2,12 @@ import XCTest
 
 /// **BUG-016 — the transcript goes blank and every message disappears.**
 ///
-/// The highest-severity bug in the inbox, and the only one whose repro is a
+/// The highest-severity bug on record, and the only one whose repro is a
 /// *gesture*. That is why this target exists: `simctl` cannot inject input at
 /// all — no tap, no type, no long-press, no accessibility query — so a probe
 /// built on it can screenshot the bug but can never cause it. `xcodebuild test`
 /// against a simulator can, needs no macOS Accessibility permission and no
-/// signing, and already runs over SSH every wave.
+/// signing, and runs headless over SSH.
 ///
 /// **The binding rule for this harness.** A green run here proves nothing until
 /// the same test has been shown to go RED on an unfixed build. A harness that

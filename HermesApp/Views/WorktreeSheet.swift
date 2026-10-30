@@ -606,7 +606,7 @@ struct WorktreeSheet: View {
         do {
             baseBranches = try await git.baseBranches(path: repoRoot)
             // `origin/HEAD` when the backend flags one, most-recent ref
-            // otherwise — the campaign's own repo flags nothing.
+            // otherwise — many repositories flag nothing.
             selectedBase = GitBaseBranch.preferred(in: baseBranches)?.name ?? ""
         } catch {
             baseBranches = []

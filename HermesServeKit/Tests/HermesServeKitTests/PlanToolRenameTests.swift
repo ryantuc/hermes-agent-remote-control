@@ -8,7 +8,7 @@ import XCTest
 /// while still attaching `todos` to it, so a client that matches one spelling
 /// renders the checklist on exactly half the backends in the field.
 ///
-/// Derived from source, not observed: the backend on this box predates the
+/// Derived from source, not observed: the backend these were written against predates the
 /// rename. That is the whole reason both names have to keep working — a phone
 /// meets whichever hermes-agent its owner happens to have installed.
 ///

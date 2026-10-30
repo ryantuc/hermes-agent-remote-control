@@ -401,7 +401,7 @@ actor ScriptedBackend {
     /// it never sent, which is a live trap for the next author: a settle,
     /// eviction or interrupt-latch test written on this helper would assert
     /// against a turn that never finished, and could pass for the wrong reason.
-    /// This campaign has already produced one test that went green against the
+    /// This project has already had one test that went green against the
     /// defect it was written to catch; this is the same failure mode waiting to
     /// happen.
     ///

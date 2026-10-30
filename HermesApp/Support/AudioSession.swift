@@ -1,7 +1,7 @@
 import AVFoundation
 import Observation
 
-/// The one place that owns `AVAudioSession` (band 7d): uses are reference
+/// The one place that owns `AVAudioSession`: uses are reference
 /// counted, the category derives from whichever uses are live, and the session
 /// is deactivated only when the last one ends. `.defaultToSpeaker` is set
 /// explicitly because `.playAndRecord` routes output to the earpiece and

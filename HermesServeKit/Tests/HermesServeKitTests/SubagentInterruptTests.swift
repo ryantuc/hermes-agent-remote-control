@@ -2,10 +2,10 @@ import XCTest
 
 @testable import HermesServeKit
 
-/// **BUG-013, wave 2 item 0** — what Stop needs from this layer to actually stop
+/// **BUG-013, second fix** — what Stop needs from this layer to actually stop
 /// a delegated agent.
 ///
-/// Wave 1 widened `isTurnActive` so Stop appears whenever the strip claims work,
+/// The first fix widened `isTurnActive` so Stop appears whenever the strip claims work,
 /// including the state where a background agent outlives the turn that spawned
 /// it. In that state `session.interrupt` reaches nothing: the handler gates on
 /// the session being busy, and the background dispatch path detaches every child

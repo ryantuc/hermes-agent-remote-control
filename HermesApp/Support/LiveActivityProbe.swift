@@ -4,7 +4,7 @@ import Foundation
 import HermesServeKit
 import UIKit
 
-/// Band 7e's device/simulator probe (`-hermesActivityProbe`): the Lock Screen
+/// The Live Activity's device/simulator probe (`-hermesActivityProbe`): the Lock Screen
 /// card and the Dynamic Island cannot be inspected in a view hierarchy, so this
 /// drives the real controller call path and prints every decision.
 @MainActor

@@ -3,9 +3,9 @@ import XCTest
 
 @testable import HermesMobile
 
-/// **BUG-013, wave 2 item 0** — the hole wave 1 knowingly shipped.
+/// **BUG-013, second fix** — the hole the first fix knowingly shipped.
 ///
-/// Wave 1 widened `isTurnActive` so a Stop is on screen whenever the strip
+/// The first fix widened `isTurnActive` so a Stop is on screen whenever the strip
 /// claims work, including the state the report was about: the parent turn has
 /// settled and delegated agents are still running. But `stopTapped` only reached
 /// `interrupt()` when the turn was busy or a prompt was queued, so in exactly

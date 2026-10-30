@@ -181,7 +181,7 @@ final class SessionActivityStripLayoutTests: XCTestCase {
 
     /// **There is no gesture that grows this surface.**
     ///
-    /// An inline expansion was built for this wave and measured out of it: two
+    /// An inline expansion was built once and measured out: two
     /// rows per group is another 176 pt, and with the keyboard up that is
     /// negative transcript on an iPhone SE. So the strip has exactly three
     /// heights, and this enumerates them — a future expansion has to come back
