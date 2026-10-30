@@ -64,6 +64,27 @@ final class DemoMessageActionsTests: XCTestCase {
         await app.exitDemo()
     }
 
+    /// Retry on the second answer asked for a hold because "the turn being retried ran commands that changed files on your machine". The demo's write is scripted: nothing ran and nothing changed, so Retry must not say so.
+    func testRetryInTheDemoNeverSaysTheTurnChangedFiles() async throws {
+        let (app, backend, chat) = try await playedDemo()
+        let report = try XCTUnwrap(
+            finishedAnswers(chat).last { chat.precedingUserEntry(before: $0.id)?.text == DemoScript.turnTwo.prompt },
+            "no finished answer follows \"\(DemoScript.turnTwo.prompt)\""
+        )
+        let entries = chat.entries
+        let end = try XCTUnwrap(entries.firstIndex { $0.id == report.id })
+        let start = try XCTUnwrap(entries[..<end].lastIndex { $0.kind == .user })
+        XCTAssertTrue(
+            entries[start...end].contains { $0.tool?.name == "write_file" },
+            "precondition: the second turn carries the scripted write, or this proves nothing"
+        )
+        for answer in finishedAnswers(chat) {
+            XCTAssertFalse(chat.turnMutatedState(before: answer.id), "Retry on \"\(answer.text.prefix(40))\" would ask for a hold over files the demo never touched")
+        }
+        await assertStillOffline(app, backend)
+        await app.exitDemo()
+    }
+
     // MARK: Edit
 
     func testEditOnTheFinishedAnswerSendsTheEditedMessageAndSettles() async throws {

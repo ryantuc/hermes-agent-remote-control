@@ -149,6 +149,41 @@ final class RetryReplacesTurnTests: XCTestCase {
         await harness.tearDown()
     }
 
+    /// Retry repeats a turn's commands, so off the demo a turn that wrote a file still asks for a hold first.
+    func testRetryAfterALiveTurnThatWroteAFileStillAsksFirst() async throws {
+        let harness = await AppHarness.make()
+        try await harness.openSocket()
+        let chat = harness.chat(storedID: storedID)
+        await chat.open()
+        let bound = await waitUntil { chat.runtimeSessionID != nil }
+        XCTAssertTrue(bound)
+        let sid = try XCTUnwrap(chat.runtimeSessionID)
+
+        chat.draft = "save the notes"
+        chat.sendTapped()
+        _ = await waitUntil { await harness.backend.callCount("prompt.submit") == 1 }
+        _ = await waitUntil { !chat.isSending }
+        await harness.backend.emit("message.start", sessionID: sid)
+        await harness.backend.emit("tool.start", sessionID: sid, payload: .object([
+            "tool_id": .string("write-1"), "name": .string("write_file"), "context": .string("notes.md"),
+        ]))
+        await harness.backend.emit("tool.complete", sessionID: sid, payload: .object([
+            "tool_id": .string("write-1"), "name": .string("write_file"), "result": .string("Wrote notes.md"), "duration_s": .number(0.1),
+        ]))
+        await harness.backend.emit("message.delta", sessionID: sid, payload: .object(["text": .string("Saved.")]))
+        await harness.backend.emit("message.complete", sessionID: sid, payload: .object([
+            "text": .string("Saved."), "status": .string("complete"),
+        ]))
+        let settled = await waitUntil { !chat.live.isBusy && chat.entries.contains { $0.kind == .assistant && $0.status == "complete" } }
+        XCTAssertTrue(settled)
+        XCTAssertTrue(chat.entries.contains { $0.tool?.name == "write_file" }, "precondition: the write never reached the transcript: \(chat.entries.map(\.id))")
+        let reply = try XCTUnwrap(chat.entries.last { $0.kind == .assistant && $0.status == "complete" })
+
+        XCTAssertTrue(chat.turnMutatedState(before: reply.id), "a live turn that wrote a file must still ask before Retry repeats it")
+
+        await harness.tearDown()
+    }
+
     // MARK: Edit & resend
 
     func testEditLoadsTheTurnAndSendReplacesIt() async throws {
