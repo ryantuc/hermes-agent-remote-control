@@ -44,6 +44,19 @@ final class ReviewReadinessTests: XCTestCase {
         XCTAssertFalse(prompt.contains("hermes serve"), prompt)
     }
 
+    /// App Review's automated check asked whether HARC has VPN functionality. It has none: it reaches the user's own computer over a network the user already has, and the word in a purpose string was enough to raise the question.
+    func testNoInfoPlistStringNamesAVPN() {
+        for (key, value) in info {
+            guard let text = value as? String else { continue }
+            for word in ["VPN", "Tailscale", "WireGuard"] {
+                XCTAssertFalse(text.localizedCaseInsensitiveContains(word), "\(key) says \"\(word)\": \(text)")
+            }
+        }
+        let prompt = info["NSLocalNetworkUsageDescription"] as? String ?? ""
+        XCTAssertTrue(prompt.contains("local network"), prompt)
+        XCTAssertTrue(prompt.contains("private network"), "the prompt still has to cover a computer reached some other way than the same network: \(prompt)")
+    }
+
     /// HTTPS through the system and SHA-256 hashing are exempt, so the answer is false and App Store Connect asks no export questions.
     func testExportComplianceIsAnsweredFalse() {
         XCTAssertEqual(info["ITSAppUsesNonExemptEncryption"] as? Bool, false)

@@ -115,6 +115,14 @@ final class LaunchPolishTests: XCTestCase {
         XCTAssertEqual(HomeChrome.getHermesAgentTitle, "Get Hermes Agent")
     }
 
+    /// The line App Review reads first must not suggest the app is a VPN, which it is not.
+    func testTheFirstRunLineSaysHowToReachTheComputerWithoutAVPN() {
+        let line = HomeChrome.firstRunRequirement
+        XCTAssertFalse(line.localizedCaseInsensitiveContains("VPN"), line)
+        XCTAssertTrue(line.contains("same Wi-Fi"), line)
+        XCTAssertTrue(line.contains("private network"), line)
+    }
+
     func testTheHubNamesTheDemoWithoutAVersionOrAConnection() {
         XCTAssertFalse(HubBackendCopy.demoSubtitle.contains("Connected"))
         XCTAssertFalse(HubBackendCopy.demoSubtitle.contains("vdemo"))
