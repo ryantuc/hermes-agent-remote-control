@@ -44,7 +44,3 @@ screenshots/
 *.xcconfig
 ExportOptions.plist
 .env
-
-# Agent session worktrees and scratch, created at the repo root.
-# Never part of the product.
-.claude/
