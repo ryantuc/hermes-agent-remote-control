@@ -34,7 +34,7 @@ enum HomeChrome {
     static let appTagline = "Remote control for Hermes Agent"
 
     /// What the first-run screen says a person needs before Connect can work, since the app is a client and does nothing on its own.
-    static let firstRunRequirement = "To start, you need Hermes Agent running on a computer this iPhone can reach, on the same Wi-Fi or over a VPN, and that computer's address."
+    static let firstRunRequirement = "To start, you need Hermes Agent running on a computer this iPhone can reach, on the same Wi-Fi or over a private network, and that computer's address."
 
     static let getHermesAgentTitle = "Get Hermes Agent"
 

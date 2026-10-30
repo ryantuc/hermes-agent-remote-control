@@ -92,7 +92,7 @@ targets:
         NSMicrophoneUsageDescription: "Dictate a message, or talk to Hermes hands-free. With the Hermes dictation engine, the recording goes to your own backend to be transcribed."
         NSSpeechRecognitionUsageDescription: "Turn what you say into text for dictation and voice chat. Recognition runs on your iPhone, so the audio stays on it."
         NSFaceIDUsageDescription: "Confirm dangerous agent actions with Face ID."
-        NSLocalNetworkUsageDescription: "HARC connects to the Hermes Agent you run on your own computer, over your local network or VPN."
+        NSLocalNetworkUsageDescription: "HARC connects to the Hermes Agent you run on your own computer, over your local network or a private network."
         # Allow plain-http backends over private networks (Tailscale) during
         # development. Production guidance is HTTPS/WSS — see docs/DEPLOYMENT.md.
         NSAppTransportSecurity:
