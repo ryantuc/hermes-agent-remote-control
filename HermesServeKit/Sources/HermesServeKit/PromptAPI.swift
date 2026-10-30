@@ -44,12 +44,15 @@ public struct PromptAPI: Sendable {
     /// Uses the 30-minute timeout, because anything shorter turns a long tool-using turn into a spurious client-side failure.
     ///
     /// `replacingRowID` makes this submit a Retry or Edit & resend: the backend drops the user turn written to that durable row and everything after it, then runs `text` in its place (`truncate_before_row_id` + `confirm_truncate`, `tui_gateway/contracts/prompt_voice.py:27-55`, declared on current and older backends). Consent travels only with a target, never on an ordinary send, because an unconfirmed cut answers 4029 and a leftover one destroyed history upstream (#80763, `tui_gateway/methods_prompt.py:244-276`). `confirm_empty_truncate` rides along as Desktop sends it with every durable-row rewind (`apps/desktop/src/app/session/hooks/use-prompt-actions/rewind.ts:338-360`): replacing the first turn leaves an empty prefix, which the backend otherwise refuses with 4028, and it is ignored when the prefix is not empty (`methods_prompt.py:369-378`). No ordinal is sent: the phone's ordinals are tail-relative, and a mismatch beside a durable row answers 4030. A busy session refuses the cut with 4009 (`methods_prompt.py:676-677`).
+    ///
+    /// `agreedUserTurns` is how many user turns, the target's own included, the person agreed this replacement removes.
     public func submit(
         sessionID: String,
         text: String,
         forceQueue: Bool = false,
         submissionRef: String? = nil,
-        replacingRowID: Int? = nil
+        replacingRowID: Int? = nil,
+        agreedUserTurns: Int? = nil
     ) async throws -> PromptAck {
         var params: [String: JSONValue] = [
             "session_id": .string(sessionID),

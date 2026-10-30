@@ -72,7 +72,7 @@ actor ScriptedGatewayTransport: GatewayTransport {
 
     private static func scriptedError(_ value: JSONValue) -> JSONRPCError? {
         guard let body = value[errorMarker] else { return nil }
-        return JSONRPCError(code: body["code"]?.coercedInt ?? 0, message: body["message"]?.coercedString ?? "")
+        return JSONRPCError(code: body["code"]?.coercedInt ?? 0, message: body["message"]?.coercedString ?? "", data: body["data"])
     }
 
     /// The `params` object of the most recent request for `method`, or nil when
@@ -123,11 +123,25 @@ private final class TransportBox: @unchecked Sendable {
 
 enum ScriptedGateway {
     /// A queued reply that answers as a JSON-RPC error frame instead of a result.
-    static func rpcError(code: Int, message: String) -> JSONValue {
-        .object([ScriptedGatewayTransport.errorMarker: .object([
+    /// `data` is the error's structured detail; nil sends none, as before.
+    static func rpcError(code: Int, message: String, data: JSONValue? = nil) -> JSONValue {
+        var body: [String: JSONValue] = [
             "code": .number(Double(code)),
             "message": .string(message),
-        ])])
+        ]
+        if let data { body["data"] = data }
+        return .object([ScriptedGatewayTransport.errorMarker: .object(body)])
+    }
+
+    /// The `params` of every request sent for `method`, oldest first.
+    static func allSentParams(_ method: String, on transport: ScriptedGatewayTransport) async -> [JSONValue] {
+        let lines = await transport.sentLines
+        return lines.compactMap { line in
+            guard let value = try? JSONDecoder().decode(JSONValue.self, from: Data(line.utf8)),
+                  value["method"]?.stringValue == method
+            else { return nil }
+            return value["params"] ?? .null
+        }
     }
 
     /// An open `HermesClient` whose socket answers `replies`, plus the socket
