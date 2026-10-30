@@ -2,10 +2,10 @@
 
 HARC talks to the FastAPI server inside Hermes Agent, started as either `hermes dashboard` (serves the browser SPA plus the APIs) or `hermes serve` (headless: APIs only, and every non-API path returns JSON 404).
 
-Facts that shape every deployment (verified against hermes-agent v0.19.1 source; the condensed client contract is in `docs/PROTOCOL.md`):
+Facts that shape every deployment (first written against hermes-agent v0.19.1 source and checked again against v0.22.5; the condensed client contract is in `docs/PROTOCOL.md`):
 
-- **Auth mode is chosen by bind host alone.** Loopback binds (`127.0.0.1`/`localhost`/`::1`) run ungated with an ephemeral per-process session token. *Any* other bind (LAN, Tailscale, `0.0.0.0`) engages the auth gate, which requires at least one configured auth provider (password or OAuth) or the server refuses to start.
-- **WebSocket auth**: gated mode requires a single-use 30-second ticket from `POST /api/auth/ws-ticket`, passed as `?ticket=` on the `/api/ws` upgrade. Loopback mode accepts `?token=<session token>`.
+- **Auth mode is chosen by bind host.** Loopback binds (`127.0.0.1`/`localhost`/`::1`) run ungated with an ephemeral per-process session token. *Any* other bind (LAN, Tailscale, `0.0.0.0`) engages the auth gate, which requires at least one configured auth provider (password or OAuth) or the server refuses to start. One addition on current versions: a non-loopback `dashboard.public_url` engages the gate even on a loopback bind.
+- **WebSocket auth**: gated mode takes a single-use 30-second ticket from `POST /api/auth/ws-ticket`, passed as `?ticket=` on the `/api/ws` upgrade; 0.21.6 and later also accept a provider-verified access token as `?token=`. Loopback mode accepts `?token=<session token>`.
 - **The native app is unaffected by CORS.** Hermes' CORS policy allows only `localhost`/`127.0.0.1` origins and never sends `allow_credentials`, which constrains browser clients; HARC authenticates with cookies or `Authorization: Bearer` and is not subject to it.
 
 ---
