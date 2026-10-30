@@ -6,6 +6,8 @@
 <title>HARC</title>
 <meta name="description" content="A native iOS client for Hermes Agent.">
 <link rel="stylesheet" href="style.css">
+<link rel="icon" type="image/png" sizes="32x32" href="favicon-32.png">
+<link rel="apple-touch-icon" sizes="180x180" href="apple-touch-icon.png">
 </head>
 <body>
 
@@ -25,6 +27,7 @@
 
   <div class="hero">
     <div class="wrap">
+      <img src="icon-512.png" width="112" height="112" alt="HARC app icon" style="display:block;border-radius:22%;margin:0 0 1.5rem">
       <p class="eyebrow">Hermes Agent Remote Control</p>
       <h1>A native iPhone client for Hermes Agent</h1>
       <p class="lede">HARC drives a copy of <code>hermes serve</code> that you run yourself, at an address you type in. No account, and no server of ours in the middle.</p>
@@ -84,7 +87,7 @@
 
           <div class="feature">
             <h3>Voice chat <span class="chip chip-partial">Half-duplex</span></h3>
-            <p>On required on-device speech recognition. Your audio stays on the phone; only the text goes to your backend.</p>
+            <p>Speech recognition runs on the phone, and voice chat won't start where it can't. Your audio stays on the phone; only the text goes to your backend.</p>
           </div>
 
           <div class="feature">
@@ -110,6 +113,7 @@
         <h2>What you need</h2>
         <p>An iPhone on iOS 17 or later, and a machine running <code>hermes serve</code> that the phone can reach. Binding the gateway to anything but loopback turns Hermes Agent's auth gate on, so you will need a credential for it.</p>
         <p>The <a href="https://github.com/ryantuc/hermes-agent-remote-control/blob/main/docs/SETUP.md">setup guide</a> covers authentication, the serve command, the firewall, and running one backend for both clients.</p>
+        <p>HARC's code is open source under the MIT license, and it is <a href="https://github.com/ryantuc/hermes-agent-remote-control">on GitHub</a> with instructions for building it yourself.</p>
       </div>
     </div>
   </section>
@@ -122,6 +126,7 @@
     <ul class="footer-links">
       <li><a href="privacy.html">Privacy</a></li>
       <li><a href="support.html">Support</a></li>
+      <li><a href="https://github.com/ryantuc/hermes-agent-remote-control">Source code</a></li>
       <li><a href="https://github.com/NousResearch/hermes-agent">Hermes Agent</a></li>
     </ul>
   </div>
