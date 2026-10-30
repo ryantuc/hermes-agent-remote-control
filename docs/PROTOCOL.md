@@ -1,12 +1,10 @@
 # Hermes serve client contract (condensed)
 
-This is the condensed contract HARC is written against: the subset of Hermes Agent's gateway protocol this client actually calls. The authoritative detail is the upstream source itself — [NousResearch/hermes-agent](https://github.com/NousResearch/hermes-agent), which serves 141 RPC methods and 62 event types over the same transport.
+This is the condensed contract HARC is written against: the subset of Hermes Agent's gateway protocol this client actually calls. The authoritative detail is the upstream source itself — [NousResearch/hermes-agent](https://github.com/NousResearch/hermes-agent), which serves many more methods and events over the same transport.
 
 Derived from Hermes Agent (MIT, Copyright (c) 2025 Nous Research). See `THIRD-PARTY-NOTICES.md`.
 
-Everything below was verified against hermes-agent **v0.19.1** source. Contract
-version: `DESKTOP_BACKEND_CONTRACT = 5`, returned as `info.desktop_contract` in
-`session.create`/`session.resume` results.
+Baseline: the sections from Transport through Reusable code, except Profiles, were first verified against hermes-agent **v0.19.1** source, whose contract version was `DESKTOP_BACKEND_CONTRACT = 5`, returned as `info.desktop_contract` in `session.create`/`session.resume` results. They have not been re-audited line by line since. Profiles and everything from "Interactive requests" on were written later, against newer gateways. HARC works with hermes-agent 0.21.x through 0.22.5, the current stable release; those report contract versions 6 to 8, and every 0.22 release reports 8.
 
 ## Transport
 
@@ -73,7 +71,7 @@ The roster surface. Read-only from this client: `profiles.configure` would write
 - `preferred_session` is **tri-state and all three states are different**: key absent (no pin was supplied for that profile, or the gateway is too old), key present and `null` (the gateway looked and the row is gone / archived / `kanban`-or-`tool` sourced), key present with an object. Its shape is `{id, resolved_id, root_title, title, preview, started_at, last_active, message_count}`, where `id` is the caller's pin echoed back and `resolved_id` is the live compression tip. Its `last_active` reads `last_activity_at` directly and is **not** comparable with `last_session.last_active`.
 - `profiles.get_asset {name, asset?} -> {found, mime?, size?, data?}`. `asset` defaults to `"avatar"`, the only supported value. `data` is a full `data:<mime>;base64,...` URL, not bare base64. A missing asset is `{found: false}` — a success, not an error — so probing every row is cheap. Errors are 4063 / 4064 / 5066.
 
-A bot's thread is identified by its title, not by a stored pointer — there is no `canonical_session` field anywhere on this wire:
+A bot's thread is identified by its title, not by a stored pointer. At v0.19.1 there was no `canonical_session` field; gateways from 0.20.6 on, which covers every release HARC supports, add one to each `profiles.list` row: the gateway's own lookup of the row titled `Bot Chat`, shaped like `preferred_session` above except that `id` is that row rather than an echoed pin. HARC prefers it over `preferred_session`, and resolves a bot's thread by title either way:
 
 - `session.list {title, profile?, include_hidden?, limit?}` is an **exact-title registry lookup**, not a listing: a partial UNIQUE index on `sessions(title)` means at most one row per profile db can carry a title, and the branch answers with a one-element list `{id, resolved_id, title, preview, started_at, message_count, source}`. Hidden rows resolve here; archived rows and `kanban`/`tool` sources come back as an empty success. `started_at` is the root's, `message_count` the tip's, and `preview` is always empty (the tip is a `get_session()` row). An older gateway ignores `title` and returns its ordinary windowed listing instead — **filter client-side on the exact title or you will adopt an unrelated conversation.**
 - Compression **transfers** a title from the root onto the continuation and NULLs the ancestor. So a pinned root id keeps resuming, but after the first rotation only the tip is discoverable by title, and `preferred_session.root_title` goes empty while `title` still reads the name. Treat "root title matches, or root title is empty and tip title matches" as the same conversation.
