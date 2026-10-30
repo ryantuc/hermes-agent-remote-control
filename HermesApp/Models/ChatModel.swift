@@ -192,6 +192,10 @@ final class ChatModel {
             /// The user turns on screen after the target, and in all, when the person composed this replacement; the cut they agreed to is the target and those turns, so `retryOutbound` refuses a cut once there are more.
             var userTurnsAfter = 0
             var userTurnCount = 0
+            /// Set by Edit & resend, whose banner says Send replaces the message and everything after it; a Retry says nothing about the later turns.
+            var agreedToLaterTurns = false
+            /// The user turns the person agreed this replacement removes, the target's own included; nil when they agreed to nothing beyond the cut the backend makes without asking.
+            var agreedUserTurns: Int? { agreedToLaterTurns ? userTurnsAfter + 1 : nil }
         }
     }
 
@@ -1284,7 +1288,9 @@ final class ChatModel {
             return
         }
         let text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard enqueueSend(text: text, attachments: attachments, replacing: replacement(for: target)) else { return }
+        var edit = replacement(for: target)
+        edit?.agreedToLaterTurns = true
+        guard enqueueSend(text: text, attachments: attachments, replacing: edit) else { return }
         editingEntryID = nil
         editingTarget = nil
         draft = ""
@@ -1685,7 +1691,7 @@ final class ChatModel {
             do {
                 let ack = try await promptAPI.submit(sessionID: sessionID, text: body,
                     submissionRef: app.engine.sharedSessionSupported ? messageID.uuidString : nil,
-                    replacingRowID: replacingRowID)
+                    replacingRowID: replacingRowID, agreedUserTurns: message.replacing?.agreedUserTurns)
                 app.engine.acknowledgeSubmission(sessionID: sessionID, ack: ack)
                 lastAckStatus = ack.effectiveStatus
                 ackEndedVoiceChat = ack.voiceStopped
@@ -1717,7 +1723,7 @@ final class ChatModel {
                 }
                 let ack = try await promptAPI.submit(sessionID: result.sessionID, text: body,
                     submissionRef: app.engine.sharedSessionSupported ? messageID.uuidString : nil,
-                    replacingRowID: replacingRowID)
+                    replacingRowID: replacingRowID, agreedUserTurns: message.replacing?.agreedUserTurns)
                 app.engine.acknowledgeSubmission(sessionID: result.sessionID, ack: ack)
                 lastAckStatus = ack.effectiveStatus
                 ackEndedVoiceChat = ack.voiceStopped
@@ -1742,7 +1748,7 @@ final class ChatModel {
                 do {
                     ack = try await promptAPI.submit(sessionID: sessionID, text: body,
                         submissionRef: app.engine.sharedSessionSupported ? messageID.uuidString : nil,
-                        replacingRowID: resolved)
+                        replacingRowID: resolved, agreedUserTurns: message.replacing?.agreedUserTurns)
                 } catch let again as HermesError where Self.isStaleReplacementTarget(again) {
                     mutateOutbound(messageID) { $0.replacing = nil }
                     throw ReplacementTargetGone()

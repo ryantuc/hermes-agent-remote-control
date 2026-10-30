@@ -45,7 +45,7 @@ public struct PromptAPI: Sendable {
     ///
     /// `replacingRowID` makes this submit a Retry or Edit & resend: the backend drops the user turn written to that durable row and everything after it, then runs `text` in its place (`truncate_before_row_id` + `confirm_truncate`, `tui_gateway/contracts/prompt_voice.py:27-55`, declared on current and older backends). Consent travels only with a target, never on an ordinary send, because an unconfirmed cut answers 4029 and a leftover one destroyed history upstream (#80763, `tui_gateway/methods_prompt.py:244-276`). `confirm_empty_truncate` rides along as Desktop sends it with every durable-row rewind (`apps/desktop/src/app/session/hooks/use-prompt-actions/rewind.ts:338-360`): replacing the first turn leaves an empty prefix, which the backend otherwise refuses with 4028, and it is ignored when the prefix is not empty (`methods_prompt.py:369-378`). No ordinal is sent: the phone's ordinals are tail-relative, and a mismatch beside a durable row answers 4030. A busy session refuses the cut with 4009 (`methods_prompt.py:676-677`).
     ///
-    /// `agreedUserTurns` is how many user turns, the target's own included, the person agreed this replacement removes.
+    /// `agreedUserTurns` is how many user turns, the target's own included, the person agreed this replacement removes. A backend that enforces the depth gate refuses a cut that removes more than one user turn unless `confirm_deep_truncate` rides along, answering 4033 with the count in `archived_user_turns` (`methods_prompt.py:513-531` at v0.22.5, still switched off there at `:453`). The key is declared only from 0.21.7 on (`prompt_voice.py:46`) and an older backend answers it with 4000, so it is never sent up front: after a 4033 whose count is no more than agreed, the same submit goes out once more with it. Any other refusal, a second 4033 included, is thrown.
     public func submit(
         sessionID: String,
         text: String,
@@ -66,12 +66,30 @@ public struct PromptAPI: Sendable {
             params["confirm_truncate"] = .bool(true)
             params["confirm_empty_truncate"] = .bool(true)
         }
+        do {
+            return try await sendSubmit(params)
+        } catch {
+            guard replacingRowID != nil, let agreedUserTurns,
+                  let archived = Self.deepCutArchivedUserTurns(error), archived <= agreedUserTurns
+            else { throw error }
+            params["confirm_deep_truncate"] = .bool(true)
+            return try await sendSubmit(params)
+        }
+    }
+
+    private func sendSubmit(_ params: [String: JSONValue]) async throws -> PromptAck {
         let result = try await client.request(
             "prompt.submit",
             params: .object(params),
             timeout: HermesClient.promptSubmitTimeout
         )
         return PromptAck(json: result)
+    }
+
+    /// The user turns a refused deep cut would remove, the target's own included; nil for any other error, and for a 4033 that does not say.
+    static func deepCutArchivedUserTurns(_ error: Error) -> Int? {
+        guard let error = error as? HermesError, case let .rpc(code, _, data) = error, code == 4033 else { return nil }
+        return data?["archived_user_turns"]?.coercedInt
     }
 
     /// `session.redirect` — steer the live model turn in place, where `status: "queued"` means it landed in the build window and runs as the next turn instead (reference-clients.md §3.5).
