@@ -2394,8 +2394,10 @@ final class ChatModel {
             switch ToolCardView.Family(toolName: tool.name) {
             case .terminal, .edit: return true
             case .file: return tool.name.lowercased().contains("write")
+            // A browser tool named like a terminal one (`browser_exec`) runs the model's code on the machine.
+            case .browser: return ToolCardView.Family.terminalWords.contains { tool.name.lowercased().contains($0) }
             // `.todo` writes only the agent's own plan, so re-running discards nothing on the user's machine.
-            case .search, .browser, .todo, .other: return false
+            case .search, .todo, .other: return false
             }
         }
     }

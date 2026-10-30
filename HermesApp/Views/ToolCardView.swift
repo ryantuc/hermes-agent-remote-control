@@ -111,7 +111,10 @@ struct ToolCardView: View {
             // below, so `todoist_add_task` cannot inherit the checklist renderer.
             if TodoList.isPlanTool(name) {
                 self = .todo
-            } else if ["terminal", "bash", "shell", "run", "exec", "command"].contains(where: name.contains) {
+            } else if name.contains("browser") {
+                // Before the terminal words: the browser tool is `browser_exec` on newer backends.
+                self = .browser
+            } else if Self.terminalWords.contains(where: name.contains) {
                 self = .terminal
             } else if ["edit", "patch", "replace", "apply_diff"].contains(where: name.contains) {
                 self = .edit
@@ -127,6 +130,9 @@ struct ToolCardView: View {
                 self = .other
             }
         }
+
+        /// The substrings that make a tool a terminal tool.
+        static let terminalWords = ["terminal", "bash", "shell", "run", "exec", "command"]
 
         /// A tool name's words, lowercased: split on anything that is not a letter or digit and where a lowercase letter or digit meets an uppercase one, so `web_extract`, `web-fetch` and `fetchWebPage` each contain `web`.
         static func words(in toolName: String) -> [String] {
