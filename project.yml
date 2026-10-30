@@ -147,9 +147,9 @@ targets:
       # run, and it is the value `BuildNumberTests` looks for to prove exactly
       # that. It is not the accepted-build floor — that is a separate constant,
       # ACCEPTED_BUILD_FLOOR in scripts/stamp-build-number.sh, which rises after
-      # each accepted upload while this stays 0 forever. They coincide at 0 today
-      # only because nothing has been accepted. Raising this one as "insurance"
-      # would blind the guard.
+      # each processed upload while this stays 0 forever. They coincided at 0
+      # until the first processed upload, 1.0.0 (3), raised the floor to 3.
+      # Raising this one as "insurance" would blind the guard.
       #
       # `HermesMobile.xcodeproj` is generated and gitignored. After any merge or
       # checkout that changes this file, `xcodegen generate` is mandatory before
@@ -165,7 +165,7 @@ targets:
       # whatever the scheduler picked - and on an incremental build it picked
       # the script first, putting the shipped app back on the "0" that means
       # unstamped while the embedded .appex kept the derived number. Measured
-      # at 0c45197: a clean build came out 415/415; the next three incremental
+      # once: a clean build came out 415/415; the next three incremental
       # builds came out app 2 / appex 415, each with Xcode's own `warning: The
       # CFBundleVersion of an app extension ('415') must match that of its
       # containing parent app ('2')`.
@@ -185,11 +185,10 @@ targets:
           sh "$SRCROOT/scripts/stamp-build-number.sh"
           sh "$SRCROOT/scripts/check-changelog.sh" --warn-only
 
-  # The Live Activity widget extension (band 7e). The campaign's last
-  # structural change and its only second target.
+  # The Live Activity widget extension: the only product target besides the app.
   #
   # It gets its **own** bundle id under `io.github.ryantuc`, which means Xcode
-  # mints a second provisioning profile against the same free personal team.
+  # mints a second provisioning profile against the same team.
   # `DEVELOPMENT_TEAM` and automatic signing match the app's exactly; nothing
   # here is renamed to work around an App-ID limit, because that limit would be
   # an account fact and not a code problem.

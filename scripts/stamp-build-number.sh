@@ -71,7 +71,7 @@
 set -u
 
 # The highest build App Store Connect has processed an upload of for the current
-# MARKETING_VERSION. It is 0 because nothing has been uploaded yet.
+# MARKETING_VERSION. It is 3: App Store Connect processed 1.0.0 (3) on 2026-10-13.
 #
 # Processed, not approved: App Store Connect requires every upload for a
 # marketing version to carry a higher build string than any earlier upload it
