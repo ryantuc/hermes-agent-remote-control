@@ -1,9 +1,15 @@
-#!/usr/bin/env python
-"""Windows-local regression checks for scripts/stamp-build-number.sh review fixes."""
+#!/usr/bin/env python3
+"""Self-checks for scripts/stamp-build-number.sh.
+
+Runs the build-number phase against throwaway git repositories, with a stand-in for PlistBuddy, and prints one PASS or FAIL line per check. Needs `git` and `sh` on PATH. Run it from a clone with its history:
+
+    python3 scripts/test_stamp_build_number_review.py
+"""
 from __future__ import annotations
 
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -42,9 +48,11 @@ def write_plist(path: Path, value: str) -> None:
 
 def make_buddy(path: Path) -> None:
     # A single-token executable so `PLISTBUDDY=...` remains a valid shell assignment.
+    # It runs under the interpreter running these checks, which need not be called `python`.
+    interpreter = shlex.quote(Path(sys.executable).as_posix())
     path.write_text(
         "#!/bin/sh\n"
-        "exec python - \"$@\" <<'PY'\n"
+        f"exec {interpreter} - \"$@\" <<'PY'\n"
         "import re, sys\n"
         "from pathlib import Path\n"
         "args = sys.argv[1:]\n"
@@ -103,7 +111,10 @@ def patched_script(workdir: Path, buddy: Path, floor: int | None = None, name: s
     text = SCRIPT.read_text(encoding="utf-8")
     text = text.replace("/usr/libexec/PlistBuddy", buddy.as_posix())
     if floor is not None:
-        text = text.replace("ACCEPTED_BUILD_FLOOR=0", f"ACCEPTED_BUILD_FLOOR={floor}")
+        # Whatever the shipped floor is today; a script with no floor line to patch is a broken check, not a pass.
+        text, count = re.subn(r"^ACCEPTED_BUILD_FLOOR=[0-9]+$", f"ACCEPTED_BUILD_FLOOR={floor}", text, flags=re.M)
+        if count != 1:
+            raise SystemExit(f"expected one ACCEPTED_BUILD_FLOOR line in {SCRIPT}, found {count}")
     out = workdir / name
     out.write_text(text, encoding="utf-8", newline="\n")
     return out
@@ -175,13 +186,14 @@ def main() -> int:
         report("no embedded extensions found" in out, "missing PlugIns names the failure", out)
 
         # A one-commit tree is legitimate at ACCEPTED_BUILD_FLOOR=0 and must stamp.
+        floor0 = patched_script(workdir, buddy, floor=0, name="stamp-floor0.sh")
         thin = workdir / "thin"
         init_repo(thin, 1)
         thin_app = workdir / "thin-app"
         write_plist(thin_app / "Info.plist", "0")
         write_plist(thin_app / "PlugIns" / "HermesLiveActivity.appex" / "Info.plist", "0")
         code, out = run_script(
-            script,
+            floor0,
             {
                 "SRCROOT": str(thin),
                 "TARGET_BUILD_DIR": str(thin_app),
@@ -196,9 +208,7 @@ def main() -> int:
         report(code == 0, "a one-commit archive stamps at floor 0", out)
         report("-> 1" in out, "the one-commit archive is stamped 1", out)
 
-        # And a tree at or below a raised floor must not reach an archive. The
-        # shipped constant stays 0; this copy declares a higher one, which is
-        # what raising it after an accepted upload looks like.
+        # And a tree at or below a raised floor must not reach an archive. This copy declares floor 5, which is what raising it after a processed upload looks like.
         raised = patched_script(workdir, buddy, floor=5, name="stamp-floor5.sh")
         write_plist(thin_app / "Info.plist", "0")
         write_plist(thin_app / "PlugIns" / "HermesLiveActivity.appex" / "Info.plist", "0")
@@ -254,7 +264,7 @@ def main() -> int:
         report(out == "1", "print mode reports the raw one-commit count", out)
 
     print()
-    print(f"stamp-build-number review checks: {pass_n} passed, {fail_n} failed")
+    print(f"stamp-build-number checks: {pass_n} passed, {fail_n} failed")
     return 0 if fail_n == 0 else 1
 
 
