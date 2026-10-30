@@ -44,8 +44,4 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-HARC itself is MIT licensed too, and separately: see `LICENSE`. HARC is an independent third-party client and is not made by, endorsed by, or affiliated with Nous Research.
-
-## The app icon
-
-`HermesApp/Assets.xcassets/AppIcon.appiconset/icon-1024.png` is an AI-generated image, produced by xAI's Grok from a prompt written by this project's author on 8 September 2026. No third-party mark is reproduced in it. The copyright status of purely machine-generated images is unsettled, so this project does not claim the MIT licence in `LICENSE` covers the icon as an original work of authorship, and makes no ownership claim beyond that.
+HARC's code is MIT licensed too, and separately: see `LICENSE`. HARC is an independent third-party client and is not made by, endorsed by, or affiliated with Nous Research.
