@@ -16,7 +16,7 @@ Accessibility is not a 1.0 goal. Reports are recorded but are not being worked.
 - `HermesApp/` is the SwiftUI app: `Models/` holds the observable state (`AppModel`, `ChatModel`), `Views/` the screens, `Design/` the theme and shared components, `Support/` the platform glue, and `Demo/` the offline demo.
 - `HermesActivity/` is the Live Activity's attributes and intents, compiled into both the app and the extension. `HermesLiveActivity/` is the widget extension that draws the Lock Screen card and the Dynamic Island.
 - `HermesAppTests/`, `HermesUITests/` and `HermesServeKit/Tests/` are the three test targets.
-- `docs/` holds the protocol notes, the setup guide and the GitHub Pages site; `scripts/` holds the two build phases.
+- `docs/` holds the protocol notes, the setup guide and the GitHub Pages site; `scripts/` holds the two build phases, a self-check for the build-number phase, and the raw extraction of the desktop themes.
 
 ## Building
 
@@ -46,3 +46,5 @@ The build number is stamped from `git rev-list --count HEAD` by `scripts/stamp-b
 `HermesServeKit` runs under `swift test`. `HermesAppTests` is app-hosted; `HermesAppTests/README.md` has the invocation. `HermesUITests` is XCUITest, and some of it needs a freshly created simulator; those files say so at the top. A pull request should keep all three green.
 
 Comments and changelog entries cite ids like `BUG-060` and `FEAT-021`. They are this project's own identifiers, and there is no tracker to follow them to.
+
+Comments also cite `reference-clients.md`, `jsonrpc-methods-and-events.md` (or `jsonrpc-methods §n`), `rest-api-and-auth.md` (or `rest §n`), `reference §n` and `spec §n`: these are the author's private notes on the upstream source and are not part of this repository; `docs/PROTOCOL.md` is the public condensation.
